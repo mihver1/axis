@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "apps/canvas-app",
+    "crates/canvas-core",
+    "crates/canvas-terminal",
+    "crates/process-manager",
+    "crates/ghostty-sys",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.81"
+version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+

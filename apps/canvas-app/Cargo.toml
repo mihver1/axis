@@ -1,0 +1,14 @@
+[package]
+name = "canvas-app"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+canvas-core = { path = "../../crates/canvas-core" }
+canvas-terminal = { path = "../../crates/canvas-terminal" }
+gpui = "0.2.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

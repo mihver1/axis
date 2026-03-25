@@ -1,0 +1,16 @@
+[package]
+name = "canvas-terminal"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+canvas-core = { path = "../canvas-core" }
+ghostty-sys = { path = "../ghostty-sys" }
+process-manager = { path = "../process-manager" }

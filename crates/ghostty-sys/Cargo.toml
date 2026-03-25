@@ -1,0 +1,11 @@
+[package]
+name = "ghostty-sys"
+build = "build.rs"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
