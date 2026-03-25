@@ -7,15 +7,16 @@ use canvas_terminal::{
 };
 use gpui::{
     div, font, prelude::*, px, rgb, size, App, Application, Bounds, ClipboardItem, Context,
-    DispatchPhase, FocusHandle, FontStyle, FontWeight, KeyDownEvent, MagnifyGestureEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent,
-    SharedString, SmartMagnifyGestureEvent, StrikethroughStyle, StyledText, SwipeGestureEvent,
-    TextRun, Timer, TouchEvent, TouchPhase, UnderlineStyle, Window, WindowBounds, WindowOptions,
+    DispatchPhase, FocusHandle, FontStyle, FontWeight, KeyDownEvent, KeybindingKeystroke,
+    Keystroke, MagnifyGestureEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, ScrollWheelEvent, SharedString, SmartMagnifyGestureEvent, StrikethroughStyle,
+    StyledText, SwipeGestureEvent, TextRun, Timer, TouchEvent, TouchPhase, UnderlineStyle, Window,
+    WindowBounds, WindowOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::PathBuf,
     time::{Duration, Instant},
@@ -55,6 +56,8 @@ const SPLIT_MARGIN_X: f32 = 28.0;
 const SPLIT_MARGIN_TOP: f32 = 28.0;
 const SPLIT_MARGIN_BOTTOM: f32 = 96.0;
 const SPLIT_GAP: f32 = 14.0;
+const SHORTCUT_PANEL_WIDTH: f32 = 540.0;
+const SHORTCUT_PANEL_MARGIN: f32 = 20.0;
 
 #[derive(Clone)]
 struct WorkdeskState {
@@ -80,6 +83,8 @@ struct CanvasShell {
     focus_handle: FocusHandle,
     ghostty_vendor_dir: SharedString,
     ghostty_status: SharedString,
+    shortcuts: ShortcutMap,
+    shortcut_editor: ShortcutEditorState,
     cursor_blink_visible: bool,
     last_cursor_blink_at: Instant,
     persist_generation: u64,
@@ -91,6 +96,12 @@ struct CanvasShell {
 struct TouchpadPanState {
     touch_ids: Vec<u64>,
     last_centroid: gpui::Point<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ShortcutEditorState {
+    open: bool,
+    recording: Option<ShortcutAction>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -132,6 +143,56 @@ enum GridDirection {
     Right,
     Up,
     Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShortcutGroup {
+    Workspace,
+    Layout,
+    View,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ShortcutAction {
+    ToggleShortcutPanel,
+    SpawnShellPane,
+    SpawnAgentPane,
+    CloseActivePane,
+    SpawnWorkdesk,
+    SelectPreviousWorkdesk,
+    SelectNextWorkdesk,
+    LayoutFree,
+    LayoutGrid,
+    LayoutSplit,
+    ToggleGridExpose,
+    NavigateLeft,
+    NavigateRight,
+    NavigateUp,
+    NavigateDown,
+    FitPanes,
+    ResetView,
+    ZoomIn,
+    ZoomOut,
+    TerminalCopySelection,
+    TerminalPaste,
+    TerminalSelectAll,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShortcutBinding {
+    keystroke: KeybindingKeystroke,
+}
+
+#[derive(Clone, Debug)]
+struct ShortcutMap {
+    bindings: HashMap<ShortcutAction, Option<ShortcutBinding>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PersistedShortcutConfig {
+    #[serde(default)]
+    bindings: BTreeMap<String, Option<String>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -396,6 +457,360 @@ impl GridDirection {
             Self::Up => "↑",
             Self::Down => "↓",
         }
+    }
+}
+
+const SHORTCUT_ACTIONS: [ShortcutAction; 22] = [
+    ShortcutAction::ToggleShortcutPanel,
+    ShortcutAction::SpawnShellPane,
+    ShortcutAction::SpawnAgentPane,
+    ShortcutAction::CloseActivePane,
+    ShortcutAction::SpawnWorkdesk,
+    ShortcutAction::SelectPreviousWorkdesk,
+    ShortcutAction::SelectNextWorkdesk,
+    ShortcutAction::LayoutFree,
+    ShortcutAction::LayoutGrid,
+    ShortcutAction::LayoutSplit,
+    ShortcutAction::ToggleGridExpose,
+    ShortcutAction::NavigateLeft,
+    ShortcutAction::NavigateRight,
+    ShortcutAction::NavigateUp,
+    ShortcutAction::NavigateDown,
+    ShortcutAction::FitPanes,
+    ShortcutAction::ResetView,
+    ShortcutAction::ZoomIn,
+    ShortcutAction::ZoomOut,
+    ShortcutAction::TerminalCopySelection,
+    ShortcutAction::TerminalPaste,
+    ShortcutAction::TerminalSelectAll,
+];
+
+impl ShortcutGroup {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Workspace => "Workspace",
+            Self::Layout => "Layout",
+            Self::View => "View",
+            Self::Terminal => "Terminal",
+        }
+    }
+
+    fn summary(self) -> &'static str {
+        match self {
+            Self::Workspace => "Create panes, move between desks, and open the shortcut drawer.",
+            Self::Layout => "Switch layout modes and move focus in directional layouts.",
+            Self::View => "Control the freeform camera without touching the mouse.",
+            Self::Terminal => "Use familiar clipboard and selection actions in the active pane.",
+        }
+    }
+}
+
+impl ShortcutAction {
+    fn all() -> &'static [Self] {
+        &SHORTCUT_ACTIONS
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::ToggleShortcutPanel => "toggle-shortcut-panel",
+            Self::SpawnShellPane => "spawn-shell-pane",
+            Self::SpawnAgentPane => "spawn-agent-pane",
+            Self::CloseActivePane => "close-active-pane",
+            Self::SpawnWorkdesk => "spawn-workdesk",
+            Self::SelectPreviousWorkdesk => "select-previous-workdesk",
+            Self::SelectNextWorkdesk => "select-next-workdesk",
+            Self::LayoutFree => "layout-free",
+            Self::LayoutGrid => "layout-grid",
+            Self::LayoutSplit => "layout-split",
+            Self::ToggleGridExpose => "toggle-grid-expose",
+            Self::NavigateLeft => "navigate-left",
+            Self::NavigateRight => "navigate-right",
+            Self::NavigateUp => "navigate-up",
+            Self::NavigateDown => "navigate-down",
+            Self::FitPanes => "fit-panes",
+            Self::ResetView => "reset-view",
+            Self::ZoomIn => "zoom-in",
+            Self::ZoomOut => "zoom-out",
+            Self::TerminalCopySelection => "terminal-copy-selection",
+            Self::TerminalPaste => "terminal-paste",
+            Self::TerminalSelectAll => "terminal-select-all",
+        }
+    }
+
+    fn from_slug(value: &str) -> Option<Self> {
+        Self::all()
+            .iter()
+            .copied()
+            .find(|action| action.slug() == value)
+    }
+
+    fn group(self) -> ShortcutGroup {
+        match self {
+            Self::ToggleShortcutPanel
+            | Self::SpawnShellPane
+            | Self::SpawnAgentPane
+            | Self::CloseActivePane
+            | Self::SpawnWorkdesk
+            | Self::SelectPreviousWorkdesk
+            | Self::SelectNextWorkdesk => ShortcutGroup::Workspace,
+            Self::LayoutFree
+            | Self::LayoutGrid
+            | Self::LayoutSplit
+            | Self::ToggleGridExpose
+            | Self::NavigateLeft
+            | Self::NavigateRight
+            | Self::NavigateUp
+            | Self::NavigateDown => ShortcutGroup::Layout,
+            Self::FitPanes | Self::ResetView | Self::ZoomIn | Self::ZoomOut => ShortcutGroup::View,
+            Self::TerminalCopySelection | Self::TerminalPaste | Self::TerminalSelectAll => {
+                ShortcutGroup::Terminal
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ToggleShortcutPanel => "Open shortcut drawer",
+            Self::SpawnShellPane => "New shell pane",
+            Self::SpawnAgentPane => "New agent pane",
+            Self::CloseActivePane => "Close active pane",
+            Self::SpawnWorkdesk => "New workdesk",
+            Self::SelectPreviousWorkdesk => "Previous workdesk",
+            Self::SelectNextWorkdesk => "Next workdesk",
+            Self::LayoutFree => "Free layout",
+            Self::LayoutGrid => "Grid layout",
+            Self::LayoutSplit => "Split layout",
+            Self::ToggleGridExpose => "Toggle grid expose",
+            Self::NavigateLeft => "Focus pane left",
+            Self::NavigateRight => "Focus pane right",
+            Self::NavigateUp => "Focus pane up",
+            Self::NavigateDown => "Focus pane down",
+            Self::FitPanes => "Fit panes in view",
+            Self::ResetView => "Reset zoom to 1:1",
+            Self::ZoomIn => "Zoom in",
+            Self::ZoomOut => "Zoom out",
+            Self::TerminalCopySelection => "Copy terminal selection",
+            Self::TerminalPaste => "Paste into terminal",
+            Self::TerminalSelectAll => "Select all terminal text",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::ToggleShortcutPanel => {
+                "Open the drawer where shortcuts can be reviewed and remapped."
+            }
+            Self::SpawnShellPane => "Create a new shell pane near the viewport center.",
+            Self::SpawnAgentPane => "Create a new agent pane near the viewport center.",
+            Self::CloseActivePane => "Close the focused pane and its live terminal session.",
+            Self::SpawnWorkdesk => "Create a fresh workdesk and switch focus to it.",
+            Self::SelectPreviousWorkdesk => {
+                "Move focus to the workdesk on the left side of the rail."
+            }
+            Self::SelectNextWorkdesk => "Move focus to the workdesk on the right side of the rail.",
+            Self::LayoutFree => "Return to the freeform canvas with draggable panes.",
+            Self::LayoutGrid => "Focus one pane at a time with directional neighbors.",
+            Self::LayoutSplit => "Tile panes into a split overview.",
+            Self::ToggleGridExpose => "Open or close the overview strip for grid mode.",
+            Self::NavigateLeft => "Move active focus to the nearest pane on the left.",
+            Self::NavigateRight => "Move active focus to the nearest pane on the right.",
+            Self::NavigateUp => "Move active focus to the nearest pane above.",
+            Self::NavigateDown => "Move active focus to the nearest pane below.",
+            Self::FitPanes => "Scale and center the freeform canvas around every pane.",
+            Self::ResetView => "Reset the freeform camera to 100% zoom and the origin.",
+            Self::ZoomIn => "Zoom the freeform canvas in around the viewport center.",
+            Self::ZoomOut => "Zoom the freeform canvas out around the viewport center.",
+            Self::TerminalCopySelection => "Copy the current terminal selection to the clipboard.",
+            Self::TerminalPaste => "Paste clipboard text into the active terminal pane.",
+            Self::TerminalSelectAll => "Select every visible terminal cell in the active pane.",
+        }
+    }
+
+    fn default_binding(self) -> Option<&'static str> {
+        match self {
+            Self::ToggleShortcutPanel => Some("cmd-/"),
+            Self::SpawnShellPane => Some("cmd-shift-n"),
+            Self::SpawnAgentPane => Some("cmd-alt-n"),
+            Self::CloseActivePane => Some("cmd-shift-w"),
+            Self::SpawnWorkdesk => Some("cmd-shift-d"),
+            Self::SelectPreviousWorkdesk => Some("cmd-alt-["),
+            Self::SelectNextWorkdesk => Some("cmd-alt-]"),
+            Self::LayoutFree => Some("cmd-shift-f"),
+            Self::LayoutGrid => Some("cmd-shift-g"),
+            Self::LayoutSplit => Some("cmd-shift-s"),
+            Self::ToggleGridExpose => Some("cmd-shift-e"),
+            Self::NavigateLeft => Some("cmd-shift-left"),
+            Self::NavigateRight => Some("cmd-shift-right"),
+            Self::NavigateUp => Some("cmd-shift-up"),
+            Self::NavigateDown => Some("cmd-shift-down"),
+            Self::FitPanes => Some("cmd-shift-0"),
+            Self::ResetView => Some("cmd-0"),
+            Self::ZoomIn => Some("cmd-="),
+            Self::ZoomOut => Some("cmd--"),
+            Self::TerminalCopySelection => Some("cmd-c"),
+            Self::TerminalPaste => Some("cmd-v"),
+            Self::TerminalSelectAll => Some("cmd-a"),
+        }
+    }
+}
+
+impl ShortcutBinding {
+    fn parse(source: &str) -> Result<Self, String> {
+        let parsed = Keystroke::parse(source).map_err(|error| error.to_string())?;
+        Self::from_keystroke(parsed)
+            .ok_or_else(|| format!("`{source}` is not a supported shortcut chord"))
+    }
+
+    fn from_keystroke(keystroke: Keystroke) -> Option<Self> {
+        if !can_bind_shortcut_keystroke(&keystroke) {
+            return None;
+        }
+
+        let mut keystroke = KeybindingKeystroke::from_keystroke(keystroke);
+        keystroke.remove_key_char();
+        Some(Self { keystroke })
+    }
+
+    fn matches(&self, event: &KeyDownEvent) -> bool {
+        event.keystroke.should_match(&self.keystroke)
+    }
+
+    fn display_label(&self) -> String {
+        self.keystroke.to_string()
+    }
+
+    fn serialized(&self) -> String {
+        self.keystroke.unparse()
+    }
+}
+
+impl Default for ShortcutMap {
+    fn default() -> Self {
+        let mut bindings = HashMap::new();
+        for action in ShortcutAction::all() {
+            let binding = action.default_binding().map(|source| {
+                ShortcutBinding::parse(source).unwrap_or_else(|error| {
+                    panic!(
+                        "invalid default shortcut `{source}` for {}: {error}",
+                        action.slug()
+                    )
+                })
+            });
+            bindings.insert(*action, binding);
+        }
+
+        Self { bindings }
+    }
+}
+
+impl ShortcutMap {
+    fn binding(&self, action: ShortcutAction) -> Option<&ShortcutBinding> {
+        self.bindings
+            .get(&action)
+            .and_then(|binding| binding.as_ref())
+    }
+
+    fn display_label(&self, action: ShortcutAction) -> String {
+        self.binding(action)
+            .map(ShortcutBinding::display_label)
+            .unwrap_or_else(|| "Unassigned".to_string())
+    }
+
+    fn matching_action(&self, event: &KeyDownEvent) -> Option<ShortcutAction> {
+        ShortcutAction::all().iter().copied().find(|action| {
+            self.binding(*action)
+                .is_some_and(|binding| binding.matches(event))
+        })
+    }
+
+    fn clear(&mut self, action: ShortcutAction) {
+        self.bindings.insert(action, None);
+    }
+
+    fn set_binding(
+        &mut self,
+        action: ShortcutAction,
+        binding: ShortcutBinding,
+    ) -> Option<ShortcutAction> {
+        let normalized = binding.serialized();
+        let displaced = ShortcutAction::all().iter().copied().find(|candidate| {
+            *candidate != action
+                && self
+                    .binding(*candidate)
+                    .is_some_and(|existing| existing.serialized() == normalized)
+        });
+
+        if let Some(candidate) = displaced {
+            self.clear(candidate);
+        }
+
+        self.bindings.insert(action, Some(binding));
+        displaced
+    }
+
+    fn reset_binding(&mut self, action: ShortcutAction) -> Option<ShortcutAction> {
+        if let Some(default) = action.default_binding() {
+            let binding = ShortcutBinding::parse(default).unwrap_or_else(|error| {
+                panic!(
+                    "invalid default shortcut `{default}` for {}: {error}",
+                    action.slug()
+                )
+            });
+            self.set_binding(action, binding)
+        } else {
+            self.clear(action);
+            None
+        }
+    }
+
+    fn reset_all(&mut self) {
+        *self = Self::default();
+    }
+
+    fn persisted_config(&self) -> PersistedShortcutConfig {
+        let mut bindings = BTreeMap::new();
+        for action in ShortcutAction::all() {
+            bindings.insert(
+                action.slug().to_string(),
+                self.binding(*action).map(ShortcutBinding::serialized),
+            );
+        }
+        PersistedShortcutConfig { bindings }
+    }
+
+    fn from_persisted(config: PersistedShortcutConfig) -> (Self, Vec<String>) {
+        let mut shortcuts = Self::default();
+        let mut warnings = Vec::new();
+
+        for (action_slug, binding_source) in config.bindings {
+            let Some(action) = ShortcutAction::from_slug(&action_slug) else {
+                warnings.push(format!("ignored unknown shortcut action `{action_slug}`"));
+                continue;
+            };
+
+            match binding_source {
+                Some(source) => match ShortcutBinding::parse(&source) {
+                    Ok(binding) => {
+                        let displaced = shortcuts.set_binding(action, binding);
+                        if let Some(displaced) = displaced {
+                            warnings.push(format!(
+                                "{} took over {} from {}",
+                                action.label(),
+                                shortcuts.display_label(action),
+                                displaced.label(),
+                            ));
+                        }
+                    }
+                    Err(error) => warnings.push(format!(
+                        "ignored invalid shortcut for {}: {error}",
+                        action.label()
+                    )),
+                },
+                None => shortcuts.clear(action),
+            }
+        }
+
+        (shortcuts, warnings)
     }
 }
 
@@ -744,6 +1159,7 @@ impl CanvasShell {
     fn new(
         workdesks: Vec<WorkdeskState>,
         active_workdesk: usize,
+        shortcuts: ShortcutMap,
         boot_notice: Option<SharedString>,
         focus_handle: FocusHandle,
         ghostty_vendor_dir: SharedString,
@@ -756,6 +1172,8 @@ impl CanvasShell {
             focus_handle,
             ghostty_vendor_dir,
             ghostty_status,
+            shortcuts,
+            shortcut_editor: ShortcutEditorState::default(),
             cursor_blink_visible: true,
             last_cursor_blink_at: Instant::now(),
             persist_generation: 0,
@@ -785,6 +1203,123 @@ impl CanvasShell {
 
     fn active_workdesk_mut(&mut self) -> &mut WorkdeskState {
         &mut self.workdesks[self.active_workdesk]
+    }
+
+    fn shortcut_label(&self, action: ShortcutAction) -> String {
+        self.shortcuts.display_label(action)
+    }
+
+    fn set_runtime_notice(&mut self, message: impl Into<String>) {
+        if let Some(workdesk) = self.workdesks.get_mut(self.active_workdesk) {
+            workdesk.runtime_notice = Some(SharedString::from(message.into()));
+        }
+    }
+
+    fn close_shortcut_panel(&mut self, cx: &mut Context<Self>) {
+        if !self.shortcut_editor.open && self.shortcut_editor.recording.is_none() {
+            return;
+        }
+
+        self.shortcut_editor.open = false;
+        self.shortcut_editor.recording = None;
+        cx.notify();
+    }
+
+    fn toggle_shortcut_panel(&mut self, cx: &mut Context<Self>) {
+        if self.shortcut_editor.open {
+            self.close_shortcut_panel(cx);
+            return;
+        }
+
+        self.shortcut_editor.open = true;
+        self.shortcut_editor.recording = None;
+        cx.notify();
+    }
+
+    fn begin_shortcut_recording(&mut self, action: ShortcutAction, cx: &mut Context<Self>) {
+        self.shortcut_editor.open = true;
+        self.shortcut_editor.recording = Some(action);
+        cx.notify();
+    }
+
+    fn clear_shortcut_binding(&mut self, action: ShortcutAction, cx: &mut Context<Self>) {
+        self.shortcuts.clear(action);
+        self.shortcut_editor.recording = None;
+        self.save_shortcuts_with_notice(format!("Cleared shortcut for {}", action.label()), cx);
+    }
+
+    fn assign_shortcut_binding(
+        &mut self,
+        action: ShortcutAction,
+        binding: ShortcutBinding,
+        cx: &mut Context<Self>,
+    ) {
+        let displaced = self.shortcuts.set_binding(action, binding);
+        self.shortcut_editor.recording = None;
+
+        let mut message = format!("{} is now {}", action.label(), self.shortcut_label(action));
+        if let Some(displaced) = displaced {
+            message.push_str(&format!("; cleared {}", displaced.label()));
+        }
+
+        self.save_shortcuts_with_notice(message, cx);
+    }
+
+    fn reset_shortcut_binding(&mut self, action: ShortcutAction, cx: &mut Context<Self>) {
+        let displaced = self.shortcuts.reset_binding(action);
+        self.shortcut_editor.recording = None;
+
+        let mut message = format!(
+            "Reset {} to {}",
+            action.label(),
+            self.shortcut_label(action)
+        );
+        if let Some(displaced) = displaced {
+            message.push_str(&format!("; cleared {}", displaced.label()));
+        }
+
+        self.save_shortcuts_with_notice(message, cx);
+    }
+
+    fn reset_all_shortcuts(&mut self, cx: &mut Context<Self>) {
+        self.shortcuts.reset_all();
+        self.shortcut_editor.recording = None;
+        self.save_shortcuts_with_notice("Restored default shortcuts", cx);
+    }
+
+    fn save_shortcuts_with_notice(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        match self.persist_shortcuts_now() {
+            Ok(()) => self.set_runtime_notice(message.into()),
+            Err(error) => {
+                self.set_runtime_notice(format!("shortcut save failed: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn persist_shortcuts_now(&self) -> Result<(), String> {
+        let shortcut_path = shortcut_file_path();
+        let Some(shortcut_dir) = shortcut_path.parent() else {
+            return Err("invalid shortcut path".to_string());
+        };
+
+        fs::create_dir_all(shortcut_dir)
+            .map_err(|error| format!("create {}: {error}", shortcut_dir.display()))?;
+        let payload = serde_json::to_vec_pretty(&self.shortcuts.persisted_config())
+            .map_err(|error| format!("serialize shortcuts: {error}"))?;
+        fs::write(&shortcut_path, payload)
+            .map_err(|error| format!("write {}: {error}", shortcut_path.display()))?;
+        Ok(())
+    }
+
+    fn cycle_workdesk(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.workdesks.is_empty() {
+            return;
+        }
+
+        let len = self.workdesks.len() as isize;
+        let next = (self.active_workdesk as isize + delta).rem_euclid(len) as usize;
+        self.select_workdesk(next, cx);
     }
 
     fn request_persist(&mut self, cx: &mut Context<Self>) {
@@ -920,47 +1455,95 @@ impl CanvasShell {
         self.activate_grid_pane(target, false, cx);
     }
 
-    fn handle_layout_shortcut(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    fn handle_shortcut_recording(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let Some(action) = self.shortcut_editor.recording else {
+            return false;
+        };
         let keystroke = &event.keystroke;
-        if self.active_workdesk().layout_mode == LayoutMode::Grid
-            && self.active_workdesk().grid_layout.expose_open
-            && keystroke.key == "escape"
-            && !keystroke.modifiers.modified()
-        {
-            self.set_grid_expose(false, cx);
+
+        if keystroke.key == "escape" && !keystroke.modifiers.modified() {
+            self.shortcut_editor.recording = None;
+            cx.notify();
             return true;
         }
 
-        if !keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
-            return false;
+        if matches!(keystroke.key.as_str(), "backspace" | "delete")
+            && !keystroke.modifiers.modified()
+        {
+            self.clear_shortcut_binding(action, cx);
+            return true;
         }
 
-        match (keystroke.modifiers.shift, keystroke.key.as_str()) {
-            (true, "f") => {
+        let Some(binding) = ShortcutBinding::from_keystroke(keystroke.clone()) else {
+            self.set_runtime_notice(
+                "Shortcut capture expects a modified chord or a non-text key. Esc cancels; Delete clears.",
+            );
+            cx.notify();
+            return true;
+        };
+
+        self.assign_shortcut_binding(action, binding, cx);
+        true
+    }
+
+    fn execute_shortcut_action(
+        &mut self,
+        action: ShortcutAction,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match action {
+            ShortcutAction::ToggleShortcutPanel => {
+                self.toggle_shortcut_panel(cx);
+                true
+            }
+            ShortcutAction::SpawnShellPane => {
+                self.spawn_pane(PaneKind::Shell, window, cx);
+                true
+            }
+            ShortcutAction::SpawnAgentPane => {
+                self.spawn_pane(PaneKind::Agent, window, cx);
+                true
+            }
+            ShortcutAction::CloseActivePane => {
+                let Some(pane_id) = self.active_workdesk().active_pane else {
+                    return false;
+                };
+                self.close_pane(pane_id, cx);
+                true
+            }
+            ShortcutAction::SpawnWorkdesk => {
+                self.spawn_workdesk(cx);
+                true
+            }
+            ShortcutAction::SelectPreviousWorkdesk => {
+                self.cycle_workdesk(-1, cx);
+                true
+            }
+            ShortcutAction::SelectNextWorkdesk => {
+                self.cycle_workdesk(1, cx);
+                true
+            }
+            ShortcutAction::LayoutFree => {
                 self.set_layout_mode(LayoutMode::Free, cx);
                 true
             }
-            (true, "g") => {
+            ShortcutAction::LayoutGrid => {
                 self.set_layout_mode(LayoutMode::Grid, cx);
                 true
             }
-            (true, "s") => {
+            ShortcutAction::LayoutSplit => {
                 self.set_layout_mode(LayoutMode::ClassicSplit, cx);
                 true
             }
-            (true, "e") => {
+            ShortcutAction::ToggleGridExpose => {
                 if self.active_workdesk().layout_mode != LayoutMode::Grid {
                     return false;
                 }
                 self.toggle_grid_expose(cx);
                 true
             }
-            (true, "left") => {
+            ShortcutAction::NavigateLeft => {
                 if !matches!(
                     self.active_workdesk().layout_mode,
                     LayoutMode::Grid | LayoutMode::ClassicSplit
@@ -970,7 +1553,7 @@ impl CanvasShell {
                 self.navigate_layout(GridDirection::Left, window, cx);
                 true
             }
-            (true, "right") => {
+            ShortcutAction::NavigateRight => {
                 if !matches!(
                     self.active_workdesk().layout_mode,
                     LayoutMode::Grid | LayoutMode::ClassicSplit
@@ -980,7 +1563,7 @@ impl CanvasShell {
                 self.navigate_layout(GridDirection::Right, window, cx);
                 true
             }
-            (true, "up") => {
+            ShortcutAction::NavigateUp => {
                 if !matches!(
                     self.active_workdesk().layout_mode,
                     LayoutMode::Grid | LayoutMode::ClassicSplit
@@ -990,7 +1573,7 @@ impl CanvasShell {
                 self.navigate_layout(GridDirection::Up, window, cx);
                 true
             }
-            (true, "down") => {
+            ShortcutAction::NavigateDown => {
                 if !matches!(
                     self.active_workdesk().layout_mode,
                     LayoutMode::Grid | LayoutMode::ClassicSplit
@@ -1000,7 +1583,39 @@ impl CanvasShell {
                 self.navigate_layout(GridDirection::Down, window, cx);
                 true
             }
-            _ => false,
+            ShortcutAction::FitPanes => {
+                if self.active_workdesk().layout_mode != LayoutMode::Free {
+                    return false;
+                }
+                self.fit_to_panes(window, cx);
+                true
+            }
+            ShortcutAction::ResetView => {
+                if self.active_workdesk().layout_mode != LayoutMode::Free {
+                    return false;
+                }
+                self.reset_view(cx);
+                true
+            }
+            ShortcutAction::ZoomIn => {
+                if self.active_workdesk().layout_mode != LayoutMode::Free {
+                    return false;
+                }
+                self.zoom_about_viewport_center(1.15, window, cx);
+                true
+            }
+            ShortcutAction::ZoomOut => {
+                if self.active_workdesk().layout_mode != LayoutMode::Free {
+                    return false;
+                }
+                self.zoom_about_viewport_center(1.0 / 1.15, window, cx);
+                true
+            }
+            ShortcutAction::TerminalCopySelection
+            | ShortcutAction::TerminalPaste
+            | ShortcutAction::TerminalSelectAll => {
+                self.execute_terminal_shortcut_action(action, cx)
+            }
         }
     }
 
@@ -1491,9 +2106,41 @@ impl CanvasShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.handle_layout_shortcut(event, window, cx) {
+        if self.handle_shortcut_recording(event, cx) {
             cx.stop_propagation();
             return;
+        }
+
+        if self.shortcut_editor.open {
+            let is_escape =
+                event.keystroke.key == "escape" && !event.keystroke.modifiers.modified();
+            let is_toggle = self
+                .shortcuts
+                .matching_action(event)
+                .is_some_and(|action| action == ShortcutAction::ToggleShortcutPanel);
+
+            if is_escape || is_toggle {
+                self.close_shortcut_panel(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.active_workdesk().layout_mode == LayoutMode::Grid
+            && self.active_workdesk().grid_layout.expose_open
+            && event.keystroke.key == "escape"
+            && !event.keystroke.modifiers.modified()
+        {
+            self.set_grid_expose(false, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        if let Some(action) = self.shortcuts.matching_action(event) {
+            if self.execute_shortcut_action(action, window, cx) {
+                cx.stop_propagation();
+                return;
+            }
         }
 
         let Some(pane_id) = self.active_workdesk().active_pane else {
@@ -1504,10 +2151,6 @@ impl CanvasShell {
         };
 
         let snapshot = terminal.snapshot();
-        if self.handle_terminal_shortcut(event, pane_id, &terminal, &snapshot, cx) {
-            return;
-        }
-
         let Some(bytes) = terminal_input_bytes(event, &snapshot) else {
             return;
         };
@@ -1646,51 +2289,50 @@ impl CanvasShell {
         cx.notify();
     }
 
-    fn handle_terminal_shortcut(
+    fn execute_terminal_shortcut_action(
         &mut self,
-        event: &KeyDownEvent,
-        pane_id: PaneId,
-        terminal: &TerminalSession,
-        snapshot: &TerminalSnapshot,
+        action: ShortcutAction,
         cx: &mut Context<Self>,
     ) -> bool {
-        let keystroke = &event.keystroke;
-        if !keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        let Some(pane_id) = self.active_workdesk().active_pane else {
             return false;
-        }
+        };
+        let Some(terminal) = self.active_workdesk().terminals.get(&pane_id).cloned() else {
+            return false;
+        };
+        let snapshot = terminal.snapshot();
 
-        match keystroke.key.as_str() {
-            "c" => {
+        match action {
+            ShortcutAction::TerminalCopySelection => {
                 let selected_text = self
                     .active_workdesk()
                     .terminal_views
                     .get(&pane_id)
                     .and_then(|view| view.selection)
-                    .and_then(|selection| terminal_selection_text(snapshot, selection));
+                    .and_then(|selection| terminal_selection_text(&snapshot, selection));
 
                 if let Some(text) = selected_text {
                     if !text.is_empty() {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
-                        self.active_workdesk_mut().runtime_notice =
-                            Some(SharedString::from("Copied terminal selection"));
-                        cx.stop_propagation();
+                        self.set_runtime_notice("Copied terminal selection");
+                        cx.notify();
                         return true;
                     }
                 }
 
                 false
             }
-            "v" => {
+            ShortcutAction::TerminalPaste => {
                 let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
                     return true;
                 };
 
                 if let Err(error) = terminal.send_text(&text) {
-                    self.active_workdesk_mut().runtime_notice = Some(SharedString::from(format!(
+                    self.set_runtime_notice(format!(
                         "terminal paste failed for pane #{}: {}",
                         pane_id.raw(),
                         error
-                    )));
+                    ));
                 } else {
                     let _ = terminal.scroll_viewport_bottom();
                     self.active_workdesk_mut().clear_selection(pane_id);
@@ -1698,12 +2340,11 @@ impl CanvasShell {
                     self.last_cursor_blink_at = Instant::now();
                 }
 
-                cx.stop_propagation();
+                cx.notify();
                 true
             }
-            "a" => {
+            ShortcutAction::TerminalSelectAll => {
                 if snapshot.rows.is_empty() || snapshot.cols == 0 {
-                    cx.stop_propagation();
                     return true;
                 }
 
@@ -1718,7 +2359,6 @@ impl CanvasShell {
                         col: last_col,
                     },
                 );
-                cx.stop_propagation();
                 cx.notify();
                 true
             }
@@ -2224,6 +2864,8 @@ impl Render for CanvasShell {
             Vec::new()
         };
 
+        let toggle_shortcut_label = self.shortcut_label(ShortcutAction::ToggleShortcutPanel);
+        let grid_expose_shortcut_label = self.shortcut_label(ShortcutAction::ToggleGridExpose);
         let expose_overlay = if let Some(layout) = expose_layout {
             let cards = workdesk
                 .panes
@@ -2249,44 +2891,46 @@ impl Render for CanvasShell {
                 })
                 .collect::<Vec<_>>();
 
-            vec![
-                div()
-                    .absolute()
-                    .left(px(SIDEBAR_WIDTH))
-                    .top(px(0.0))
-                    .w(px(viewport_width - SIDEBAR_WIDTH))
-                    .h(px(viewport_height))
-                    .bg(rgb(0x0b1014))
-                    .border_l_1()
-                    .border_color(rgb(0x18222a))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+            vec![div()
+                .absolute()
+                .left(px(SIDEBAR_WIDTH))
+                .top(px(0.0))
+                .w(px(viewport_width - SIDEBAR_WIDTH))
+                .h(px(viewport_height))
+                .bg(rgb(0x0b1014))
+                .border_l_1()
+                .border_color(rgb(0x18222a))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
                         this.set_grid_expose(false, cx);
                         cx.stop_propagation();
-                    }))
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(EXPOSE_MARGIN_X))
-                            .top(px(18.0))
-                            .px_4()
-                            .py_3()
-                            .bg(rgb(0x131a20))
-                            .border_1()
-                            .border_color(rgb(0x2a3640))
-                            .rounded_lg()
-                            .shadow_lg()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0xf0d35f))
-                                    .child("Grid Expose"),
-                            )
-                            .child(div().mt_1().text_sm().child(
-                                "Click a pane to zoom back into it, or press Cmd+Shift+E to close the overview.",
-                            )),
-                    )
-                    .children(cards),
-            ]
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(EXPOSE_MARGIN_X))
+                        .top(px(18.0))
+                        .px_4()
+                        .py_3()
+                        .bg(rgb(0x131a20))
+                        .border_1()
+                        .border_color(rgb(0x2a3640))
+                        .rounded_lg()
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0xf0d35f))
+                                .child("Grid Expose"),
+                        )
+                        .child(div().mt_1().text_sm().child(format!(
+                            "Click a pane to zoom back into it, or press {} to close the overview.",
+                            grid_expose_shortcut_label
+                        ))),
+                )
+                .children(cards)]
         } else {
             Vec::new()
         };
@@ -2358,6 +3002,206 @@ impl Render for CanvasShell {
                 )
             })
             .collect::<Vec<_>>();
+        let shortcut_path_label = shortcut_file_path().display().to_string();
+        let recording_shortcut = self
+            .shortcut_editor
+            .recording
+            .map(|action| action.label().to_string());
+        let shortcut_sections = [
+            ShortcutGroup::Workspace,
+            ShortcutGroup::Layout,
+            ShortcutGroup::View,
+            ShortcutGroup::Terminal,
+        ]
+        .into_iter()
+        .map(|group| {
+            let accent = shortcut_group_accent(group);
+            let rows = ShortcutAction::all()
+                .iter()
+                .copied()
+                .filter(|action| action.group() == group)
+                .map(|action| {
+                    shortcut_row(
+                        action,
+                        self.shortcut_label(action),
+                        self.shortcut_editor.recording == Some(action),
+                        cx.listener(move |this, _, _, cx| {
+                            this.begin_shortcut_recording(action, cx);
+                            cx.stop_propagation();
+                        }),
+                        cx.listener(move |this, _, _, cx| {
+                            this.reset_shortcut_binding(action, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_3()
+                .bg(rgb(0x11181e))
+                .border_1()
+                .border_color(rgb(0x24313b))
+                .rounded_lg()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_xs().text_color(accent).child(group.label()))
+                        .child(div().text_sm().child(group.summary())),
+                )
+                .children(rows)
+        })
+        .collect::<Vec<_>>();
+        let shortcut_overlay = if self.shortcut_editor.open {
+            vec![
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .w(px(viewport_width))
+                    .h(px(viewport_height))
+                    .bg(rgb(0x091016).opacity(0.84))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.close_shortcut_panel(cx);
+                        cx.stop_propagation();
+                    })),
+                div()
+                    .absolute()
+                    .top(px(SHORTCUT_PANEL_MARGIN))
+                    .right(px(SHORTCUT_PANEL_MARGIN))
+                    .bottom(px(SHORTCUT_PANEL_MARGIN))
+                    .w(px(
+                        SHORTCUT_PANEL_WIDTH
+                            .min((viewport_width - SHORTCUT_PANEL_MARGIN * 2.0).max(320.0)),
+                    ))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(rgb(0x0f151b))
+                    .border_1()
+                    .border_color(rgb(0x27333d))
+                    .rounded_xl()
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_scroll_wheel(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_start()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x7cc7ff))
+                                            .child("Shortcut Drawer"),
+                                    )
+                                    .child(div().text_lg().child("Configurable hotkeys"))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x90a0aa))
+                                            .child(
+                                                "Click any binding to record a new chord. Press Delete while recording to clear it, or Escape to cancel.",
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(control_button(
+                                        "Defaults",
+                                        rgb(0xf0d35f).into(),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.reset_all_shortcuts(cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ))
+                                    .child(control_button(
+                                        "Close",
+                                        rgb(0x7cc7ff).into(),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.close_shortcut_panel(cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    )),
+                            ),
+                    )
+                    .when_some(recording_shortcut.clone(), |panel, action_label| {
+                        panel.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .bg(rgb(0x182028))
+                                .border_1()
+                                .border_color(rgb(0x2e4556))
+                                .rounded_lg()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x7cc7ff))
+                                        .child(format!("Recording: {action_label}")),
+                                )
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(rgb(0xb7c1c8))
+                                        .child(
+                                            "The next supported chord becomes the new binding immediately.",
+                                        ),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x131a20))
+                            .border_1()
+                            .border_color(rgb(0x25303a))
+                            .rounded_lg()
+                            .child(status_chip("Open", toggle_shortcut_label.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x90a0aa))
+                                    .child(shortcut_path_label.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .children(shortcut_sections),
+                    ),
+            ]
+        } else {
+            Vec::new()
+        };
 
         window.on_mouse_event({
             let entity = entity.clone();
@@ -2486,6 +3330,53 @@ impl Render for CanvasShell {
                     .children(workdesk_cards)
                     .child(
                         div()
+                            .p_3()
+                            .bg(rgb(0x131a20))
+                            .border_1()
+                            .border_color(rgb(0x2a3640))
+                            .rounded_lg()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0xb4a4ff))
+                                    .child("Shortcuts"),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_sm()
+                                    .child("Record and remap your hotkeys"),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(0x90a0aa))
+                                    .child(
+                                        "Bindings are saved to .canvas/shortcuts.json and reloaded on startup.",
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt_3()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(status_chip("Open", toggle_shortcut_label.clone()))
+                                    .child(toggle_button(
+                                        "Keys",
+                                        rgb(0xb4a4ff).into(),
+                                        self.shortcut_editor.open,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.toggle_shortcut_panel(cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
                             .mt_auto()
                             .p_3()
                             .bg(rgb(0x131a20))
@@ -2576,6 +3467,16 @@ impl Render for CanvasShell {
                         layout_mode == LayoutMode::ClassicSplit,
                         cx.listener(|this, _, _, cx| {
                             this.set_layout_mode(LayoutMode::ClassicSplit, cx);
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .child(dock_divider())
+                    .child(toggle_button(
+                        "Keys",
+                        rgb(0xb4a4ff).into(),
+                        self.shortcut_editor.open,
+                        cx.listener(|this, _, _, cx| {
+                            this.toggle_shortcut_panel(cx);
                             cx.stop_propagation();
                         }),
                     ))
@@ -2672,8 +3573,10 @@ impl Render for CanvasShell {
                     .child(status_chip("Layout", layout_status))
                     .child(status_chip("Mode", movement_status))
                     .child(status_chip("Zoom", zoom_label))
+                    .child(status_chip("Keys", toggle_shortcut_label))
                     .child(status_chip("Bridge", ghostty_chip)),
             )
+            .children(shortcut_overlay)
             .when_some(workdesk.runtime_notice.clone(), |root, notice| {
                 root.child(
                     div()
@@ -2697,7 +3600,7 @@ impl Render for CanvasShell {
 }
 
 fn main() {
-    let (workdesks, active_workdesk, boot_notice) = load_boot_state();
+    let (workdesks, active_workdesk, shortcuts, boot_notice) = load_boot_state();
     let ghostty = ghostty_build_info();
     let ghostty_vendor_dir = SharedString::from(ghostty.vendor_dir.display().to_string());
     let ghostty_status = if ghostty.linked {
@@ -2710,6 +3613,7 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
         let workdesks = workdesks.clone();
         let active_workdesk = active_workdesk;
+        let shortcuts = shortcuts.clone();
         let boot_notice = boot_notice.clone();
         let ghostty_vendor_dir = ghostty_vendor_dir.clone();
         let ghostty_status = ghostty_status.clone();
@@ -2722,6 +3626,7 @@ fn main() {
             move |window, cx| {
                 let workdesks = workdesks.clone();
                 let active_workdesk = active_workdesk;
+                let shortcuts = shortcuts.clone();
                 let boot_notice = boot_notice.clone();
                 let ghostty_vendor_dir = ghostty_vendor_dir.clone();
                 let ghostty_status = ghostty_status.clone();
@@ -2731,6 +3636,7 @@ fn main() {
                     CanvasShell::new(
                         workdesks,
                         active_workdesk,
+                        shortcuts,
                         boot_notice,
                         focus_handle.clone(),
                         ghostty_vendor_dir,
@@ -2753,18 +3659,40 @@ fn main() {
     });
 }
 
-fn load_boot_state() -> (Vec<WorkdeskState>, usize, Option<SharedString>) {
-    match load_persisted_session() {
+fn load_boot_state() -> (Vec<WorkdeskState>, usize, ShortcutMap, Option<SharedString>) {
+    let (workdesks, active_workdesk, session_notice) = match load_persisted_session() {
         Ok(Some((workdesks, active_workdesk))) => (workdesks, active_workdesk, None),
         Ok(None) => (initial_workdesks(), 0, None),
         Err(error) => (
             initial_workdesks(),
             0,
-            Some(SharedString::from(format!(
+            Some(format!(
                 "session restore failed, booted seeded desks instead: {error}"
-            ))),
+            )),
         ),
+    };
+
+    let (shortcuts, shortcut_notice) = match load_persisted_shortcuts() {
+        Ok(payload) => payload,
+        Err(error) => (
+            ShortcutMap::default(),
+            Some(format!(
+                "shortcut config failed, using defaults instead: {error}"
+            )),
+        ),
+    };
+
+    let mut notices = Vec::new();
+    if let Some(notice) = session_notice {
+        notices.push(notice);
     }
+    if let Some(notice) = shortcut_notice {
+        notices.push(notice);
+    }
+
+    let boot_notice = (!notices.is_empty()).then(|| SharedString::from(notices.join(" | ")));
+
+    (workdesks, active_workdesk, shortcuts, boot_notice)
 }
 
 fn load_persisted_session() -> Result<Option<(Vec<WorkdeskState>, usize)>, String> {
@@ -2790,6 +3718,37 @@ fn session_file_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.canvas")
         .join("session.json")
+}
+
+fn load_persisted_shortcuts() -> Result<(ShortcutMap, Option<String>), String> {
+    let shortcut_path = shortcut_file_path();
+    let payload = match fs::read(&shortcut_path) {
+        Ok(payload) => payload,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((ShortcutMap::default(), None));
+        }
+        Err(error) => {
+            return Err(format!("read {}: {error}", shortcut_path.display()));
+        }
+    };
+
+    let config = serde_json::from_slice::<PersistedShortcutConfig>(&payload)
+        .map_err(|error| format!("parse {}: {error}", shortcut_path.display()))?;
+    let (shortcuts, warnings) = ShortcutMap::from_persisted(config);
+    let warning_notice = (!warnings.is_empty()).then(|| {
+        format!(
+            "shortcut config loaded with warnings: {}",
+            warnings.join("; ")
+        )
+    });
+
+    Ok((shortcuts, warning_notice))
+}
+
+fn shortcut_file_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.canvas")
+        .join("shortcuts.json")
 }
 
 fn initial_workdesks() -> Vec<WorkdeskState> {
@@ -2922,6 +3881,110 @@ fn workdesk_card(
                 .child(status_chip("Focus", focus)),
         )
         .child(div().text_xs().text_color(rgb(0xb7c1c8)).child(preview))
+}
+
+fn shortcut_group_accent(group: ShortcutGroup) -> gpui::Hsla {
+    match group {
+        ShortcutGroup::Workspace => rgb(0x77d19a).into(),
+        ShortcutGroup::Layout => rgb(0xf0d35f).into(),
+        ShortcutGroup::View => rgb(0xb4a4ff).into(),
+        ShortcutGroup::Terminal => rgb(0x7cc7ff).into(),
+    }
+}
+
+fn shortcut_binding_button(
+    label: &str,
+    accent: gpui::Hsla,
+    active: bool,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let label = label.to_string();
+    let background = if active { rgb(0x1f2d36) } else { rgb(0x171d24) };
+    let border = if active { accent } else { rgb(0x2b3641).into() };
+
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .min_w(px(134.0))
+        .px_3()
+        .py_2()
+        .cursor_pointer()
+        .bg(background)
+        .border_1()
+        .border_color(border)
+        .rounded_lg()
+        .font_family(".ZedMono")
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, listener)
+        .child(div().text_xs().text_color(accent).child(label))
+}
+
+fn shortcut_row(
+    action: ShortcutAction,
+    binding_label: String,
+    is_recording: bool,
+    record_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    reset_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let accent = shortcut_group_accent(action.group());
+    let background = if is_recording {
+        rgb(0x182028)
+    } else {
+        rgb(0x121920)
+    };
+    let border = if is_recording {
+        accent
+    } else {
+        rgb(0x24313b).into()
+    };
+
+    div()
+        .flex()
+        .justify_between()
+        .items_center()
+        .gap_4()
+        .p_3()
+        .bg(background)
+        .border_1()
+        .border_color(border)
+        .rounded_lg()
+        .child(
+            div()
+                .flex_1()
+                .flex_col()
+                .gap_1()
+                .child(div().text_sm().child(action.label()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x90a0aa))
+                        .child(action.description()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(shortcut_binding_button(
+                    if is_recording {
+                        "Press keys..."
+                    } else {
+                        binding_label.as_str()
+                    },
+                    accent,
+                    is_recording,
+                    record_listener,
+                ))
+                .child(control_button(
+                    "Default",
+                    rgb(0x7f8a94).into(),
+                    reset_listener,
+                )),
+        )
 }
 
 fn control_button(
@@ -3807,6 +4870,45 @@ fn terminal_frame_metrics(
     }
 }
 
+fn can_bind_shortcut_keystroke(keystroke: &Keystroke) -> bool {
+    if keystroke.key.is_empty() {
+        return false;
+    }
+
+    if matches!(
+        keystroke.key.as_str(),
+        "shift" | "control" | "alt" | "platform" | "function"
+    ) {
+        return false;
+    }
+
+    keystroke.modifiers.modified() || is_non_text_shortcut_key(keystroke.key.as_str())
+}
+
+fn is_non_text_shortcut_key(key: &str) -> bool {
+    matches!(
+        key,
+        "escape"
+            | "tab"
+            | "enter"
+            | "backspace"
+            | "delete"
+            | "home"
+            | "end"
+            | "pageup"
+            | "pagedown"
+            | "left"
+            | "right"
+            | "up"
+            | "down"
+    ) || is_function_key(key)
+}
+
+fn is_function_key(key: &str) -> bool {
+    key.strip_prefix('f')
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+}
+
 fn terminal_selection_text(
     snapshot: &TerminalSnapshot,
     selection: TerminalSelection,
@@ -3963,5 +5065,56 @@ mod tests {
         assert_eq!(restored.panes.len(), 2);
         assert_eq!(restored.panes[0].id.raw(), 7);
         assert_eq!(restored.panes[1].kind, PaneKind::Agent);
+    }
+
+    #[test]
+    fn shortcut_reassignment_clears_previous_owner() {
+        let mut shortcuts = ShortcutMap::default();
+        let binding = ShortcutBinding::parse("cmd-shift-n").unwrap();
+
+        let displaced = shortcuts.set_binding(ShortcutAction::SpawnAgentPane, binding);
+
+        assert_eq!(displaced, Some(ShortcutAction::SpawnShellPane));
+        assert!(shortcuts.binding(ShortcutAction::SpawnShellPane).is_none());
+        assert_eq!(
+            shortcuts
+                .binding(ShortcutAction::SpawnAgentPane)
+                .unwrap()
+                .serialized(),
+            "cmd-shift-n"
+        );
+    }
+
+    #[test]
+    fn persisted_shortcuts_can_clear_and_override_bindings() {
+        let mut bindings = BTreeMap::new();
+        bindings.insert("spawn-shell-pane".to_string(), None);
+        bindings.insert("zoom-in".to_string(), Some("cmd-shift-=".to_string()));
+
+        let (shortcuts, warnings) =
+            ShortcutMap::from_persisted(PersistedShortcutConfig { bindings });
+
+        assert!(warnings.is_empty());
+        assert!(shortcuts.binding(ShortcutAction::SpawnShellPane).is_none());
+        assert_eq!(
+            shortcuts
+                .binding(ShortcutAction::ZoomIn)
+                .unwrap()
+                .serialized(),
+            "cmd-shift-="
+        );
+    }
+
+    #[test]
+    fn shortcut_capture_requires_modifiers_for_plain_text() {
+        assert!(!can_bind_shortcut_keystroke(
+            &Keystroke::parse("a").unwrap()
+        ));
+        assert!(can_bind_shortcut_keystroke(
+            &Keystroke::parse("cmd-a").unwrap()
+        ));
+        assert!(can_bind_shortcut_keystroke(
+            &Keystroke::parse("escape").unwrap()
+        ));
     }
 }
