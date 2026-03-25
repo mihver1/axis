@@ -20,10 +20,11 @@ use crate::{
     DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
     Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
     KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
-    MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow,
-    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    MagnifyGestureEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Overflow, ParentElement, Pixels, Point, Render, ScrollWheelEvent,
+    SharedString, Size, SmartMagnifyGestureEvent, Style, StyleRefinement, Styled,
+    SwipeGestureEvent, Task, TooltipId, TouchEvent, Visibility, Window, WindowControlArea, point,
+    px, size,
 };
 use collections::HashMap;
 use refineable::Refineable;
@@ -316,6 +317,55 @@ impl Interactivity {
         self.scroll_wheel_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                    (listener)(event, window, cx);
+                }
+            }));
+    }
+
+    /// Bind the given callback to raw touch events during the bubble phase.
+    pub fn on_touch(&mut self, listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static) {
+        self.touch_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx);
+                }
+            }));
+    }
+
+    /// Bind the given callback to magnify gesture events during the bubble phase.
+    pub fn on_magnify_gesture(
+        &mut self,
+        listener: impl Fn(&MagnifyGestureEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.magnify_gesture_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx);
+                }
+            }));
+    }
+
+    /// Bind the given callback to swipe gesture events during the bubble phase.
+    pub fn on_swipe_gesture(
+        &mut self,
+        listener: impl Fn(&SwipeGestureEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.swipe_gesture_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx);
+                }
+            }));
+    }
+
+    /// Bind the given callback to smart magnify gesture events during the bubble phase.
+    pub fn on_smart_magnify_gesture(
+        &mut self,
+        listener: impl Fn(&SmartMagnifyGestureEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.smart_magnify_gesture_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
                     (listener)(event, window, cx);
                 }
             }));
@@ -835,6 +885,42 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Bind the given callback to raw touch events during the bubble phase.
+    fn on_touch(
+        mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_touch(listener);
+        self
+    }
+
+    /// Bind the given callback to magnify gesture events during the bubble phase.
+    fn on_magnify_gesture(
+        mut self,
+        listener: impl Fn(&MagnifyGestureEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_magnify_gesture(listener);
+        self
+    }
+
+    /// Bind the given callback to swipe gesture events during the bubble phase.
+    fn on_swipe_gesture(
+        mut self,
+        listener: impl Fn(&SwipeGestureEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_swipe_gesture(listener);
+        self
+    }
+
+    /// Bind the given callback to smart magnify gesture events during the bubble phase.
+    fn on_smart_magnify_gesture(
+        mut self,
+        listener: impl Fn(&SmartMagnifyGestureEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_smart_magnify_gesture(listener);
+        self
+    }
+
     /// Capture the given action, before normal action dispatch can fire
     /// The fluent API equivalent to [`Interactivity::on_scroll_wheel`]
     ///
@@ -1192,6 +1278,19 @@ pub(crate) type MouseMoveListener =
 pub(crate) type ScrollWheelListener =
     Box<dyn Fn(&ScrollWheelEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
+pub(crate) type TouchListener =
+    Box<dyn Fn(&TouchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+
+pub(crate) type MagnifyGestureListener =
+    Box<dyn Fn(&MagnifyGestureEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+
+pub(crate) type SwipeGestureListener =
+    Box<dyn Fn(&SwipeGestureEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+
+pub(crate) type SmartMagnifyGestureListener = Box<
+    dyn Fn(&SmartMagnifyGestureEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static,
+>;
+
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 pub(crate) type DragListener =
@@ -1510,6 +1609,10 @@ pub struct Interactivity {
     pub(crate) mouse_up_listeners: Vec<MouseUpListener>,
     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
     pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
+    pub(crate) touch_listeners: Vec<TouchListener>,
+    pub(crate) magnify_gesture_listeners: Vec<MagnifyGestureListener>,
+    pub(crate) swipe_gesture_listeners: Vec<SwipeGestureListener>,
+    pub(crate) smart_magnify_gesture_listeners: Vec<SmartMagnifyGestureListener>,
     pub(crate) key_down_listeners: Vec<KeyDownListener>,
     pub(crate) key_up_listeners: Vec<KeyUpListener>,
     pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
@@ -1705,6 +1808,10 @@ impl Interactivity {
             || !self.mouse_move_listeners.is_empty()
             || !self.click_listeners.is_empty()
             || !self.scroll_wheel_listeners.is_empty()
+            || !self.touch_listeners.is_empty()
+            || !self.magnify_gesture_listeners.is_empty()
+            || !self.swipe_gesture_listeners.is_empty()
+            || !self.smart_magnify_gesture_listeners.is_empty()
             || self.drag_listener.is_some()
             || !self.drop_listeners.is_empty()
             || self.tooltip_builder.is_some()
@@ -2063,6 +2170,36 @@ impl Interactivity {
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 listener(event, phase, &hitbox, window, cx);
             })
+        }
+
+        for listener in self.touch_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |event: &TouchEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.magnify_gesture_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |event: &MagnifyGestureEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.swipe_gesture_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |event: &SwipeGestureEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.smart_magnify_gesture_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(
+                move |event: &SmartMagnifyGestureEvent, phase, window, cx| {
+                    listener(event, phase, &hitbox, window, cx);
+                },
+            )
         }
 
         if self.hover_style.is_some()

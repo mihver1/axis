@@ -1,16 +1,14 @@
-use canvas_core::{
-    PaneId, PaneKind, PaneRecord, Point as WorkdeskPoint, Size as WorkdeskSize, Workdesk,
-};
+use canvas_core::{PaneId, PaneKind, PaneRecord, Point as WorkdeskPoint, Size as WorkdeskSize};
 use canvas_terminal::{
-    ghostty_build_info, grid_size_for_pane, seed_workdesk, spawn_terminal_session, TerminalColor,
-    TerminalRow, TerminalSession, TerminalSnapshot,
+    ghostty_build_info, grid_size_for_pane, spawn_terminal_session, TerminalColor, TerminalRow,
+    TerminalSession, TerminalSnapshot,
 };
 use gpui::{
-    div, font, prelude::*, px, rgb, size, App, Application, Bounds, ClipboardItem, Context,
-    DispatchPhase, FocusHandle, FontStyle, FontWeight, KeyDownEvent, KeybindingKeystroke,
-    Keystroke, MagnifyGestureEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, ScrollWheelEvent, SharedString, SmartMagnifyGestureEvent, StrikethroughStyle,
-    StyledText, SwipeGestureEvent, TextRun, Timer, TouchEvent, TouchPhase, UnderlineStyle, Window,
+    div, font, prelude::*, px, rgb, rgba, size, App, Application, Bounds, ClipboardItem, Context,
+    FocusHandle, FontStyle, FontWeight, KeyDownEvent, KeybindingKeystroke, Keystroke,
+    MagnifyGestureEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    ScrollWheelEvent, SharedString, SmartMagnifyGestureEvent, StrikethroughStyle, StyledText,
+    SwipeGestureEvent, TextRun, Timer, TouchEvent, TouchPhase, UnderlineStyle, Window,
     WindowBounds, WindowOptions,
 };
 use serde::{Deserialize, Serialize};
@@ -37,7 +35,9 @@ const MIN_PANE_WIDTH: f32 = 320.0;
 const MIN_PANE_HEIGHT: f32 = 220.0;
 const DEFAULT_SHELL_SIZE: WorkdeskSize = WorkdeskSize::new(920.0, 560.0);
 const DEFAULT_AGENT_SIZE: WorkdeskSize = WorkdeskSize::new(720.0, 420.0);
+const DEFAULT_WORKDESK_SUMMARY: &str = "Empty desk. Add shells or agents when you need them.";
 const SIDEBAR_WIDTH: f32 = 268.0;
+const WORKDESK_MENU_WIDTH: f32 = 208.0;
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const TERMINAL_SELECTION_BG: u32 = 0x2d5b88;
 const TERMINAL_SELECTION_FG: u32 = 0xf4f8fb;
@@ -80,6 +80,7 @@ struct WorkdeskState {
 struct CanvasShell {
     workdesks: Vec<WorkdeskState>,
     active_workdesk: usize,
+    workdesk_menu: Option<WorkdeskContextMenu>,
     focus_handle: FocusHandle,
     ghostty_vendor_dir: SharedString,
     ghostty_status: SharedString,
@@ -102,6 +103,12 @@ struct TouchpadPanState {
 struct ShortcutEditorState {
     open: bool,
     recording: Option<ShortcutAction>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkdeskContextMenu {
+    index: usize,
+    position: gpui::Point<Pixels>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1169,6 +1176,7 @@ impl CanvasShell {
         let mut shell = Self {
             workdesks,
             active_workdesk: clamped_active_workdesk,
+            workdesk_menu: None,
             focus_handle,
             ghostty_vendor_dir,
             ghostty_status,
@@ -1188,10 +1196,7 @@ impl CanvasShell {
         }
 
         for workdesk in &mut shell.workdesks {
-            let panes_to_boot = workdesk.panes.clone();
-            for pane in panes_to_boot {
-                workdesk.attach_terminal_session(pane.id, &pane.kind, &pane.title, pane.size);
-            }
+            boot_workdesk_terminals(workdesk);
         }
 
         shell
@@ -2371,6 +2376,7 @@ impl CanvasShell {
             return;
         }
 
+        self.dismiss_workdesk_menu();
         self.active_workdesk_mut().drag_state = DragState::Idle;
         self.active_workdesk = index;
         self.active_workdesk_mut().drag_state = DragState::Idle;
@@ -2382,24 +2388,125 @@ impl CanvasShell {
         cx.notify();
     }
 
-    fn spawn_workdesk(&mut self, cx: &mut Context<Self>) {
-        let serial = self.workdesks.len() + 1;
-        let name = format!("Workdesk {serial}");
-        let summary = "Fresh desk for a new branch, task, or agent flow.";
-        let mut workdesk = Workdesk::new();
-        workdesk.add_pane(
-            "Shell",
-            PaneKind::Shell,
-            WorkdeskPoint::new(72.0, 72.0),
-            DEFAULT_SHELL_SIZE,
-        );
-        let mut state = WorkdeskState::new(name, summary, workdesk.panes().to_vec());
-        let panes_to_boot = state.panes.clone();
-        for pane in panes_to_boot {
-            state.attach_terminal_session(pane.id, &pane.kind, &pane.title, pane.size);
+    fn dismiss_workdesk_menu(&mut self) -> bool {
+        self.workdesk_menu.take().is_some()
+    }
+
+    fn open_workdesk_menu(
+        &mut self,
+        index: usize,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.workdesks.len() {
+            return;
         }
+
+        self.workdesk_menu = Some(WorkdeskContextMenu { index, position });
+        cx.notify();
+    }
+
+    fn toggle_workdesk_menu(
+        &mut self,
+        index: usize,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.workdesk_menu, Some(menu) if menu.index == index) {
+            self.dismiss_workdesk_menu();
+            cx.notify();
+            return;
+        }
+
+        self.open_workdesk_menu(index, position, cx);
+    }
+
+    fn next_workdesk_name(&self) -> String {
+        let mut serial = 1;
+        loop {
+            let candidate = format!("Workdesk {serial}");
+            if self.workdesks.iter().all(|desk| desk.name != candidate) {
+                return candidate;
+            }
+            serial += 1;
+        }
+    }
+
+    fn unique_workdesk_name(&self, base: &str) -> String {
+        if self.workdesks.iter().all(|desk| desk.name != base) {
+            return base.to_string();
+        }
+
+        let mut serial = 2;
+        loop {
+            let candidate = format!("{base} {serial}");
+            if self.workdesks.iter().all(|desk| desk.name != candidate) {
+                return candidate;
+            }
+            serial += 1;
+        }
+    }
+
+    fn spawn_workdesk(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_workdesk_menu();
+        let state = blank_workdesk(self.next_workdesk_name(), DEFAULT_WORKDESK_SUMMARY);
         self.workdesks.push(state);
         self.active_workdesk = self.workdesks.len() - 1;
+        self.request_persist(cx);
+        cx.notify();
+    }
+
+    fn duplicate_workdesk(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(source) = self.workdesks.get(index) else {
+            return;
+        };
+
+        let mut duplicated = PersistedWorkdesk::from_state(source).into_state();
+        duplicated.name = self.unique_workdesk_name(&format!("{} Copy", source.name));
+        duplicated.summary = source.summary.clone();
+        boot_workdesk_terminals(&mut duplicated);
+
+        let insert_at = index + 1;
+        self.workdesks.insert(insert_at, duplicated);
+        self.active_workdesk = insert_at;
+        self.dismiss_workdesk_menu();
+        self.request_persist(cx);
+        cx.notify();
+    }
+
+    fn delete_workdesk(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.workdesks.len() {
+            return;
+        }
+
+        if self.workdesks.len() == 1 {
+            if let Some(workdesk) = self.workdesks.get_mut(index) {
+                workdesk.runtime_notice = Some(SharedString::from(
+                    "Keep at least one workdesk in the session.",
+                ));
+            }
+            self.dismiss_workdesk_menu();
+            cx.notify();
+            return;
+        }
+
+        let mut removed = self.workdesks.remove(index);
+        shutdown_workdesk_terminals(&mut removed);
+
+        if self.active_workdesk > index {
+            self.active_workdesk -= 1;
+        }
+        self.active_workdesk = self
+            .active_workdesk
+            .min(self.workdesks.len().saturating_sub(1));
+
+        let active_workdesk = self.active_workdesk_mut();
+        active_workdesk.drag_state = DragState::Idle;
+        if active_workdesk.active_pane.is_none() {
+            active_workdesk.active_pane = active_workdesk.panes.last().map(|pane| pane.id);
+        }
+
+        self.dismiss_workdesk_menu();
         self.request_persist(cx);
         cx.notify();
     }
@@ -2633,6 +2740,7 @@ impl Render for CanvasShell {
         let viewport = window.window_bounds().get_bounds();
         let viewport_width = f32::from(viewport.size.width);
         let viewport_height = f32::from(viewport.size.height);
+        let open_workdesk_menu = self.workdesk_menu;
         let workdesk = self.active_workdesk();
         let layout_mode = workdesk.layout_mode;
         let grid_expose_open = layout_mode == LayoutMode::Grid && workdesk.grid_layout.expose_open;
@@ -2979,6 +3087,7 @@ impl Render for CanvasShell {
             .iter()
             .enumerate()
             .map(|(index, desk)| {
+                let is_menu_open = matches!(open_workdesk_menu, Some(menu) if menu.index == index);
                 let preview = if desk.panes.is_empty() {
                     "No panes yet".to_string()
                 } else {
@@ -2993,10 +3102,20 @@ impl Render for CanvasShell {
                     index,
                     desk,
                     index == self.active_workdesk,
+                    is_menu_open,
                     preview,
                     workdesk_accent(index),
                     cx.listener(move |this, _, _, cx| {
+                        this.dismiss_workdesk_menu();
                         this.select_workdesk(index, cx);
+                        cx.stop_propagation();
+                    }),
+                    cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                        this.open_workdesk_menu(index, event.position, cx);
+                        cx.stop_propagation();
+                    }),
+                    cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                        this.toggle_workdesk_menu(index, event.position, cx);
                         cx.stop_propagation();
                     }),
                 )
@@ -3065,7 +3184,7 @@ impl Render for CanvasShell {
                     .top(px(0.0))
                     .w(px(viewport_width))
                     .h(px(viewport_height))
-                    .bg(rgb(0x091016).opacity(0.84))
+                    .bg(rgba(0x091016d6))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                         this.close_shortcut_panel(cx);
                         cx.stop_propagation();
@@ -3191,6 +3310,7 @@ impl Render for CanvasShell {
                     )
                     .child(
                         div()
+                            .id("shortcut-scroll-list")
                             .flex_1()
                             .overflow_y_scroll()
                             .flex()
@@ -3202,58 +3322,100 @@ impl Render for CanvasShell {
         } else {
             Vec::new()
         };
+        let workdesk_context_menu = open_workdesk_menu.and_then(|menu| {
+            let desk = self.workdesks.get(menu.index)?;
+            let can_delete = self.workdesks.len() > 1;
+            let menu_height = if can_delete { 174.0 } else { 128.0 };
+            let max_left = (SIDEBAR_WIDTH - WORKDESK_MENU_WIDTH - 12.0).max(12.0);
+            let max_top = (viewport_height - menu_height - 12.0).max(12.0);
+            let left = (f32::from(menu.position.x) + 8.0).clamp(12.0, max_left);
+            let top = f32::from(menu.position.y).clamp(12.0, max_top);
+            let accent = workdesk_accent(menu.index);
 
-        window.on_mouse_event({
-            let entity = entity.clone();
-            move |event: &TouchEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble {
-                    return;
-                }
-
-                entity.update(cx, |this, cx| {
-                    this.on_touch_event(event, window, cx);
-                });
-            }
+            Some(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(WORKDESK_MENU_WIDTH))
+                    .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .bg(rgb(0x11181e))
+                    .border_1()
+                    .border_color(rgb(0x2c3944))
+                    .rounded_lg()
+                    .shadow_lg()
+                    .on_any_mouse_down(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        if this.dismiss_workdesk_menu() {
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .on_scroll_wheel(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(accent)
+                                    .child(format!("Desk {}", menu.index + 1)),
+                            )
+                            .child(div().text_sm().child(desk.name.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x90a0aa))
+                                    .child(format!("{} panes", desk.panes.len())),
+                            ),
+                    )
+                    .child(workdesk_menu_item(
+                        "Open",
+                        "Switch to this desk",
+                        accent,
+                        cx.listener(move |this, _, _, cx| {
+                            this.dismiss_workdesk_menu();
+                            this.select_workdesk(menu.index, cx);
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .child(workdesk_menu_item(
+                        "Duplicate",
+                        "Clone the layout and panes",
+                        rgb(0x7cc7ff).into(),
+                        cx.listener(move |this, _, _, cx| {
+                            this.duplicate_workdesk(menu.index, cx);
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .when(can_delete, |menu_div| {
+                        menu_div.child(workdesk_menu_item(
+                            "Delete",
+                            "Remove this desk from the session",
+                            rgb(0xff9b88).into(),
+                            cx.listener(move |this, _, _, cx| {
+                                this.delete_workdesk(menu.index, cx);
+                                cx.stop_propagation();
+                            }),
+                        ))
+                    }),
+            )
         });
-
-        window.on_mouse_event({
-            let entity = entity.clone();
-            move |event: &MagnifyGestureEvent, phase, _, cx| {
-                if phase != DispatchPhase::Bubble {
-                    return;
-                }
-
-                entity.update(cx, |this, cx| {
-                    this.on_magnify_gesture(event, cx);
-                });
-            }
-        });
-
-        window.on_mouse_event({
-            let entity = entity.clone();
-            move |event: &SwipeGestureEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble {
-                    return;
-                }
-
-                entity.update(cx, |this, cx| {
-                    this.on_swipe_gesture(event, window, cx);
-                });
-            }
-        });
-
-        window.on_mouse_event({
-            let entity = entity.clone();
-            move |event: &SmartMagnifyGestureEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble {
-                    return;
-                }
-
-                entity.update(cx, |this, cx| {
-                    this.on_smart_magnify_gesture(event, window, cx);
-                });
-            }
-        });
+        let touch_entity = entity.clone();
+        let magnify_entity = entity.clone();
+        let swipe_entity = entity.clone();
+        let smart_magnify_entity = entity.clone();
 
         div()
             .relative()
@@ -3262,6 +3424,26 @@ impl Render for CanvasShell {
             .bg(rgb(0x11161b))
             .text_color(rgb(0xf7efe5))
             .track_focus(&self.focus_handle)
+            .on_touch(move |event, window, cx| {
+                touch_entity.update(cx, |this, cx| {
+                    this.on_touch_event(event, window, cx);
+                });
+            })
+            .on_magnify_gesture(move |event, _, cx| {
+                magnify_entity.update(cx, |this, cx| {
+                    this.on_magnify_gesture(event, cx);
+                });
+            })
+            .on_swipe_gesture(move |event, window, cx| {
+                swipe_entity.update(cx, |this, cx| {
+                    this.on_swipe_gesture(event, window, cx);
+                });
+            })
+            .on_smart_magnify_gesture(move |event, window, cx| {
+                smart_magnify_entity.update(cx, |this, cx| {
+                    this.on_smart_magnify_gesture(event, window, cx);
+                });
+            })
             .on_key_down(cx.listener(Self::handle_terminal_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_canvas_mouse_down))
             .on_mouse_move(cx.listener(Self::on_canvas_mouse_move))
@@ -3596,6 +3778,7 @@ impl Render for CanvasShell {
                         .child(notice),
                 )
             })
+            .when_some(workdesk_context_menu, |root, menu| root.child(menu))
     }
 }
 
@@ -3667,7 +3850,7 @@ fn load_boot_state() -> (Vec<WorkdeskState>, usize, ShortcutMap, Option<SharedSt
             initial_workdesks(),
             0,
             Some(format!(
-                "session restore failed, booted seeded desks instead: {error}"
+                "session restore failed, started with a blank desk: {error}"
             )),
         ),
     };
@@ -3752,76 +3935,46 @@ fn shortcut_file_path() -> PathBuf {
 }
 
 fn initial_workdesks() -> Vec<WorkdeskState> {
-    let mut primary = Workdesk::new();
-    seed_workdesk(&mut primary);
+    vec![blank_workdesk("Workdesk 1", DEFAULT_WORKDESK_SUMMARY)]
+}
 
-    let mut build = Workdesk::new();
-    build.add_pane(
-        "Editor Shell",
-        PaneKind::Shell,
-        WorkdeskPoint::new(64.0, 64.0),
-        DEFAULT_SHELL_SIZE,
-    );
-    build.add_pane(
-        "Build Logs",
-        PaneKind::Shell,
-        WorkdeskPoint::new(1040.0, 88.0),
-        WorkdeskSize::new(700.0, 380.0),
-    );
-    build.add_pane(
-        "Build Agent",
-        PaneKind::Agent,
-        WorkdeskPoint::new(360.0, 700.0),
-        WorkdeskSize::new(820.0, 340.0),
-    );
+fn blank_workdesk(name: impl Into<String>, summary: impl Into<String>) -> WorkdeskState {
+    WorkdeskState::new(name, summary, Vec::new())
+}
 
-    let mut scratch = Workdesk::new();
-    scratch.add_pane(
-        "Scratch Shell",
-        PaneKind::Shell,
-        WorkdeskPoint::new(84.0, 84.0),
-        WorkdeskSize::new(860.0, 520.0),
-    );
-    scratch.add_pane(
-        "Research Agent",
-        PaneKind::Agent,
-        WorkdeskPoint::new(1010.0, 120.0),
-        DEFAULT_AGENT_SIZE,
-    );
+fn boot_workdesk_terminals(workdesk: &mut WorkdeskState) {
+    let panes_to_boot = workdesk.panes.clone();
+    for pane in panes_to_boot {
+        workdesk.attach_terminal_session(pane.id, &pane.kind, &pane.title, pane.size);
+    }
+}
 
-    vec![
-        WorkdeskState::new(
-            "Core Loop",
-            "Main implementation desk with the current shell and agent close together.",
-            primary.panes().to_vec(),
-        ),
-        WorkdeskState::new(
-            "Build & Logs",
-            "A quieter desk for long-running builds, logs, and supporting agents.",
-            build.panes().to_vec(),
-        ),
-        WorkdeskState::new(
-            "Scratchpad",
-            "A disposable desk for experiments, research, and one-off commands.",
-            scratch.panes().to_vec(),
-        ),
-    ]
+fn shutdown_workdesk_terminals(workdesk: &mut WorkdeskState) {
+    for terminal in workdesk.terminals.values() {
+        terminal.close();
+    }
+    workdesk.terminals.clear();
+    workdesk.terminal_revisions.clear();
+    workdesk.terminal_views.clear();
 }
 
 fn workdesk_card(
     index: usize,
     desk: &WorkdeskState,
     is_active: bool,
+    is_menu_open: bool,
     preview: String,
     accent: gpui::Hsla,
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    context_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    menu_button_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let border = if is_active {
+    let border = if is_active || is_menu_open {
         accent
     } else {
         rgb(0x24313b).into()
     };
-    let background = if is_active {
+    let background = if is_active || is_menu_open {
         rgb(0x162028)
     } else {
         rgb(0x11181e)
@@ -3841,7 +3994,11 @@ fn workdesk_card(
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
+        .on_mouse_down(MouseButton::Right, |_, _, cx| {
+            cx.stop_propagation();
+        })
         .on_mouse_up(MouseButton::Left, listener)
+        .on_mouse_up(MouseButton::Right, context_listener)
         .child(
             div()
                 .flex()
@@ -3855,13 +4012,44 @@ fn workdesk_card(
                 )
                 .child(
                     div()
-                        .px_2()
-                        .py_1()
-                        .rounded_full()
-                        .bg(rgb(0x0c1116))
-                        .text_xs()
-                        .text_color(rgb(0x9da8b1))
-                        .child(format!("{} panes", desk.panes.len())),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_full()
+                                .bg(rgb(0x0c1116))
+                                .text_xs()
+                                .text_color(rgb(0x9da8b1))
+                                .child(format!("{} panes", desk.panes.len())),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(28.0))
+                                .h(px(28.0))
+                                .bg(if is_menu_open {
+                                    rgb(0x1c2730)
+                                } else {
+                                    rgb(0x0c1116)
+                                })
+                                .border_1()
+                                .border_color(if is_menu_open {
+                                    accent
+                                } else {
+                                    rgb(0x24313b).into()
+                                })
+                                .rounded_md()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_up(MouseButton::Left, menu_button_listener)
+                                .child(div().text_xs().text_color(rgb(0x9da8b1)).child("•••")),
+                        ),
                 ),
         )
         .child(div().text_sm().child(desk.name.clone()))
@@ -3881,6 +4069,34 @@ fn workdesk_card(
                 .child(status_chip("Focus", focus)),
         )
         .child(div().text_xs().text_color(rgb(0xb7c1c8)).child(preview))
+}
+
+fn workdesk_menu_item(
+    label: &str,
+    detail: &str,
+    accent: gpui::Hsla,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let label = label.to_string();
+    let detail = detail.to_string();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .cursor_pointer()
+        .bg(rgb(0x171f26))
+        .border_1()
+        .border_color(rgb(0x293742))
+        .rounded_md()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, listener)
+        .child(div().text_sm().text_color(accent).child(label))
+        .child(div().text_xs().text_color(rgb(0x90a0aa)).child(detail))
 }
 
 fn shortcut_group_accent(group: ShortcutGroup) -> gpui::Hsla {
@@ -5116,5 +5332,26 @@ mod tests {
         assert!(can_bind_shortcut_keystroke(
             &Keystroke::parse("escape").unwrap()
         ));
+    }
+
+    #[test]
+    fn persisted_empty_workdesk_round_trips() {
+        let restored =
+            PersistedWorkdesk::from_state(&blank_workdesk("Desk", "Summary")).into_state();
+
+        assert_eq!(restored.name, "Desk");
+        assert_eq!(restored.summary, "Summary");
+        assert!(restored.panes.is_empty());
+        assert_eq!(restored.active_pane, None);
+    }
+
+    #[test]
+    fn initial_workdesks_start_with_single_blank_desk() {
+        let workdesks = initial_workdesks();
+
+        assert_eq!(workdesks.len(), 1);
+        assert_eq!(workdesks[0].name, "Workdesk 1");
+        assert_eq!(workdesks[0].summary, DEFAULT_WORKDESK_SUMMARY);
+        assert!(workdesks[0].panes.is_empty());
     }
 }
