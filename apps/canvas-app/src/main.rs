@@ -12,11 +12,17 @@ use gpui::{
     WindowBounds, WindowOptions,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
     fs,
+    io::{BufRead, BufReader, Write},
+    os::unix::{fs::PermissionsExt, net::UnixListener},
     path::PathBuf,
+    process::Command,
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -35,39 +41,46 @@ const MIN_PANE_WIDTH: f32 = 320.0;
 const MIN_PANE_HEIGHT: f32 = 220.0;
 const DEFAULT_SHELL_SIZE: WorkdeskSize = WorkdeskSize::new(920.0, 560.0);
 const DEFAULT_AGENT_SIZE: WorkdeskSize = WorkdeskSize::new(720.0, 420.0);
-const DEFAULT_WORKDESK_SUMMARY: &str = "Empty desk. Add shells or agents when you need them.";
-const SIDEBAR_WIDTH: f32 = 268.0;
+const SIDEBAR_WIDTH: f32 = 216.0;
 const WORKDESK_MENU_WIDTH: f32 = 208.0;
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const TERMINAL_SELECTION_BG: u32 = 0x2d5b88;
 const TERMINAL_SELECTION_FG: u32 = 0xf4f8fb;
 const TERMINAL_BODY_INSET: f32 = 12.0;
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_millis(240);
-const GRID_ACTIVE_MARGIN_X: f32 = 84.0;
-const GRID_ACTIVE_MARGIN_TOP: f32 = 54.0;
-const GRID_ACTIVE_MARGIN_BOTTOM: f32 = 96.0;
-const GRID_HINT_WIDTH: f32 = 170.0;
-const GRID_HINT_HEIGHT: f32 = 88.0;
+const GRID_ACTIVE_MARGIN_X: f32 = 56.0;
+const GRID_ACTIVE_MARGIN_TOP: f32 = 34.0;
+const GRID_ACTIVE_MARGIN_BOTTOM: f32 = 62.0;
+const GRID_HINT_WIDTH: f32 = 160.0;
+const GRID_HINT_HEIGHT: f32 = 80.0;
 const GRID_DIRECTION_EPSILON: f32 = 24.0;
-const EXPOSE_MARGIN_X: f32 = 58.0;
-const EXPOSE_MARGIN_TOP: f32 = 64.0;
-const EXPOSE_MARGIN_BOTTOM: f32 = 120.0;
-const SPLIT_MARGIN_X: f32 = 28.0;
-const SPLIT_MARGIN_TOP: f32 = 28.0;
-const SPLIT_MARGIN_BOTTOM: f32 = 96.0;
+const EXPOSE_MARGIN_X: f32 = 42.0;
+const EXPOSE_MARGIN_TOP: f32 = 48.0;
+const EXPOSE_MARGIN_BOTTOM: f32 = 88.0;
+const SPLIT_MARGIN_X: f32 = 18.0;
+const SPLIT_MARGIN_TOP: f32 = 18.0;
+const SPLIT_MARGIN_BOTTOM: f32 = 62.0;
 const SPLIT_GAP: f32 = 14.0;
 const SHORTCUT_PANEL_WIDTH: f32 = 540.0;
 const SHORTCUT_PANEL_MARGIN: f32 = 20.0;
+const FLOATING_DOCK_MARGIN: f32 = 16.0;
+const CONTEXT_STRIP_MARGIN_BOTTOM: f32 = 68.0;
+const INSPECTOR_PANEL_WIDTH: f32 = 360.0;
+const WORKDESK_EDITOR_WIDTH: f32 = 436.0;
 
 #[derive(Clone)]
 struct WorkdeskState {
     name: String,
     summary: String,
+    metadata: WorkdeskMetadata,
     panes: Vec<PaneRecord>,
+    pane_attention: HashMap<PaneId, PaneAttention>,
     terminals: HashMap<PaneId, TerminalSession>,
     terminal_revisions: HashMap<PaneId, u64>,
+    terminal_statuses: HashMap<PaneId, Option<String>>,
     terminal_views: HashMap<PaneId, TerminalViewState>,
     next_pane_serial: u64,
+    attention_sequence: u64,
     layout_mode: LayoutMode,
     grid_layout: GridLayoutState,
     camera: WorkdeskPoint,
@@ -81,11 +94,15 @@ struct CanvasShell {
     workdesks: Vec<WorkdeskState>,
     active_workdesk: usize,
     workdesk_menu: Option<WorkdeskContextMenu>,
+    workdesk_editor: Option<WorkdeskEditorState>,
+    automation_rx: Receiver<AutomationEnvelope>,
     focus_handle: FocusHandle,
+    automation_socket_path: SharedString,
     ghostty_vendor_dir: SharedString,
     ghostty_status: SharedString,
     shortcuts: ShortcutMap,
     shortcut_editor: ShortcutEditorState,
+    inspector_open: bool,
     cursor_blink_visible: bool,
     last_cursor_blink_at: Instant,
     persist_generation: u64,
@@ -109,6 +126,62 @@ struct ShortcutEditorState {
 struct WorkdeskContextMenu {
     index: usize,
     position: gpui::Point<Pixels>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkdeskMetadata {
+    #[serde(default)]
+    intent: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    branch: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    progress: Option<WorkdeskProgress>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkdeskProgress {
+    label: String,
+    value: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkdeskTemplate {
+    ShellDesk,
+    AgentReview,
+    Debug,
+    Implementation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkdeskEditorField {
+    Name,
+    Intent,
+    Summary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkdeskEditorMode {
+    Create,
+    Edit(usize),
+}
+
+#[derive(Clone, Debug)]
+struct WorkdeskDraft {
+    name: String,
+    summary: String,
+    metadata: WorkdeskMetadata,
+}
+
+#[derive(Clone, Debug)]
+struct WorkdeskEditorState {
+    mode: WorkdeskEditorMode,
+    template: WorkdeskTemplate,
+    active_field: WorkdeskEditorField,
+    draft: WorkdeskDraft,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -160,9 +233,40 @@ enum ShortcutGroup {
     Terminal,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum AttentionState {
+    #[default]
+    Idle,
+    Working,
+    Waiting,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+struct PaneAttention {
+    #[serde(default)]
+    state: AttentionState,
+    #[serde(default)]
+    unread: bool,
+    #[serde(default)]
+    last_attention_sequence: u64,
+    #[serde(default)]
+    last_activity_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WorkdeskAttentionSummary {
+    highest: AttentionState,
+    unread_count: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ShortcutAction {
     ToggleShortcutPanel,
+    ToggleInspector,
+    NextAttention,
+    ClearActiveAttention,
     SpawnShellPane,
     SpawnAgentPane,
     CloseActivePane,
@@ -263,7 +367,11 @@ struct PersistedSession {
 struct PersistedWorkdesk {
     name: String,
     summary: String,
+    #[serde(default)]
+    metadata: WorkdeskMetadata,
     panes: Vec<PersistedPane>,
+    #[serde(default)]
+    attention_sequence: u64,
     layout_mode: PersistedLayoutMode,
     camera: PersistedPoint,
     zoom: f32,
@@ -277,6 +385,8 @@ struct PersistedPane {
     kind: PersistedPaneKind,
     position: PersistedPoint,
     size: PersistedSize,
+    #[serde(default)]
+    attention: PaneAttention,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -304,6 +414,40 @@ struct PersistedPoint {
 struct PersistedSize {
     width: f32,
     height: f32,
+}
+
+struct AutomationServer {
+    receiver: Receiver<AutomationEnvelope>,
+    socket_path: PathBuf,
+}
+
+struct AutomationEnvelope {
+    request: AutomationRequest,
+    response_tx: Sender<AutomationResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AutomationRequest {
+    #[serde(default)]
+    id: Option<Value>,
+    method: String,
+    #[serde(default = "empty_json_value")]
+    params: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AutomationResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<Value>,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn empty_json_value() -> Value {
+    Value::Object(Default::default())
 }
 
 #[derive(Clone, Default)]
@@ -366,6 +510,293 @@ impl TerminalSelection {
     fn contains(self, cell: TerminalCell) -> bool {
         let (start, end) = self.ordered();
         cell.compare(start).is_ge() && cell.compare(end).is_le()
+    }
+}
+
+impl AttentionState {
+    fn from_api_name(value: &str) -> Option<Self> {
+        match value {
+            "idle" => Some(Self::Idle),
+            "working" => Some(Self::Working),
+            "waiting" => Some(Self::Waiting),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Working => "Working",
+            Self::Waiting => "Waiting",
+            Self::Error => "Error",
+        }
+    }
+
+    fn is_attention(self) -> bool {
+        matches!(self, Self::Waiting | Self::Error)
+    }
+
+    fn tint(self) -> gpui::Hsla {
+        match self {
+            Self::Idle => rgb(0x5e6c76).into(),
+            Self::Working => rgb(0x7cc7ff).into(),
+            Self::Waiting => rgb(0xf0d35f).into(),
+            Self::Error => rgb(0xff9b88).into(),
+        }
+    }
+
+    fn priority(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Working => 1,
+            Self::Waiting => 2,
+            Self::Error => 3,
+        }
+    }
+}
+
+impl AutomationResponse {
+    fn success(id: Option<Value>, result: Value) -> Self {
+        Self {
+            id,
+            ok: true,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn error(id: Option<Value>, message: impl Into<String>) -> Self {
+        Self {
+            id,
+            ok: false,
+            result: None,
+            error: Some(message.into()),
+        }
+    }
+}
+
+impl WorkdeskAttentionSummary {
+    fn register(&mut self, attention: PaneAttention) {
+        if attention.unread && attention.state.is_attention() {
+            self.unread_count += 1;
+        }
+
+        if attention.state.priority() > self.highest.priority() {
+            self.highest = attention.state;
+        }
+    }
+}
+
+impl WorkdeskMetadata {
+    fn hydrated(mut self) -> Self {
+        let (cwd, branch) = workspace_defaults();
+        if self.cwd.trim().is_empty() {
+            self.cwd = cwd;
+        }
+        if self.branch.trim().is_empty() {
+            self.branch = branch;
+        }
+        self
+    }
+
+    fn intent_label(&self, summary: &str) -> String {
+        let intent = self.intent.trim();
+        if intent.is_empty() {
+            summary.to_string()
+        } else {
+            intent.to_string()
+        }
+    }
+
+    fn status_label(&self) -> Option<String> {
+        self.status
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn progress_label(&self) -> Option<String> {
+        self.progress
+            .as_ref()
+            .map(|progress| format!("{} {}%", progress.label, progress.value))
+    }
+}
+
+impl WorkdeskProgress {
+    fn new(label: impl Into<String>, value: u8) -> Self {
+        Self {
+            label: label.into(),
+            value: value.min(100),
+        }
+    }
+}
+
+impl WorkdeskTemplate {
+    fn all() -> [Self; 4] {
+        [Self::ShellDesk, Self::AgentReview, Self::Debug, Self::Implementation]
+    }
+
+    fn from_api_name(value: &str) -> Option<Self> {
+        match value {
+            "shell-desk" | "shell" => Some(Self::ShellDesk),
+            "agent-review" | "review" => Some(Self::AgentReview),
+            "debug" => Some(Self::Debug),
+            "implementation" | "implement" => Some(Self::Implementation),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ShellDesk => "Shell Desk",
+            Self::AgentReview => "Agent Review",
+            Self::Debug => "Debug",
+            Self::Implementation => "Implementation",
+        }
+    }
+
+    fn base_name(self) -> &'static str {
+        self.label()
+    }
+
+    fn summary(self) -> &'static str {
+        match self {
+            Self::ShellDesk => "One shell kept hot for command-first work.",
+            Self::AgentReview => "Agent plus shell loop for review and verification.",
+            Self::Debug => "Repro shell and debug agent kept in one workspace.",
+            Self::Implementation => "Execution shell with an implementation agent beside it.",
+        }
+    }
+
+    fn intent(self) -> &'static str {
+        match self {
+            Self::ShellDesk => "Run commands, inspect state, and keep one terminal ready.",
+            Self::AgentReview => "Review agent output, verify claims, and keep evidence nearby.",
+            Self::Debug => "Pin the repro, keep logs visible, and iterate on fixes.",
+            Self::Implementation => "Ship a scoped change, verify locally, and keep the build green.",
+        }
+    }
+
+    fn status(self) -> Option<String> {
+        match self {
+            Self::ShellDesk => Some("Ready".to_string()),
+            Self::AgentReview => Some("Reviewing".to_string()),
+            Self::Debug => Some("Debugging".to_string()),
+            Self::Implementation => Some("Building".to_string()),
+        }
+    }
+
+    fn progress(self) -> Option<WorkdeskProgress> {
+        match self {
+            Self::ShellDesk => None,
+            Self::AgentReview => Some(WorkdeskProgress::new("Review", 20)),
+            Self::Debug => Some(WorkdeskProgress::new("Debug", 15)),
+            Self::Implementation => Some(WorkdeskProgress::new("Build", 25)),
+        }
+    }
+
+    fn accent(self) -> gpui::Hsla {
+        match self {
+            Self::ShellDesk => rgb(0xe59a49).into(),
+            Self::AgentReview => rgb(0x7cc7ff).into(),
+            Self::Debug => rgb(0xff9b88).into(),
+            Self::Implementation => rgb(0x77d19a).into(),
+        }
+    }
+}
+
+impl WorkdeskEditorField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Intent => "Intent",
+            Self::Summary => "Summary",
+        }
+    }
+
+    fn cycle(self, reverse: bool) -> Self {
+        match (self, reverse) {
+            (Self::Name, false) => Self::Intent,
+            (Self::Intent, false) => Self::Summary,
+            (Self::Summary, false) => Self::Name,
+            (Self::Name, true) => Self::Summary,
+            (Self::Intent, true) => Self::Name,
+            (Self::Summary, true) => Self::Intent,
+        }
+    }
+}
+
+impl WorkdeskDraft {
+    fn from_template(name: String, template: WorkdeskTemplate) -> Self {
+        Self {
+            name,
+            summary: template.summary().to_string(),
+            metadata: default_workdesk_metadata(
+                template.intent().to_string(),
+                template.status(),
+                template.progress(),
+            ),
+        }
+    }
+
+    fn from_workdesk(desk: &WorkdeskState) -> Self {
+        Self {
+            name: desk.name.clone(),
+            summary: desk.summary.clone(),
+            metadata: desk.metadata.clone(),
+        }
+    }
+
+    fn field_value(&self, field: WorkdeskEditorField) -> &str {
+        match field {
+            WorkdeskEditorField::Name => &self.name,
+            WorkdeskEditorField::Intent => &self.metadata.intent,
+            WorkdeskEditorField::Summary => &self.summary,
+        }
+    }
+
+    fn field_value_mut(&mut self, field: WorkdeskEditorField) -> &mut String {
+        match field {
+            WorkdeskEditorField::Name => &mut self.name,
+            WorkdeskEditorField::Intent => &mut self.metadata.intent,
+            WorkdeskEditorField::Summary => &mut self.summary,
+        }
+    }
+}
+
+impl WorkdeskEditorState {
+    fn new_create(template: WorkdeskTemplate, name: String) -> Self {
+        Self {
+            mode: WorkdeskEditorMode::Create,
+            template,
+            active_field: WorkdeskEditorField::Name,
+            draft: WorkdeskDraft::from_template(name, template),
+        }
+    }
+
+    fn new_edit(index: usize, desk: &WorkdeskState) -> Self {
+        Self {
+            mode: WorkdeskEditorMode::Edit(index),
+            template: WorkdeskTemplate::ShellDesk,
+            active_field: WorkdeskEditorField::Name,
+            draft: WorkdeskDraft::from_workdesk(desk),
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match self.mode {
+            WorkdeskEditorMode::Create => "New workdesk",
+            WorkdeskEditorMode::Edit(_) => "Edit workdesk",
+        }
+    }
+
+    fn submit_label(&self) -> &'static str {
+        match self.mode {
+            WorkdeskEditorMode::Create => "Create",
+            WorkdeskEditorMode::Edit(_) => "Save",
+        }
     }
 }
 
@@ -467,8 +898,11 @@ impl GridDirection {
     }
 }
 
-const SHORTCUT_ACTIONS: [ShortcutAction; 22] = [
+const SHORTCUT_ACTIONS: [ShortcutAction; 25] = [
     ShortcutAction::ToggleShortcutPanel,
+    ShortcutAction::ToggleInspector,
+    ShortcutAction::NextAttention,
+    ShortcutAction::ClearActiveAttention,
     ShortcutAction::SpawnShellPane,
     ShortcutAction::SpawnAgentPane,
     ShortcutAction::CloseActivePane,
@@ -504,7 +938,7 @@ impl ShortcutGroup {
 
     fn summary(self) -> &'static str {
         match self {
-            Self::Workspace => "Create panes, move between desks, and open the shortcut drawer.",
+            Self::Workspace => "Create panes, move between desks, inspect attention, and open utility overlays.",
             Self::Layout => "Switch layout modes and move focus in directional layouts.",
             Self::View => "Control the freeform camera without touching the mouse.",
             Self::Terminal => "Use familiar clipboard and selection actions in the active pane.",
@@ -520,6 +954,9 @@ impl ShortcutAction {
     fn slug(self) -> &'static str {
         match self {
             Self::ToggleShortcutPanel => "toggle-shortcut-panel",
+            Self::ToggleInspector => "toggle-inspector",
+            Self::NextAttention => "next-attention",
+            Self::ClearActiveAttention => "clear-active-attention",
             Self::SpawnShellPane => "spawn-shell-pane",
             Self::SpawnAgentPane => "spawn-agent-pane",
             Self::CloseActivePane => "close-active-pane",
@@ -554,6 +991,9 @@ impl ShortcutAction {
     fn group(self) -> ShortcutGroup {
         match self {
             Self::ToggleShortcutPanel
+            | Self::ToggleInspector
+            | Self::NextAttention
+            | Self::ClearActiveAttention
             | Self::SpawnShellPane
             | Self::SpawnAgentPane
             | Self::CloseActivePane
@@ -578,6 +1018,9 @@ impl ShortcutAction {
     fn label(self) -> &'static str {
         match self {
             Self::ToggleShortcutPanel => "Open shortcut drawer",
+            Self::ToggleInspector => "Toggle developer inspector",
+            Self::NextAttention => "Jump to next attention",
+            Self::ClearActiveAttention => "Clear active attention",
             Self::SpawnShellPane => "New shell pane",
             Self::SpawnAgentPane => "New agent pane",
             Self::CloseActivePane => "Close active pane",
@@ -606,6 +1049,15 @@ impl ShortcutAction {
         match self {
             Self::ToggleShortcutPanel => {
                 "Open the drawer where shortcuts can be reviewed and remapped."
+            }
+            Self::ToggleInspector => {
+                "Open the debug-only inspector with bridge and layout diagnostics."
+            }
+            Self::NextAttention => {
+                "Jump to the next pane across all desks that still has unread attention."
+            }
+            Self::ClearActiveAttention => {
+                "Dismiss the current pane's waiting or error attention state."
             }
             Self::SpawnShellPane => "Create a new shell pane near the viewport center.",
             Self::SpawnAgentPane => "Create a new agent pane near the viewport center.",
@@ -636,6 +1088,9 @@ impl ShortcutAction {
     fn default_binding(self) -> Option<&'static str> {
         match self {
             Self::ToggleShortcutPanel => Some("cmd-/"),
+            Self::ToggleInspector => Some("cmd-alt-i"),
+            Self::NextAttention => Some("cmd-alt-j"),
+            Self::ClearActiveAttention => Some("cmd-alt-k"),
             Self::SpawnShellPane => Some("cmd-shift-n"),
             Self::SpawnAgentPane => Some("cmd-alt-n"),
             Self::CloseActivePane => Some("cmd-shift-w"),
@@ -902,17 +1357,41 @@ impl PaneViewportFrame {
 
 impl WorkdeskState {
     fn new(name: impl Into<String>, summary: impl Into<String>, panes: Vec<PaneRecord>) -> Self {
+        let name = name.into();
+        let summary = summary.into();
         let next_pane_serial = panes.iter().map(|pane| pane.id.raw()).max().unwrap_or(0) + 1;
         let active_pane = panes.last().map(|pane| pane.id);
+        let pane_attention = panes
+            .iter()
+            .map(|pane| {
+                let state = match pane.kind {
+                    PaneKind::Shell => AttentionState::Idle,
+                    PaneKind::Agent => AttentionState::Working,
+                };
+                (
+                    pane.id,
+                    PaneAttention {
+                        state,
+                        unread: false,
+                        last_attention_sequence: 0,
+                        last_activity_sequence: 0,
+                    },
+                )
+            })
+            .collect();
 
         Self {
-            name: name.into(),
-            summary: summary.into(),
+            name,
+            summary: summary.clone(),
+            metadata: default_workdesk_metadata(summary, None, None),
             panes,
+            pane_attention,
             terminals: HashMap::new(),
             terminal_revisions: HashMap::new(),
+            terminal_statuses: HashMap::new(),
             terminal_views: HashMap::new(),
             next_pane_serial,
+            attention_sequence: 0,
             layout_mode: LayoutMode::Free,
             grid_layout: GridLayoutState::default(),
             camera: WorkdeskPoint::new(0.0, 0.0),
@@ -923,23 +1402,87 @@ impl WorkdeskState {
         }
     }
 
-    fn sync_terminal_revisions(&mut self) -> bool {
-        let mut changed = false;
+    fn sync_terminal_revisions(&mut self) -> Vec<PaneId> {
+        let mut changed = Vec::new();
 
         for (pane_id, terminal) in &self.terminals {
             let revision = terminal.revision();
             if self.terminal_revisions.get(pane_id).copied() != Some(revision) {
                 self.terminal_revisions.insert(*pane_id, revision);
-                changed = true;
+                changed.push(*pane_id);
             }
         }
 
         self.terminal_revisions
             .retain(|pane_id, _| self.terminals.contains_key(pane_id));
+        self.terminal_statuses
+            .retain(|pane_id, _| self.terminals.contains_key(pane_id));
         self.terminal_views
             .retain(|pane_id, _| self.terminals.contains_key(pane_id));
+        self.pane_attention
+            .retain(|pane_id, _| self.panes.iter().any(|pane| pane.id == *pane_id));
 
         changed
+    }
+
+    fn next_attention_sequence(&mut self) -> u64 {
+        self.attention_sequence += 1;
+        self.attention_sequence
+    }
+
+    fn pane_attention(&self, pane_id: PaneId) -> PaneAttention {
+        self.pane_attention.get(&pane_id).copied().unwrap_or_default()
+    }
+
+    fn pane_attention_mut(&mut self, pane_id: PaneId) -> &mut PaneAttention {
+        self.pane_attention.entry(pane_id).or_default()
+    }
+
+    fn set_pane_attention_state(
+        &mut self,
+        pane_id: PaneId,
+        state: AttentionState,
+        unread: bool,
+    ) -> bool {
+        let next_sequence = if state.is_attention() {
+            Some(self.next_attention_sequence())
+        } else {
+            None
+        };
+        let attention = self.pane_attention_mut(pane_id);
+        let changed = attention.state != state || attention.unread != unread;
+        if !changed {
+            return false;
+        }
+
+        attention.state = state;
+        attention.unread = unread && state.is_attention();
+        if let Some(sequence) = next_sequence {
+            attention.last_attention_sequence = sequence;
+        }
+        changed
+    }
+
+    fn mark_pane_attention_seen(&mut self, pane_id: PaneId) -> bool {
+        let attention = self.pane_attention_mut(pane_id);
+        if !attention.unread {
+            return false;
+        }
+        attention.unread = false;
+        true
+    }
+
+    fn note_pane_activity(&mut self, pane_id: PaneId) {
+        let sequence = self.next_attention_sequence();
+        self.pane_attention_mut(pane_id).last_activity_sequence = sequence;
+    }
+
+    fn workdesk_attention_summary(&self) -> WorkdeskAttentionSummary {
+        let mut summary = WorkdeskAttentionSummary::default();
+        for attention in self.pane_attention.values().copied() {
+            summary.register(attention);
+        }
+        summary
     }
 
     fn attach_terminal_session(
@@ -952,8 +1495,18 @@ impl WorkdeskState {
         match spawn_terminal_session(kind, title, size) {
             Ok(session) => {
                 self.terminal_revisions.insert(pane_id, session.revision());
+                self.terminal_statuses.insert(pane_id, None);
                 self.terminals.insert(pane_id, session);
                 self.terminal_views.entry(pane_id).or_default();
+                self.pane_attention.entry(pane_id).or_insert(PaneAttention {
+                    state: match kind {
+                        PaneKind::Shell => AttentionState::Idle,
+                        PaneKind::Agent => AttentionState::Working,
+                    },
+                    unread: false,
+                    last_attention_sequence: 0,
+                    last_activity_sequence: 0,
+                });
             }
             Err(error) => {
                 self.runtime_notice = Some(SharedString::from(format!(
@@ -1016,6 +1569,7 @@ impl WorkdeskState {
 
     fn focus_pane(&mut self, pane_id: PaneId) {
         self.active_pane = Some(pane_id);
+        self.mark_pane_attention_seen(pane_id);
         self.bring_pane_to_front(pane_id);
     }
 
@@ -1047,6 +1601,18 @@ impl WorkdeskState {
             .and_then(|pane_id| self.panes.iter().find(|pane| pane.id == pane_id))
             .map(|pane| pane.title.clone())
             .unwrap_or_else(|| "None".to_string())
+    }
+
+    fn intent_label(&self) -> String {
+        self.metadata.intent_label(&self.summary)
+    }
+
+    fn status_label(&self) -> Option<String> {
+        self.metadata.status_label()
+    }
+
+    fn progress_label(&self) -> Option<String> {
+        self.metadata.progress_label()
     }
 
     fn clear_selection(&mut self, pane_id: PaneId) {
@@ -1116,6 +1682,7 @@ impl PersistedWorkdesk {
         Self {
             name: state.name.clone(),
             summary: state.summary.clone(),
+            metadata: state.metadata.clone(),
             panes: state
                 .panes
                 .iter()
@@ -1125,8 +1692,10 @@ impl PersistedWorkdesk {
                     kind: PersistedPaneKind::from(&pane.kind),
                     position: PersistedPoint::from(pane.position),
                     size: PersistedSize::from(pane.size),
+                    attention: state.pane_attention(pane.id),
                 })
                 .collect(),
+            attention_sequence: state.attention_sequence,
             layout_mode: state.layout_mode.into(),
             camera: state.camera.into(),
             zoom: state.zoom,
@@ -1135,8 +1704,23 @@ impl PersistedWorkdesk {
     }
 
     fn into_state(self) -> WorkdeskState {
-        let panes = self
-            .panes
+        let PersistedWorkdesk {
+            name,
+            summary,
+            metadata,
+            panes,
+            attention_sequence,
+            layout_mode,
+            camera,
+            zoom,
+            active_pane,
+        } = self;
+
+        let pane_attention = panes
+            .iter()
+            .map(|pane| (PaneId::new(pane.id), pane.attention))
+            .collect::<HashMap<_, _>>();
+        let panes = panes
             .into_iter()
             .map(|pane| PaneRecord {
                 id: PaneId::new(pane.id),
@@ -1147,12 +1731,14 @@ impl PersistedWorkdesk {
             })
             .collect::<Vec<_>>();
 
-        let mut state = WorkdeskState::new(self.name, self.summary, panes);
-        state.layout_mode = self.layout_mode.into();
-        state.camera = self.camera.into();
-        state.zoom = self.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-        state.active_pane = self
-            .active_pane
+        let mut state = WorkdeskState::new(name, summary, panes);
+        state.metadata = metadata.hydrated();
+        state.pane_attention = pane_attention;
+        state.attention_sequence = attention_sequence;
+        state.layout_mode = layout_mode.into();
+        state.camera = camera.into();
+        state.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        state.active_pane = active_pane
             .map(PaneId::new)
             .filter(|pane_id| state.panes.iter().any(|pane| pane.id == *pane_id));
         state.grid_layout = GridLayoutState::default();
@@ -1168,20 +1754,29 @@ impl CanvasShell {
         active_workdesk: usize,
         shortcuts: ShortcutMap,
         boot_notice: Option<SharedString>,
+        automation_server: AutomationServer,
         focus_handle: FocusHandle,
         ghostty_vendor_dir: SharedString,
         ghostty_status: SharedString,
     ) -> Self {
+        let AutomationServer {
+            receiver,
+            socket_path,
+        } = automation_server;
         let clamped_active_workdesk = active_workdesk.min(workdesks.len().saturating_sub(1));
         let mut shell = Self {
             workdesks,
             active_workdesk: clamped_active_workdesk,
             workdesk_menu: None,
+            workdesk_editor: None,
+            automation_rx: receiver,
             focus_handle,
+            automation_socket_path: SharedString::from(socket_path.display().to_string()),
             ghostty_vendor_dir,
             ghostty_status,
             shortcuts,
             shortcut_editor: ShortcutEditorState::default(),
+            inspector_open: false,
             cursor_blink_visible: true,
             last_cursor_blink_at: Instant::now(),
             persist_generation: 0,
@@ -1218,6 +1813,562 @@ impl CanvasShell {
         if let Some(workdesk) = self.workdesks.get_mut(self.active_workdesk) {
             workdesk.runtime_notice = Some(SharedString::from(message.into()));
         }
+    }
+
+    fn workdesk_name_for_template(&self, template: WorkdeskTemplate) -> String {
+        self.unique_workdesk_name(template.base_name())
+    }
+
+    fn open_workdesk_creator(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_workdesk_menu();
+        self.workdesk_editor = Some(WorkdeskEditorState::new_create(
+            WorkdeskTemplate::ShellDesk,
+            self.workdesk_name_for_template(WorkdeskTemplate::ShellDesk),
+        ));
+        cx.notify();
+    }
+
+    fn open_workdesk_editor_panel(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(desk) = self.workdesks.get(index).cloned() else {
+            return;
+        };
+        self.dismiss_workdesk_menu();
+        self.workdesk_editor = Some(WorkdeskEditorState::new_edit(index, &desk));
+        cx.notify();
+    }
+
+    fn close_workdesk_editor(&mut self, cx: &mut Context<Self>) {
+        if self.workdesk_editor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn select_workdesk_template(&mut self, template: WorkdeskTemplate, cx: &mut Context<Self>) {
+        let name = self.workdesk_name_for_template(template);
+        let Some(editor) = self.workdesk_editor.as_mut() else {
+            return;
+        };
+        if editor.mode != WorkdeskEditorMode::Create || editor.template == template {
+            return;
+        }
+
+        editor.template = template;
+        editor.active_field = WorkdeskEditorField::Name;
+        editor.draft = WorkdeskDraft::from_template(name, template);
+        cx.notify();
+    }
+
+    fn commit_workdesk_editor(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(editor) = self.workdesk_editor.clone() else {
+            return false;
+        };
+
+        match editor.mode {
+            WorkdeskEditorMode::Create => {
+                let name = self.workdesk_name_for_template(editor.template);
+                let draft = normalize_workdesk_draft(editor.draft, &name, editor.template.summary());
+                let mut desk = workdesk_from_template(editor.template, draft);
+                boot_workdesk_terminals(&mut desk);
+                self.workdesks.push(desk);
+                self.active_workdesk = self.workdesks.len() - 1;
+            }
+            WorkdeskEditorMode::Edit(index) => {
+                if index >= self.workdesks.len() {
+                    self.workdesk_editor = None;
+                    cx.notify();
+                    return false;
+                }
+
+                let current_name = self.workdesks[index].name.clone();
+                let current_summary = self.workdesks[index].summary.clone();
+                let fallback_name = self.unique_workdesk_name_except(index, &current_name);
+                let draft = normalize_workdesk_draft(editor.draft, &fallback_name, &current_summary);
+                let desk = &mut self.workdesks[index];
+                desk.name = draft.name;
+                desk.summary = draft.summary;
+                desk.metadata = draft.metadata.hydrated();
+            }
+        }
+
+        self.workdesk_editor = None;
+        self.request_persist(cx);
+        cx.notify();
+        true
+    }
+
+    fn handle_workdesk_editor_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(editor) = self.workdesk_editor.as_mut() else {
+            return false;
+        };
+        let keystroke = &event.keystroke;
+
+        if keystroke.key == "escape" && !keystroke.modifiers.modified() {
+            self.close_workdesk_editor(cx);
+            return true;
+        }
+
+        if keystroke.key == "enter" && !keystroke.modifiers.modified() {
+            self.commit_workdesk_editor(cx);
+            return true;
+        }
+
+        if keystroke.key == "tab"
+            && !keystroke.modifiers.control
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.platform
+            && !keystroke.modifiers.function
+        {
+            editor.active_field = editor.active_field.cycle(keystroke.modifiers.shift);
+            cx.notify();
+            return true;
+        }
+
+        if matches!(keystroke.key.as_str(), "backspace" | "delete") && !keystroke.modifiers.modified()
+        {
+            editor.draft.field_value_mut(editor.active_field).pop();
+            cx.notify();
+            return true;
+        }
+
+        if let Some(text) = editable_keystroke_text(keystroke) {
+            editor
+                .draft
+                .field_value_mut(editor.active_field)
+                .push_str(&text);
+            cx.notify();
+            return true;
+        }
+
+        true
+    }
+
+    fn process_automation_commands(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut processed = false;
+
+        while let Ok(envelope) = self.automation_rx.try_recv() {
+            processed = true;
+            let response = self.handle_automation_request(envelope.request, cx);
+            let _ = envelope.response_tx.send(response);
+        }
+
+        processed
+    }
+
+    fn handle_automation_request(
+        &mut self,
+        request: AutomationRequest,
+        cx: &mut Context<Self>,
+    ) -> AutomationResponse {
+        let id = request.id.clone();
+        let response: Result<Value, String> = (|| match request.method.as_str() {
+            "workdesk.list" => Ok(Value::Array(
+                self.workdesks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, desk)| {
+                        automation_workdesk_summary_json(index, desk, index == self.active_workdesk)
+                    })
+                    .collect(),
+            )),
+            "workdesk.create" => {
+                let template = json_string_at(&request.params, &["template"])
+                    .map(|value| {
+                        WorkdeskTemplate::from_api_name(&value)
+                            .ok_or_else(|| format!("unknown template `{value}`"))
+                    })
+                    .transpose()?
+                    .unwrap_or(WorkdeskTemplate::ShellDesk);
+                let default_name = self.workdesk_name_for_template(template);
+                let mut draft = WorkdeskDraft::from_template(default_name.clone(), template);
+                if let Some(name) = json_string_at(&request.params, &["name"]) {
+                    draft.name = self.unique_workdesk_name(&name);
+                }
+                if let Some(summary) = json_string_at(&request.params, &["summary"]) {
+                    draft.summary = summary;
+                }
+                if let Some(intent) = json_string_at(&request.params, &["intent"]) {
+                    draft.metadata.intent = intent;
+                }
+                if let Some(cwd) = json_string_at(&request.params, &["cwd"]) {
+                    draft.metadata.cwd = cwd;
+                }
+                if let Some(branch) = json_string_at(&request.params, &["branch"]) {
+                    draft.metadata.branch = branch;
+                }
+                if json_has_any(&request.params, &["status"]) {
+                    draft.metadata.status = json_optional_string_at(&request.params, &["status"])?;
+                }
+                if let Some(progress) = json_value_at(&request.params, &["progress"]) {
+                    draft.metadata.progress = parse_progress_value(progress)?;
+                }
+                let select = json_bool_at(&request.params, &["select"]).unwrap_or(true);
+                let mut desk = workdesk_from_template(template, draft);
+                boot_workdesk_terminals(&mut desk);
+                self.workdesks.push(desk);
+                let index = self.workdesks.len() - 1;
+                if select {
+                    self.select_workdesk(index, cx);
+                } else {
+                    self.request_persist(cx);
+                }
+                Ok(automation_workdesk_summary_json(
+                    index,
+                    &self.workdesks[index],
+                    index == self.active_workdesk,
+                ))
+            }
+            "workdesk.select" => {
+                let index = if let Some(name) =
+                    json_string_at(&request.params, &["workdesk_name", "name"])
+                {
+                    self.workdesks
+                        .iter()
+                        .position(|desk| desk.name == name)
+                        .ok_or_else(|| format!("workdesk `{name}` was not found"))?
+                } else {
+                    self.resolve_automation_workdesk_index(&request.params)?
+                };
+                self.select_workdesk(index, cx);
+                Ok(automation_workdesk_summary_json(
+                    index,
+                    &self.workdesks[index],
+                    true,
+                ))
+            }
+            "workdesk.rename" => {
+                let index = self.resolve_automation_workdesk_index(&request.params)?;
+                let name = require_json_string_at(&request.params, &["name"], "name")?;
+                let name = self.unique_workdesk_name_except(index, &name);
+                self.workdesks[index].name = name;
+                self.request_persist(cx);
+                Ok(automation_workdesk_summary_json(
+                    index,
+                    &self.workdesks[index],
+                    index == self.active_workdesk,
+                ))
+            }
+            "pane.create" => {
+                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
+                let kind = json_string_at(&request.params, &["kind"])
+                    .and_then(|value| parse_pane_kind(&value))
+                    .ok_or_else(|| "pane.create requires `kind` = `shell` or `agent`".to_string())?;
+                let title = json_string_at(&request.params, &["title"]);
+                let focus = json_bool_at(&request.params, &["focus"]).unwrap_or(true);
+                let pane_id = self.spawn_pane_on_workdesk(desk_index, kind, title, focus);
+                self.request_persist(cx);
+                Ok(automation_pane_json(
+                    &self.workdesks[desk_index],
+                    pane_id,
+                    desk_index == self.active_workdesk,
+                ))
+            }
+            "pane.focus" => {
+                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
+                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
+                if desk_index != self.active_workdesk {
+                    self.select_workdesk(desk_index, cx);
+                }
+                self.focus_pane(pane_id, cx);
+                Ok(automation_pane_json(
+                    &self.workdesks[desk_index],
+                    pane_id,
+                    true,
+                ))
+            }
+            "attention.set" => {
+                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
+                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
+                let state = json_string_at(&request.params, &["state"])
+                    .and_then(|value| AttentionState::from_api_name(&value))
+                    .ok_or_else(|| "attention.set requires `state`".to_string())?;
+                let unread = json_bool_at(&request.params, &["unread"]).unwrap_or(state.is_attention());
+                self.set_pane_attention(desk_index, pane_id, state, unread, true, cx);
+                Ok(automation_pane_json(
+                    &self.workdesks[desk_index],
+                    pane_id,
+                    desk_index == self.active_workdesk,
+                ))
+            }
+            "attention.clear" => {
+                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
+                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
+                let baseline = self.baseline_attention_state(desk_index, pane_id);
+                self.set_pane_attention(desk_index, pane_id, baseline, false, false, cx);
+                Ok(automation_pane_json(
+                    &self.workdesks[desk_index],
+                    pane_id,
+                    desk_index == self.active_workdesk,
+                ))
+            }
+            "status.set" => {
+                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
+                self.workdesks[desk_index].metadata.status =
+                    json_optional_string_at(&request.params, &["value", "status"])?;
+                self.request_persist(cx);
+                Ok(automation_workdesk_summary_json(
+                    desk_index,
+                    &self.workdesks[desk_index],
+                    desk_index == self.active_workdesk,
+                ))
+            }
+            "progress.set" => {
+                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
+                let progress = if let Some(progress_value) =
+                    json_value_at(&request.params, &["progress", "value"])
+                {
+                    if progress_value.is_object() {
+                        parse_progress_value(progress_value)?
+                    } else {
+                        let label = require_json_string_at(&request.params, &["label"], "label")?;
+                        let value = progress_value
+                            .as_u64()
+                            .ok_or_else(|| "`value` must be an integer from 0 to 100".to_string())?;
+                        Some(WorkdeskProgress::new(label, value as u8))
+                    }
+                } else {
+                    None
+                };
+                self.workdesks[desk_index].metadata.progress = progress;
+                self.request_persist(cx);
+                Ok(automation_workdesk_summary_json(
+                    desk_index,
+                    &self.workdesks[desk_index],
+                    desk_index == self.active_workdesk,
+                ))
+            }
+            "notification.create" => {
+                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
+                let body = require_json_string_at(&request.params, &["body", "message"], "body")?;
+                let title = json_string_at(&request.params, &["title"]);
+                let message = title
+                    .as_deref()
+                    .map(|title| format!("{title} · {body}"))
+                    .unwrap_or_else(|| body.clone());
+                self.workdesks[desk_index].runtime_notice = Some(SharedString::from(message.clone()));
+                if json_bool_at(&request.params, &["desktop"]).unwrap_or(false) {
+                    post_attention_notification(
+                        title.unwrap_or_else(|| "Canvas".to_string()),
+                        body.clone(),
+                    );
+                }
+                Ok(json!({
+                    "desk_index": desk_index,
+                    "message": message,
+                }))
+            }
+            "state.current" => Ok(self.automation_state_json()),
+            other => Err(format!("unknown automation method `{other}`")),
+        })();
+
+        match response {
+            Ok(result) => AutomationResponse::success(id, result),
+            Err(error) => AutomationResponse::error(id, error),
+        }
+    }
+
+    fn resolve_automation_workdesk_index(&self, params: &Value) -> Result<usize, String> {
+        if let Some(index) = json_u64_at(params, &["workdesk_index", "index"]) {
+            let index = index as usize;
+            if index < self.workdesks.len() {
+                return Ok(index);
+            }
+            return Err(format!("workdesk index {index} is out of range"));
+        }
+
+        if let Some(name) = json_string_at(params, &["workdesk_name"]) {
+            return self
+                .workdesks
+                .iter()
+                .position(|desk| desk.name == name)
+                .ok_or_else(|| format!("workdesk `{name}` was not found"));
+        }
+
+        Ok(self.active_workdesk)
+    }
+
+    fn resolve_automation_pane_id(&self, desk_index: usize, params: &Value) -> Result<PaneId, String> {
+        let desk = self
+            .workdesks
+            .get(desk_index)
+            .ok_or_else(|| format!("workdesk index {desk_index} is out of range"))?;
+
+        if let Some(raw_id) = json_u64_at(params, &["pane_id", "id"]) {
+            let pane_id = PaneId::new(raw_id);
+            if desk.panes.iter().any(|pane| pane.id == pane_id) {
+                return Ok(pane_id);
+            }
+            return Err(format!(
+                "pane {} was not found on workdesk `{}`",
+                raw_id, desk.name
+            ));
+        }
+
+        desk.active_pane
+            .ok_or_else(|| format!("workdesk `{}` does not have an active pane", desk.name))
+    }
+
+    fn automation_state_json(&self) -> Value {
+        json!({
+            "active_workdesk": self.active_workdesk,
+            "socket_path": self.automation_socket_path.to_string(),
+            "workdesks": self.workdesks.iter().enumerate().map(|(index, desk)| {
+                automation_workdesk_state_json(index, desk, index == self.active_workdesk)
+            }).collect::<Vec<_>>(),
+        })
+    }
+
+    fn baseline_attention_state(&self, desk_index: usize, pane_id: PaneId) -> AttentionState {
+        let Some(desk) = self.workdesks.get(desk_index) else {
+            return AttentionState::Idle;
+        };
+        let Some(pane) = desk.panes.iter().find(|pane| pane.id == pane_id) else {
+            return AttentionState::Idle;
+        };
+
+        match pane.kind {
+            PaneKind::Shell => AttentionState::Idle,
+            PaneKind::Agent => desk
+                .terminals
+                .get(&pane_id)
+                .map(|terminal| terminal.snapshot())
+                .filter(|snapshot| !snapshot.closed)
+                .map(|_| AttentionState::Working)
+                .unwrap_or(AttentionState::Idle),
+        }
+    }
+
+    fn set_pane_attention(
+        &mut self,
+        desk_index: usize,
+        pane_id: PaneId,
+        state: AttentionState,
+        unread: bool,
+        announce: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let active_workdesk = self.active_workdesk;
+        let (changed, desk_name, pane_title, is_visible) = {
+            let Some(desk) = self.workdesks.get_mut(desk_index) else {
+                return false;
+            };
+            let Some(pane_title) = desk
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .map(|pane| pane.title.clone())
+            else {
+                return false;
+            };
+            let effective_unread =
+                unread && !(active_workdesk == desk_index && desk.active_pane == Some(pane_id));
+            let changed = desk.set_pane_attention_state(pane_id, state, effective_unread);
+            (
+                changed,
+                desk.name.clone(),
+                pane_title,
+                active_workdesk == desk_index && desk.active_pane == Some(pane_id),
+            )
+        };
+
+        if !changed {
+            return false;
+        }
+
+        if announce && state.is_attention() {
+            self.set_runtime_notice(format!("{pane_title} on {desk_name} is {}", state.label()));
+            if !is_visible {
+                post_attention_notification(
+                    format!("Canvas · {desk_name}"),
+                    format!("{pane_title} is {}", state.label().to_lowercase()),
+                );
+            }
+        }
+
+        self.request_persist(cx);
+        cx.notify();
+        true
+    }
+
+    fn clear_active_pane_attention(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pane_id) = self.active_workdesk().active_pane else {
+            return false;
+        };
+        let state = self.baseline_attention_state(self.active_workdesk, pane_id);
+        self.set_pane_attention(self.active_workdesk, pane_id, state, false, false, cx)
+    }
+
+    fn cycle_manual_pane_attention(&mut self, pane_id: PaneId, cx: &mut Context<Self>) -> bool {
+        let desk_index = self.active_workdesk;
+        let current = self.active_workdesk().pane_attention(pane_id).state;
+        let next = match current {
+            AttentionState::Idle | AttentionState::Working => AttentionState::Waiting,
+            AttentionState::Waiting => AttentionState::Error,
+            AttentionState::Error => self.baseline_attention_state(desk_index, pane_id),
+        };
+        self.set_pane_attention(desk_index, pane_id, next, next.is_attention(), true, cx)
+    }
+
+    fn next_attention_target(&self) -> Option<(usize, PaneId)> {
+        next_attention_target_for_workdesks(&self.workdesks)
+    }
+
+    fn navigate_next_attention(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((desk_index, pane_id)) = self.next_attention_target() else {
+            return false;
+        };
+
+        if desk_index != self.active_workdesk {
+            self.select_workdesk(desk_index, cx);
+        }
+        self.focus_pane(pane_id, cx);
+        true
+    }
+
+    fn handle_terminal_attention_transition(
+        &mut self,
+        desk_index: usize,
+        pane_id: PaneId,
+        snapshot: &TerminalSnapshot,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(desk) = self.workdesks.get(desk_index) else {
+            return false;
+        };
+        let Some(pane) = desk.panes.iter().find(|pane| pane.id == pane_id) else {
+            return false;
+        };
+
+        let next_state = infer_attention_state_from_snapshot(&pane.kind, snapshot);
+        match next_state {
+            AttentionState::Idle | AttentionState::Working => {
+                self.set_pane_attention(desk_index, pane_id, next_state, false, false, cx)
+            }
+            AttentionState::Waiting | AttentionState::Error => {
+                self.set_pane_attention(desk_index, pane_id, next_state, true, true, cx)
+            }
+        }
+    }
+
+    fn close_inspector(&mut self, cx: &mut Context<Self>) {
+        if !self.inspector_open {
+            return;
+        }
+
+        self.inspector_open = false;
+        cx.notify();
+    }
+
+    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+
+        self.inspector_open = !self.inspector_open;
+        cx.notify();
     }
 
     fn close_shortcut_panel(&mut self, cx: &mut Context<Self>) {
@@ -1502,6 +2653,12 @@ impl CanvasShell {
                 self.toggle_shortcut_panel(cx);
                 true
             }
+            ShortcutAction::ToggleInspector => {
+                self.toggle_inspector(cx);
+                cfg!(debug_assertions)
+            }
+            ShortcutAction::NextAttention => self.navigate_next_attention(cx),
+            ShortcutAction::ClearActiveAttention => self.clear_active_pane_attention(cx),
             ShortcutAction::SpawnShellPane => {
                 self.spawn_pane(PaneKind::Shell, window, cx);
                 true
@@ -1630,8 +2787,9 @@ impl CanvasShell {
 
             if this
                 .update(cx, |this, cx| {
+                    let automation_changed = this.process_automation_commands(cx);
                     let blink_changed = this.tick_cursor_blink();
-                    if this.sync_terminal_revisions() || blink_changed {
+                    if automation_changed || this.sync_terminal_revisions(cx) || blink_changed {
                         cx.notify();
                     }
                 })
@@ -1643,10 +2801,48 @@ impl CanvasShell {
         .detach();
     }
 
-    fn sync_terminal_revisions(&mut self) -> bool {
-        self.workdesks
-            .iter_mut()
-            .any(WorkdeskState::sync_terminal_revisions)
+    fn sync_terminal_revisions(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+
+        for desk_index in 0..self.workdesks.len() {
+            let changed_panes = {
+                let desk = &mut self.workdesks[desk_index];
+                desk.sync_terminal_revisions()
+            };
+            if !changed_panes.is_empty() {
+                changed = true;
+            }
+
+            for pane_id in changed_panes {
+                let snapshot = {
+                    let Some(desk) = self.workdesks.get(desk_index) else {
+                        continue;
+                    };
+                    let Some(terminal) = desk.terminals.get(&pane_id) else {
+                        continue;
+                    };
+                    terminal.snapshot()
+                };
+
+                let previous_status = self.workdesks[desk_index]
+                    .terminal_statuses
+                    .get(&pane_id)
+                    .cloned()
+                    .unwrap_or(None);
+                self.workdesks[desk_index]
+                    .terminal_statuses
+                    .insert(pane_id, snapshot.status.clone());
+                self.workdesks[desk_index].note_pane_activity(pane_id);
+
+                if previous_status != snapshot.status {
+                    changed =
+                        self.handle_terminal_attention_transition(desk_index, pane_id, &snapshot, cx)
+                            || changed;
+                }
+            }
+        }
+
+        changed
     }
 
     fn tick_cursor_blink(&mut self) -> bool {
@@ -1742,7 +2938,13 @@ impl CanvasShell {
         cx.notify();
     }
 
-    fn spawn_pane(&mut self, kind: PaneKind, window: &Window, cx: &mut Context<Self>) {
+    fn spawn_pane_on_workdesk(
+        &mut self,
+        desk_index: usize,
+        kind: PaneKind,
+        title: Option<String>,
+        focus: bool,
+    ) -> PaneId {
         let size = match kind {
             PaneKind::Shell => DEFAULT_SHELL_SIZE,
             PaneKind::Agent => DEFAULT_AGENT_SIZE,
@@ -1751,37 +2953,30 @@ impl CanvasShell {
             PaneKind::Shell => "Shell",
             PaneKind::Agent => "Agent",
         };
-        let world_center = self.screen_to_world(self.viewport_center(window));
-        let desk = self.active_workdesk_mut();
+        let desk = &mut self.workdesks[desk_index];
         let pane_id = PaneId::new(desk.next_pane_serial);
         desk.next_pane_serial += 1;
         let cascade = 36.0 * (desk.panes.len() % 6) as f32;
-        let position = if desk.layout_mode != LayoutMode::Free {
-            desk.active_pane
-                .and_then(|active_pane_id| {
-                    desk.panes
-                        .iter()
-                        .find(|pane| pane.id == active_pane_id)
-                        .map(|pane| {
-                            WorkdeskPoint::new(
-                                pane.position.x + pane.size.width + 96.0,
-                                pane.position.y + 42.0 * ((desk.panes.len() % 3) as f32),
-                            )
-                        })
-                })
-                .unwrap_or_else(|| {
-                    WorkdeskPoint::new(
-                        world_center.x - size.width * 0.5 + cascade,
-                        world_center.y - size.height * 0.5 + cascade,
-                    )
-                })
-        } else {
-            WorkdeskPoint::new(
-                world_center.x - size.width * 0.5 + cascade,
-                world_center.y - size.height * 0.5 + cascade,
-            )
-        };
-        let title = format!("{base_label} {}", pane_id.raw());
+        let position = desk
+            .active_pane
+            .and_then(|active_pane_id| {
+                desk.panes
+                    .iter()
+                    .find(|pane| pane.id == active_pane_id)
+                    .map(|pane| {
+                        let horizontal_offset = if desk.layout_mode == LayoutMode::Free {
+                            42.0
+                        } else {
+                            pane.size.width + 96.0
+                        };
+                        WorkdeskPoint::new(
+                            pane.position.x + horizontal_offset,
+                            pane.position.y + 42.0 * ((desk.panes.len() % 3) as f32),
+                        )
+                    })
+            })
+            .unwrap_or_else(|| WorkdeskPoint::new(80.0 + cascade, 96.0 + cascade));
+        let title = title.unwrap_or_else(|| format!("{base_label} {}", pane_id.raw()));
 
         desk.panes.push(PaneRecord {
             id: pane_id,
@@ -1791,8 +2986,30 @@ impl CanvasShell {
             size,
         });
         desk.attach_terminal_session(pane_id, &kind, &title, size);
-        desk.focus_pane(pane_id);
+        if focus {
+            desk.focus_pane(pane_id);
+            self.active_workdesk = desk_index;
+        }
         desk.drag_state = DragState::Idle;
+        pane_id
+    }
+
+    fn spawn_pane(&mut self, kind: PaneKind, window: &Window, cx: &mut Context<Self>) {
+        let world_center = self.screen_to_world(self.viewport_center(window));
+        let previous_count = self.active_workdesk().panes.len();
+        let pane_id = self.spawn_pane_on_workdesk(self.active_workdesk, kind, None, true);
+        if let Some(pane) = self
+            .active_workdesk_mut()
+            .panes
+            .iter_mut()
+            .find(|pane| pane.id == pane_id)
+        {
+            let cascade = 36.0 * (previous_count % 6) as f32;
+            pane.position = WorkdeskPoint::new(
+                world_center.x - pane.size.width * 0.5 + cascade,
+                world_center.y - pane.size.height * 0.5 + cascade,
+            );
+        }
         self.request_persist(cx);
         cx.notify();
     }
@@ -1804,7 +3021,9 @@ impl CanvasShell {
         if let Some(terminal) = desk.terminals.remove(&pane_id) {
             terminal.close();
         }
+        desk.pane_attention.remove(&pane_id);
         desk.terminal_revisions.remove(&pane_id);
+        desk.terminal_statuses.remove(&pane_id);
         desk.terminal_views.remove(&pane_id);
 
         if desk.active_pane == Some(pane_id) {
@@ -2116,6 +3335,11 @@ impl CanvasShell {
             return;
         }
 
+        if self.handle_workdesk_editor_key_down(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
         if self.shortcut_editor.open {
             let is_escape =
                 event.keystroke.key == "escape" && !event.keystroke.modifiers.modified();
@@ -2129,6 +3353,21 @@ impl CanvasShell {
             }
             cx.stop_propagation();
             return;
+        }
+
+        if self.inspector_open {
+            let is_escape =
+                event.keystroke.key == "escape" && !event.keystroke.modifiers.modified();
+            let is_toggle = self
+                .shortcuts
+                .matching_action(event)
+                .is_some_and(|action| action == ShortcutAction::ToggleInspector);
+
+            if is_escape || is_toggle {
+                self.close_inspector(cx);
+                cx.stop_propagation();
+                return;
+            }
         }
 
         if self.active_workdesk().layout_mode == LayoutMode::Grid
@@ -2168,7 +3407,9 @@ impl CanvasShell {
             )));
         } else {
             let _ = terminal.scroll_viewport_bottom();
-            self.active_workdesk_mut().clear_selection(pane_id);
+            let desk = self.active_workdesk_mut();
+            desk.clear_selection(pane_id);
+            desk.note_pane_activity(pane_id);
             self.cursor_blink_visible = true;
             self.last_cursor_blink_at = Instant::now();
         }
@@ -2177,8 +3418,11 @@ impl CanvasShell {
     }
 
     fn focus_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        self.active_workdesk_mut().focus_pane(pane_id);
+        let desk = self.active_workdesk_mut();
+        desk.focus_pane(pane_id);
+        desk.note_pane_activity(pane_id);
         self.request_persist(cx);
+        cx.notify();
     }
 
     fn begin_pane_drag(
@@ -2340,7 +3584,9 @@ impl CanvasShell {
                     ));
                 } else {
                     let _ = terminal.scroll_viewport_bottom();
-                    self.active_workdesk_mut().clear_selection(pane_id);
+                    let desk = self.active_workdesk_mut();
+                    desk.clear_selection(pane_id);
+                    desk.note_pane_activity(pane_id);
                     self.cursor_blink_visible = true;
                     self.last_cursor_blink_at = Instant::now();
                 }
@@ -2384,6 +3630,9 @@ impl CanvasShell {
             self.active_workdesk_mut().active_pane =
                 self.active_workdesk().panes.last().map(|pane| pane.id);
         }
+        if let Some(pane_id) = self.active_workdesk().active_pane {
+            self.active_workdesk_mut().mark_pane_attention_seen(pane_id);
+        }
         self.request_persist(cx);
         cx.notify();
     }
@@ -2421,17 +3670,6 @@ impl CanvasShell {
         self.open_workdesk_menu(index, position, cx);
     }
 
-    fn next_workdesk_name(&self) -> String {
-        let mut serial = 1;
-        loop {
-            let candidate = format!("Workdesk {serial}");
-            if self.workdesks.iter().all(|desk| desk.name != candidate) {
-                return candidate;
-            }
-            serial += 1;
-        }
-    }
-
     fn unique_workdesk_name(&self, base: &str) -> String {
         if self.workdesks.iter().all(|desk| desk.name != base) {
             return base.to_string();
@@ -2447,10 +3685,42 @@ impl CanvasShell {
         }
     }
 
+    fn unique_workdesk_name_except(&self, index: usize, base: &str) -> String {
+        if self
+            .workdesks
+            .iter()
+            .enumerate()
+            .all(|(desk_index, desk)| desk_index == index || desk.name != base)
+        {
+            return base.to_string();
+        }
+
+        let mut serial = 2;
+        loop {
+            let candidate = format!("{base} {serial}");
+            if self
+                .workdesks
+                .iter()
+                .enumerate()
+                .all(|(desk_index, desk)| desk_index == index || desk.name != candidate)
+            {
+                return candidate;
+            }
+            serial += 1;
+        }
+    }
+
     fn spawn_workdesk(&mut self, cx: &mut Context<Self>) {
         self.dismiss_workdesk_menu();
-        let state = blank_workdesk(self.next_workdesk_name(), DEFAULT_WORKDESK_SUMMARY);
-        self.workdesks.push(state);
+        let mut desk = workdesk_from_template(
+            WorkdeskTemplate::ShellDesk,
+            WorkdeskDraft::from_template(
+                self.workdesk_name_for_template(WorkdeskTemplate::ShellDesk),
+                WorkdeskTemplate::ShellDesk,
+            ),
+        );
+        boot_workdesk_terminals(&mut desk);
+        self.workdesks.push(desk);
         self.active_workdesk = self.workdesks.len() - 1;
         self.request_persist(cx);
         cx.notify();
@@ -2514,7 +3784,7 @@ impl CanvasShell {
     fn pane_surface(
         &self,
         pane: &PaneRecord,
-        stack_index: usize,
+        _stack_index: usize,
         frame: PaneViewportFrame,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2522,7 +3792,11 @@ impl CanvasShell {
         let pane_id = pane.id;
         let is_active = workdesk.active_pane == Some(pane.id);
         let accent = pane_accent(&pane.kind);
-        let border = if is_active {
+        let pane_attention = workdesk.pane_attention(pane.id);
+        let attention_tint = pane_attention.state.tint();
+        let border = if pane_attention.state.is_attention() {
+            attention_tint
+        } else if is_active {
             accent
         } else {
             rgb(0x2f3a44).into()
@@ -2536,9 +3810,9 @@ impl CanvasShell {
         let screen_y = frame.y;
         let screen_width = frame.width;
         let screen_height = frame.height;
-        let header_height = 42.0 * frame.zoom.clamp(0.75, 1.4);
-        let pane_padding = 16.0 * frame.zoom.clamp(0.8, 1.35);
-        let resize_handle_size = 16.0 * frame.zoom.clamp(0.85, 1.4);
+        let header_height = 34.0 * frame.zoom.clamp(0.78, 1.3);
+        let pane_padding = 12.0 * frame.zoom.clamp(0.85, 1.25);
+        let resize_handle_size = 14.0 * frame.zoom.clamp(0.85, 1.3);
         let terminal_snapshot = workdesk
             .terminals
             .get(&pane.id)
@@ -2562,14 +3836,29 @@ impl CanvasShell {
             is_active,
             self.cursor_blink_visible,
         );
-        let terminal_status = terminal_footer_label(&terminal_snapshot);
+        let status_tint = if pane_attention.state == AttentionState::Idle {
+            terminal_snapshot
+                .as_ref()
+                .map(|snapshot| {
+                    if snapshot.closed {
+                        rgb(0xff9b88).into()
+                    } else if is_active {
+                        accent
+                    } else {
+                        rgb(0x55616b).into()
+                    }
+                })
+                .unwrap_or_else(|| rgb(0x55616b).into())
+        } else {
+            attention_tint
+        };
 
         let header = {
             let header = div()
                 .flex()
                 .justify_between()
                 .items_center()
-                .gap_3()
+                .gap_2()
                 .h(px(header_height))
                 .px(px(pane_padding))
                 .bg(header_bg)
@@ -2577,49 +3866,56 @@ impl CanvasShell {
                 .border_color(border)
                 .child(
                     div()
+                        .flex_1()
                         .flex()
-                        .flex_col()
-                        .gap_1()
+                        .items_center()
+                        .gap_2()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.cycle_manual_pane_attention(pane_id, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .child(attention_indicator(pane_attention.state, pane_attention.unread)),
+                        )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(accent)
-                                .child(pane_kind_label(&pane.kind)),
+                                .text_color(status_tint)
+                                .child(match pane.kind {
+                                    PaneKind::Shell => "shell",
+                                    PaneKind::Agent => "agent",
+                                }),
                         )
-                        .child(div().text_sm().child(runtime_title)),
+                        .child(
+                            div()
+                                .text_sm()
+                                .child(runtime_title),
+                        ),
                 )
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_full()
-                                .bg(rgb(0x0f1419))
-                                .text_xs()
-                                .text_color(rgb(0x9da8b1))
-                                .child(format!("#{}", stack_index + 1)),
-                        )
-                        .child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_full()
-                                .bg(rgb(0x0f1419))
-                                .text_xs()
-                                .text_color(rgb(0x7cc7ff))
-                                .child(terminal_status),
-                        )
+                        .gap_1()
                         .child(
                             div()
                                 .cursor_pointer()
-                                .px_2()
-                                .py_1()
-                                .rounded_full()
-                                .bg(rgb(0x2f1818))
+                                .w(px(24.0))
+                                .h(px(24.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .bg(rgb(0x23171a))
                                 .text_xs()
                                 .text_color(rgb(0xffc4b5))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -2632,7 +3928,7 @@ impl CanvasShell {
                                         cx.stop_propagation();
                                     }),
                                 )
-                                .child("Close"),
+                                .child("X"),
                         ),
                 );
 
@@ -3044,8 +4340,50 @@ impl Render for CanvasShell {
         };
 
         let active_pane = workdesk.active_pane_title();
-        let drag_status = workdesk.drag_status();
-        let zoom_label = match layout_mode {
+        let active_terminal_snapshot = workdesk
+            .active_pane
+            .and_then(|pane_id| workdesk.terminals.get(&pane_id).map(|terminal| terminal.snapshot()));
+        let active_attention = workdesk
+            .active_pane
+            .map(|pane_id| workdesk.pane_attention(pane_id))
+            .unwrap_or_default();
+        let active_terminal_status = terminal_footer_label(&active_terminal_snapshot);
+        let workdesk_intent = workdesk.intent_label();
+        let workdesk_status = workdesk.status_label();
+        let workdesk_progress = workdesk.progress_label();
+        let context_accent = workdesk
+            .active_pane
+            .map(|pane_id| {
+                let attention = workdesk.pane_attention(pane_id);
+                if attention.state == AttentionState::Idle {
+                    workdesk
+                        .panes
+                        .iter()
+                        .find(|pane| pane.id == pane_id)
+                        .map(|pane| pane_accent(&pane.kind))
+                        .unwrap_or_else(|| rgb(0x7f8a94).into())
+                } else {
+                    attention.state.tint()
+                }
+            })
+            .unwrap_or_else(|| rgb(0x7f8a94).into());
+        let layout_hint = match layout_mode {
+            LayoutMode::Free => "Free · drag and zoom".to_string(),
+            LayoutMode::Grid => {
+                if grid_expose_open {
+                    "Expose · choose a pane".to_string()
+                } else {
+                    "Grid · directional focus".to_string()
+                }
+            }
+            LayoutMode::ClassicSplit => "Split · directional focus".to_string(),
+        };
+        let context_title = if workdesk.active_pane.is_some() {
+            format!("{} / {}", workdesk.name, active_pane)
+        } else {
+            workdesk.name.clone()
+        };
+        let inspector_zoom_label = match layout_mode {
             LayoutMode::Grid => {
                 if grid_expose_open {
                     "overview".to_string()
@@ -3060,28 +4398,8 @@ impl Render for CanvasShell {
                 .unwrap_or_else(|| "auto".to_string()),
             LayoutMode::Free => format!("{:.0}%", workdesk.zoom * 100.0),
         };
-        let live_terminals = format!("{}", workdesk.terminals.len());
-        let ghostty_chip = if self.ghostty_status.as_ref().contains("linked") {
-            "ghostty linked".to_string()
-        } else {
-            "pty bridge".to_string()
-        };
-        let layout_status = if grid_expose_open {
-            "Grid / Expose".to_string()
-        } else {
-            layout_mode.label().to_string()
-        };
-        let movement_status = match layout_mode {
-            LayoutMode::Grid => {
-                if grid_expose_open {
-                    "Choosing pane".to_string()
-                } else {
-                    "Directional lens".to_string()
-                }
-            }
-            LayoutMode::ClassicSplit => "Tiled lens".to_string(),
-            LayoutMode::Free => drag_status,
-        };
+        let show_inspector = cfg!(debug_assertions) && self.inspector_open;
+        let inspector_toggle_label = self.shortcut_label(ShortcutAction::ToggleInspector);
         let workdesk_cards = self
             .workdesks
             .iter()
@@ -3093,7 +4411,8 @@ impl Render for CanvasShell {
                 } else {
                     desk.panes
                         .iter()
-                        .take(3)
+                        .rev()
+                        .take(2)
                         .map(|pane| pane.title.as_str())
                         .collect::<Vec<_>>()
                         .join(" · ")
@@ -3325,7 +4644,7 @@ impl Render for CanvasShell {
         let workdesk_context_menu = open_workdesk_menu.and_then(|menu| {
             let desk = self.workdesks.get(menu.index)?;
             let can_delete = self.workdesks.len() > 1;
-            let menu_height = if can_delete { 174.0 } else { 128.0 };
+            let menu_height = if can_delete { 220.0 } else { 174.0 };
             let max_left = (SIDEBAR_WIDTH - WORKDESK_MENU_WIDTH - 12.0).max(12.0);
             let max_top = (viewport_height - menu_height - 12.0).max(12.0);
             let left = (f32::from(menu.position.x) + 8.0).clamp(12.0, max_left);
@@ -3391,6 +4710,15 @@ impl Render for CanvasShell {
                         }),
                     ))
                     .child(workdesk_menu_item(
+                        "Edit",
+                        "Rename and update intent",
+                        rgb(0x77d19a).into(),
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_workdesk_editor_panel(menu.index, cx);
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .child(workdesk_menu_item(
                         "Duplicate",
                         "Clone the layout and panes",
                         rgb(0x7cc7ff).into(),
@@ -3411,6 +4739,210 @@ impl Render for CanvasShell {
                         ))
                     }),
             )
+        });
+        let workdesk_editor_overlay = self.workdesk_editor.as_ref().map(|editor| {
+            let accent = match editor.mode {
+                WorkdeskEditorMode::Create => editor.template.accent(),
+                WorkdeskEditorMode::Edit(index) => workdesk_accent(index),
+            };
+            let template_cards = WorkdeskTemplate::all()
+                .into_iter()
+                .map(|template| {
+                    workdesk_template_card(
+                        template,
+                        editor.template == template,
+                        cx.listener(move |this, _, _, cx| {
+                            this.select_workdesk_template(template, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let editor_fields = [
+                WorkdeskEditorField::Name,
+                WorkdeskEditorField::Intent,
+                WorkdeskEditorField::Summary,
+            ]
+            .into_iter()
+            .map(|field| {
+                workdesk_editor_field(
+                    field.label(),
+                    editor.draft.field_value(field).to_string(),
+                    editor.active_field == field,
+                    accent,
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(editor) = this.workdesk_editor.as_mut() {
+                            editor.active_field = field;
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+            let metadata_cwd = compact_cwd_label(&editor.draft.metadata.cwd);
+            let metadata_branch = if editor.draft.metadata.branch.trim().is_empty() {
+                "no-branch".to_string()
+            } else {
+                editor.draft.metadata.branch.clone()
+            };
+
+            div()
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .w(px(viewport_width))
+                        .h(px(viewport_height))
+                        .bg(rgba(0x091016a6))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            this.close_workdesk_editor(cx);
+                            cx.stop_propagation();
+                        })),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px((viewport_height * 0.14).max(44.0)))
+                        .left(px(
+                            ((viewport_width - WORKDESK_EDITOR_WIDTH) * 0.5)
+                                .max(SIDEBAR_WIDTH + 16.0),
+                        ))
+                        .w(px(
+                            WORKDESK_EDITOR_WIDTH.min(
+                                (viewport_width - SIDEBAR_WIDTH - FLOATING_DOCK_MARGIN * 2.0)
+                                    .max(320.0),
+                            ),
+                        ))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .bg(rgb(0x0f151b))
+                        .border_1()
+                        .border_color(rgb(0x2c3944))
+                        .rounded_xl()
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .items_start()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(accent)
+                                                .child(editor.title()),
+                                        )
+                                        .child(div().text_lg().child(editor.draft.name.clone()))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x90a0aa))
+                                                .child(
+                                                    "Tab switches fields. Enter saves. Escape cancels.",
+                                                ),
+                                        ),
+                                )
+                                .child(compact_dock_button(
+                                    "Close",
+                                    rgb(0xff9b88).into(),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.close_workdesk_editor(cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )),
+                        )
+                        .when(matches!(editor.mode, WorkdeskEditorMode::Create), |panel| {
+                            panel.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x90a0aa))
+                                            .child("Templates"),
+                                    )
+                                    .children(template_cards),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .flex_wrap()
+                                .child(context_pill(metadata_cwd, rgb(0x7f8a94).into()))
+                                .child(context_pill(metadata_branch, rgb(0x7cc7ff).into()))
+                                .when_some(editor.draft.metadata.status_label(), |row, status| {
+                                    row.child(context_pill(status, accent))
+                                })
+                                .when_some(editor.draft.metadata.progress_label(), |row, progress| {
+                                    row.child(context_pill(progress, rgb(0x77d19a).into()))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .children(editor_fields),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x7f8a94))
+                                        .child(match editor.mode {
+                                            WorkdeskEditorMode::Create => {
+                                                "Shortcut quick-create still makes a Shell Desk."
+                                            }
+                                            WorkdeskEditorMode::Edit(_) => {
+                                                "Status, branch, cwd, and progress stay on the desk metadata."
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(control_button(
+                                            "Cancel",
+                                            rgb(0x7f8a94).into(),
+                                            cx.listener(|this, _, _, cx| {
+                                                this.close_workdesk_editor(cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        ))
+                                        .child(control_button(
+                                            editor.submit_label(),
+                                            accent,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.commit_workdesk_editor(cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )),
+                                ),
+                        ),
+                )
         });
         let touch_entity = entity.clone();
         let magnify_entity = entity.clone();
@@ -3466,8 +4998,8 @@ impl Render for CanvasShell {
                     .h(px(viewport_height))
                     .flex()
                     .flex_col()
-                    .gap_3()
-                    .p_4()
+                    .gap_2()
+                    .p_3()
                     .bg(rgb(0x0d1217))
                     .border_r_1()
                     .border_color(rgb(0x22303a))
@@ -3481,126 +5013,56 @@ impl Render for CanvasShell {
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .gap_1()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(rgb(0x7cc7ff))
-                                    .child("Workdesks"),
-                            )
-                            .child(div().text_lg().child("Parallel desks"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x90a0aa))
-                                    .child(
-                                        "Separate active threads into their own spatial desks and switch context from the left rail.",
-                                    ),
-                            ),
-                    )
-                    .child(
-                        control_button(
-                            "+ New Desk",
-                            rgb(0x77d19a).into(),
-                            cx.listener(|this, _, _, cx| {
-                                this.spawn_workdesk(cx);
-                                cx.stop_propagation();
-                            }),
-                        ),
-                    )
-                    .children(workdesk_cards)
-                    .child(
-                        div()
-                            .p_3()
-                            .bg(rgb(0x131a20))
-                            .border_1()
-                            .border_color(rgb(0x2a3640))
-                            .rounded_lg()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0xb4a4ff))
-                                    .child("Shortcuts"),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_sm()
-                                    .child("Record and remap your hotkeys"),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(rgb(0x90a0aa))
-                                    .child(
-                                        "Bindings are saved to .canvas/shortcuts.json and reloaded on startup.",
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .mt_3()
                                     .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_2()
-                                    .child(status_chip("Open", toggle_shortcut_label.clone()))
-                                    .child(toggle_button(
-                                        "Keys",
-                                        rgb(0xb4a4ff).into(),
-                                        self.shortcut_editor.open,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.toggle_shortcut_panel(cx);
-                                            cx.stop_propagation();
-                                        }),
-                                    )),
-                            ),
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x7cc7ff))
+                                    .child("Desks"),
+                                    )
+                                    .child(div().text_sm().child("Workdesks")),
+                            )
+                            .child(compact_dock_button(
+                                "+",
+                                rgb(0x77d19a).into(),
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_workdesk_creator(cx);
+                                    cx.stop_propagation();
+                                }),
+                            )),
                     )
                     .child(
                         div()
-                            .mt_auto()
-                            .p_3()
-                            .bg(rgb(0x131a20))
-                            .border_1()
-                            .border_color(rgb(0x2a3640))
-                            .rounded_lg()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x7cc7ff))
-                                    .child("Ghostty bridge"),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_sm()
-                                    .text_color(rgb(0xdce2e8))
-                                    .child(self.ghostty_status.clone()),
-                            )
-                            .child(
-                                div()
-                                    .mt_2()
-                                    .text_xs()
-                                    .text_color(rgb(0x7f8a94))
-                                    .child(format!("vendor: {}", self.ghostty_vendor_dir)),
-                            ),
+                            .id("workdesk-rail-scroll")
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .children(workdesk_cards),
                     ),
             )
             .child(
                 div()
                     .absolute()
-                    .left(px(SIDEBAR_WIDTH + 20.0))
-                    .bottom(px(20.0))
+                    .left(px(SIDEBAR_WIDTH + FLOATING_DOCK_MARGIN))
+                    .bottom(px(FLOATING_DOCK_MARGIN))
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_1()
                     .px_2()
-                    .py_2()
-                    .bg(rgb(0x131a20))
+                    .py(px(6.0))
+                    .bg(rgb(0x11181f))
                     .border_1()
                     .border_color(rgb(0x2a3640))
-                    .rounded_xl()
+                    .rounded_lg()
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
@@ -3608,7 +5070,7 @@ impl Render for CanvasShell {
                     .on_scroll_wheel(|_, _, cx| {
                         cx.stop_propagation();
                     })
-                    .child(control_button(
+                    .child(compact_dock_button(
                         "Shell",
                         rgb(0xe59a49).into(),
                         cx.listener(|this, _, window, cx| {
@@ -3616,7 +5078,7 @@ impl Render for CanvasShell {
                             cx.stop_propagation();
                         }),
                     ))
-                    .child(control_button(
+                    .child(compact_dock_button(
                         "Agent",
                         rgb(0x7cc7ff).into(),
                         cx.listener(|this, _, window, cx| {
@@ -3625,7 +5087,7 @@ impl Render for CanvasShell {
                         }),
                     ))
                     .child(dock_divider())
-                    .child(toggle_button(
+                    .child(compact_toggle_button(
                         "Free",
                         rgb(0x77d19a).into(),
                         layout_mode == LayoutMode::Free,
@@ -3634,7 +5096,7 @@ impl Render for CanvasShell {
                             cx.stop_propagation();
                         }),
                     ))
-                    .child(toggle_button(
+                    .child(compact_toggle_button(
                         "Grid",
                         rgb(0xf0d35f).into(),
                         layout_mode == LayoutMode::Grid,
@@ -3643,7 +5105,7 @@ impl Render for CanvasShell {
                             cx.stop_propagation();
                         }),
                     ))
-                    .child(toggle_button(
+                    .child(compact_toggle_button(
                         "Split",
                         rgb(0x7cc7ff).into(),
                         layout_mode == LayoutMode::ClassicSplit,
@@ -3653,7 +5115,7 @@ impl Render for CanvasShell {
                         }),
                     ))
                     .child(dock_divider())
-                    .child(toggle_button(
+                    .child(compact_toggle_button(
                         "Keys",
                         rgb(0xb4a4ff).into(),
                         self.shortcut_editor.open,
@@ -3663,7 +5125,7 @@ impl Render for CanvasShell {
                         }),
                     ))
                     .when(layout_mode == LayoutMode::Grid, |dock| {
-                        dock.child(toggle_button(
+                        dock.child(compact_toggle_button(
                             "Expose",
                             rgb(0xb4a4ff).into(),
                             grid_expose_open,
@@ -3674,73 +5136,33 @@ impl Render for CanvasShell {
                         ))
                     })
                     .when(layout_mode == LayoutMode::Free, |dock| {
-                        dock.child(dock_divider())
-                            .child(control_button(
-                                "Fit",
-                                rgb(0x77d19a).into(),
-                                cx.listener(|this, _, window, cx| {
-                                    this.fit_to_panes(window, cx);
-                                    cx.stop_propagation();
-                                }),
-                            ))
-                            .child(control_button(
-                                "1:1",
-                                rgb(0xf0d35f).into(),
-                                cx.listener(|this, _, _, cx| {
-                                    this.reset_view(cx);
-                                    cx.stop_propagation();
-                                }),
-                            ))
-                            .child(control_button(
-                                "+",
-                                rgb(0xb4a4ff).into(),
-                                cx.listener(|this, _, window, cx| {
-                                    this.zoom_about_viewport_center(1.15, window, cx);
-                                    cx.stop_propagation();
-                                }),
-                            ))
-                            .child(control_button(
-                                "-",
-                                rgb(0xb4a4ff).into(),
-                                cx.listener(|this, _, window, cx| {
-                                    this.zoom_about_viewport_center(1.0 / 1.15, window, cx);
-                                    cx.stop_propagation();
-                                }),
-                            ))
-                    })
-                    .when(layout_mode == LayoutMode::Grid, |dock| {
-                        dock.child(dock_divider()).child(status_chip(
-                            if grid_expose_open {
-                                "Overview"
-                            } else {
-                                "Navigate"
-                            },
-                            if grid_expose_open {
-                                "Click pane or Esc".to_string()
-                            } else {
-                                "Cmd+Shift+Arrows".to_string()
-                            },
+                        dock.child(dock_divider()).child(compact_dock_button(
+                            "Fit",
+                            rgb(0x77d19a).into(),
+                            cx.listener(|this, _, window, cx| {
+                                this.fit_to_panes(window, cx);
+                                cx.stop_propagation();
+                            }),
                         ))
-                    })
-                    .when(layout_mode == LayoutMode::ClassicSplit, |dock| {
-                        dock.child(dock_divider())
-                            .child(status_chip("Navigate", "Cmd+Shift+Arrows".to_string()))
                     }),
             )
             .child(
                 div()
                     .absolute()
-                    .right(px(20.0))
-                    .bottom(px(20.0))
+                    .left(px(SIDEBAR_WIDTH + FLOATING_DOCK_MARGIN))
+                    .bottom(px(CONTEXT_STRIP_MARGIN_BOTTOM))
                     .flex()
                     .items_center()
                     .gap_2()
                     .px_2()
-                    .py_2()
-                    .bg(rgb(0x131a20))
+                    .py_1()
+                    .max_w(px(
+                        (viewport_width - SIDEBAR_WIDTH - FLOATING_DOCK_MARGIN * 2.0).max(220.0),
+                    ))
+                    .bg(rgba(0x10161be8))
                     .border_1()
                     .border_color(rgb(0x2a3640))
-                    .rounded_xl()
+                    .rounded_lg()
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
@@ -3748,17 +5170,114 @@ impl Render for CanvasShell {
                     .on_scroll_wheel(|_, _, cx| {
                         cx.stop_propagation();
                     })
-                    .child(status_chip("Panes", format!("{}", workdesk.panes.len())))
-                    .child(status_chip("Desk", workdesk.name.clone()))
-                    .child(status_chip("Live", live_terminals))
-                    .child(status_chip("Focus", active_pane))
-                    .child(status_chip("Layout", layout_status))
-                    .child(status_chip("Mode", movement_status))
-                    .child(status_chip("Zoom", zoom_label))
-                    .child(status_chip("Keys", toggle_shortcut_label))
-                    .child(status_chip("Bridge", ghostty_chip)),
+                    .child(context_pill(context_title, context_accent))
+                    .child(context_pill(workdesk_intent, rgb(0x7f8a94).into()))
+                    .when_some(workdesk_status, |strip, status| {
+                        strip.child(context_pill(status, context_accent))
+                    })
+                    .when_some(workdesk_progress, |strip, progress| {
+                        strip.child(context_pill(progress, rgb(0x77d19a).into()))
+                    })
+                    .when(workdesk.active_pane.is_some(), |strip| {
+                        strip.child(context_pill(active_terminal_status.clone(), rgb(0x7cc7ff).into()))
+                    })
+                    .when(active_attention.state != AttentionState::Idle, |strip| {
+                        strip.child(context_pill(
+                            if active_attention.unread {
+                                format!("{} · unread", active_attention.state.label())
+                            } else {
+                                active_attention.state.label().to_string()
+                            },
+                            active_attention.state.tint(),
+                        ))
+                    })
+                    .child(context_pill(layout_hint, rgb(0x7f8a94).into())),
             )
+            .when(show_inspector, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .w(px(viewport_width))
+                        .h(px(viewport_height))
+                        .bg(rgba(0x09101680))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            this.close_inspector(cx);
+                            cx.stop_propagation();
+                        })),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(72.0))
+                        .right(px(FLOATING_DOCK_MARGIN))
+                        .w(px(INSPECTOR_PANEL_WIDTH.min((viewport_width - 32.0).max(280.0))))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .bg(rgb(0x0f151b))
+                        .border_1()
+                        .border_color(rgb(0x2c3944))
+                        .rounded_xl()
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .items_start()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x7cc7ff))
+                                                .child("Developer Inspector"),
+                                        )
+                                        .child(div().text_lg().child("Debug surface"))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x90a0aa))
+                                                .child(format!("Toggle with {}", inspector_toggle_label)),
+                                        ),
+                                )
+                                .child(compact_dock_button(
+                                    "Close",
+                                    rgb(0xff9b88).into(),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.close_inspector(cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(inspector_row("Socket", self.automation_socket_path.clone()))
+                                .child(inspector_row("Bridge", self.ghostty_status.clone()))
+                                .child(inspector_row("Vendor", self.ghostty_vendor_dir.clone()))
+                                .child(inspector_row("Desk", workdesk.name.clone()))
+                                .child(inspector_row("Pane", active_pane))
+                                .child(inspector_row("Layout", layout_mode.label()))
+                                .child(inspector_row("Zoom", inspector_zoom_label))
+                                .child(inspector_row("Drag", workdesk.drag_status()))
+                                .child(inspector_row("Keys", toggle_shortcut_label.clone())),
+                        ),
+                )
+            })
             .children(shortcut_overlay)
+            .when_some(workdesk_editor_overlay, |root, overlay| root.child(overlay))
             .when_some(workdesk.runtime_notice.clone(), |root, notice| {
                 root.child(
                     div()
@@ -3784,6 +5303,27 @@ impl Render for CanvasShell {
 
 fn main() {
     let (workdesks, active_workdesk, shortcuts, boot_notice) = load_boot_state();
+    let (automation_server, automation_notice) = match start_automation_server() {
+        Ok(server) => (server, None),
+        Err(error) => {
+            let (_sender, receiver) = mpsc::channel();
+            (
+                AutomationServer {
+                    receiver,
+                    socket_path: automation_socket_path(),
+                },
+                Some(SharedString::from(format!(
+                    "automation socket disabled: {error}"
+                ))),
+            )
+        }
+    };
+    let boot_notice = match (boot_notice, automation_notice) {
+        (Some(left), Some(right)) => Some(SharedString::from(format!("{left} | {right}"))),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    };
     let ghostty = ghostty_build_info();
     let ghostty_vendor_dir = SharedString::from(ghostty.vendor_dir.display().to_string());
     let ghostty_status = if ghostty.linked {
@@ -3798,6 +5338,7 @@ fn main() {
         let active_workdesk = active_workdesk;
         let shortcuts = shortcuts.clone();
         let boot_notice = boot_notice.clone();
+        let automation_socket_path = automation_server.socket_path.clone();
         let ghostty_vendor_dir = ghostty_vendor_dir.clone();
         let ghostty_status = ghostty_status.clone();
 
@@ -3811,6 +5352,10 @@ fn main() {
                 let active_workdesk = active_workdesk;
                 let shortcuts = shortcuts.clone();
                 let boot_notice = boot_notice.clone();
+                let automation_server = AutomationServer {
+                    receiver: automation_server.receiver,
+                    socket_path: automation_socket_path,
+                };
                 let ghostty_vendor_dir = ghostty_vendor_dir.clone();
                 let ghostty_status = ghostty_status.clone();
                 let focus_handle = cx.focus_handle();
@@ -3821,6 +5366,7 @@ fn main() {
                         active_workdesk,
                         shortcuts,
                         boot_notice,
+                        automation_server,
                         focus_handle.clone(),
                         ghostty_vendor_dir,
                         ghostty_status,
@@ -3934,10 +5480,401 @@ fn shortcut_file_path() -> PathBuf {
         .join("shortcuts.json")
 }
 
-fn initial_workdesks() -> Vec<WorkdeskState> {
-    vec![blank_workdesk("Workdesk 1", DEFAULT_WORKDESK_SUMMARY)]
+fn automation_socket_path() -> PathBuf {
+    workspace_root_path().join(".canvas").join("canvas.sock")
 }
 
+fn start_automation_server() -> Result<AutomationServer, String> {
+    start_automation_server_at(automation_socket_path())
+}
+
+fn start_automation_server_at(socket_path: PathBuf) -> Result<AutomationServer, String> {
+    let Some(socket_dir) = socket_path.parent() else {
+        return Err("invalid automation socket path".to_string());
+    };
+    fs::create_dir_all(socket_dir)
+        .map_err(|error| format!("create {}: {error}", socket_dir.display()))?;
+    if socket_path.exists() {
+        fs::remove_file(&socket_path)
+            .map_err(|error| format!("remove stale {}: {error}", socket_path.display()))?;
+    }
+
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|error| format!("bind {}: {error}", socket_path.display()))?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("chmod {}: {error}", socket_path.display()))?;
+    let (sender, receiver) = mpsc::channel();
+
+    thread::spawn(move || automation_listener_loop(listener, sender));
+
+    Ok(AutomationServer {
+        receiver,
+        socket_path,
+    })
+}
+
+fn automation_listener_loop(listener: UnixListener, sender: Sender<AutomationEnvelope>) {
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else {
+            break;
+        };
+        let sender = sender.clone();
+        thread::spawn(move || {
+            let reader = match stream.try_clone() {
+                Ok(reader) => reader,
+                Err(_) => return,
+            };
+            let mut writer = stream;
+            for line in BufReader::new(reader).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let response = match serde_json::from_str::<AutomationRequest>(trimmed) {
+                    Ok(request) => {
+                        let (response_tx, response_rx) = mpsc::channel();
+                        let id = request.id.clone();
+                        if sender
+                            .send(AutomationEnvelope { request, response_tx })
+                            .is_err()
+                        {
+                            AutomationResponse::error(id, "automation command queue is closed")
+                        } else {
+                            response_rx
+                                .recv()
+                                .unwrap_or_else(|_| {
+                                    AutomationResponse::error(
+                                        id,
+                                        "automation command dropped before completion",
+                                    )
+                                })
+                        }
+                    }
+                    Err(error) => AutomationResponse::error(None, format!("invalid request: {error}")),
+                };
+
+                let Ok(payload) = serde_json::to_vec(&response) else {
+                    break;
+                };
+                if writer.write_all(&payload).is_err()
+                    || writer.write_all(b"\n").is_err()
+                    || writer.flush().is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+fn workspace_root_path() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    root.canonicalize().unwrap_or(root)
+}
+
+fn workspace_defaults() -> (String, String) {
+    let root = workspace_root_path();
+    let branch = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| stdout.trim().to_string())
+        .unwrap_or_default();
+
+    (root.display().to_string(), branch)
+}
+
+fn default_workdesk_metadata(
+    intent: impl Into<String>,
+    status: Option<String>,
+    progress: Option<WorkdeskProgress>,
+) -> WorkdeskMetadata {
+    let (cwd, branch) = workspace_defaults();
+    WorkdeskMetadata {
+        intent: intent.into(),
+        cwd,
+        branch,
+        status,
+        progress,
+    }
+}
+
+fn normalize_workdesk_draft(
+    mut draft: WorkdeskDraft,
+    fallback_name: &str,
+    fallback_summary: &str,
+) -> WorkdeskDraft {
+    let name = draft.name.trim();
+    draft.name = if name.is_empty() {
+        fallback_name.to_string()
+    } else {
+        name.to_string()
+    };
+
+    let summary = draft.summary.trim();
+    draft.summary = if summary.is_empty() {
+        fallback_summary.to_string()
+    } else {
+        summary.to_string()
+    };
+
+    let intent = draft.metadata.intent.trim();
+    draft.metadata.intent = if intent.is_empty() {
+        draft.summary.clone()
+    } else {
+        intent.to_string()
+    };
+    draft.metadata = draft.metadata.hydrated();
+    draft
+}
+
+fn workdesk_from_template(template: WorkdeskTemplate, draft: WorkdeskDraft) -> WorkdeskState {
+    let draft = normalize_workdesk_draft(draft, template.base_name(), template.summary());
+    let panes = match template {
+        WorkdeskTemplate::ShellDesk => vec![PaneRecord {
+            id: PaneId::new(1),
+            title: "Shell 1".to_string(),
+            kind: PaneKind::Shell,
+            position: WorkdeskPoint::new(120.0, 96.0),
+            size: DEFAULT_SHELL_SIZE,
+        }],
+        WorkdeskTemplate::AgentReview => vec![
+            PaneRecord {
+                id: PaneId::new(1),
+                title: "Review Shell".to_string(),
+                kind: PaneKind::Shell,
+                position: WorkdeskPoint::new(80.0, 96.0),
+                size: DEFAULT_SHELL_SIZE,
+            },
+            PaneRecord {
+                id: PaneId::new(2),
+                title: "Review Agent".to_string(),
+                kind: PaneKind::Agent,
+                position: WorkdeskPoint::new(1048.0, 132.0),
+                size: DEFAULT_AGENT_SIZE,
+            },
+        ],
+        WorkdeskTemplate::Debug => vec![
+            PaneRecord {
+                id: PaneId::new(1),
+                title: "Repro Shell".to_string(),
+                kind: PaneKind::Shell,
+                position: WorkdeskPoint::new(80.0, 96.0),
+                size: DEFAULT_SHELL_SIZE,
+            },
+            PaneRecord {
+                id: PaneId::new(2),
+                title: "Debug Agent".to_string(),
+                kind: PaneKind::Agent,
+                position: WorkdeskPoint::new(1048.0, 120.0),
+                size: DEFAULT_AGENT_SIZE,
+            },
+        ],
+        WorkdeskTemplate::Implementation => vec![
+            PaneRecord {
+                id: PaneId::new(1),
+                title: "Build Shell".to_string(),
+                kind: PaneKind::Shell,
+                position: WorkdeskPoint::new(80.0, 96.0),
+                size: DEFAULT_SHELL_SIZE,
+            },
+            PaneRecord {
+                id: PaneId::new(2),
+                title: "Implement Agent".to_string(),
+                kind: PaneKind::Agent,
+                position: WorkdeskPoint::new(1048.0, 132.0),
+                size: DEFAULT_AGENT_SIZE,
+            },
+        ],
+    };
+
+    let mut desk = WorkdeskState::new(draft.name, draft.summary, panes);
+    desk.metadata = draft.metadata;
+    desk
+}
+
+fn compact_cwd_label(path: &str) -> String {
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return "~".to_string();
+    }
+    if parts.len() == 1 {
+        return parts[0].to_string();
+    }
+    format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+}
+
+fn editable_keystroke_text(keystroke: &Keystroke) -> Option<String> {
+    if keystroke.modifiers.control
+        || keystroke.modifiers.alt
+        || keystroke.modifiers.platform
+        || keystroke.modifiers.function
+    {
+        return None;
+    }
+
+    match keystroke.key.as_str() {
+        "space" => Some(" ".to_string()),
+        "tab" | "enter" | "backspace" | "delete" | "escape" => None,
+        _ => keystroke
+            .key_char
+            .clone()
+            .or_else(|| (!keystroke.modifiers.modified()).then(|| keystroke.key.clone())),
+    }
+}
+
+fn json_value_at<'a>(params: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| params.get(*key))
+}
+
+fn json_has_any(params: &Value, keys: &[&str]) -> bool {
+    json_value_at(params, keys).is_some()
+}
+
+fn json_string_at(params: &Value, keys: &[&str]) -> Option<String> {
+    json_value_at(params, keys)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn json_optional_string_at(params: &Value, keys: &[&str]) -> Result<Option<String>, String> {
+    match json_value_at(params, keys) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok((!value.trim().is_empty()).then(|| value.trim().to_string())),
+        Some(_) => Err(format!("expected string or null for `{}`", keys[0])),
+    }
+}
+
+fn json_u64_at(params: &Value, keys: &[&str]) -> Option<u64> {
+    json_value_at(params, keys).and_then(Value::as_u64)
+}
+
+fn json_bool_at(params: &Value, keys: &[&str]) -> Option<bool> {
+    json_value_at(params, keys).and_then(Value::as_bool)
+}
+
+fn require_json_string_at(params: &Value, keys: &[&str], label: &str) -> Result<String, String> {
+    json_string_at(params, keys).ok_or_else(|| format!("missing required `{label}`"))
+}
+
+fn parse_pane_kind(value: &str) -> Option<PaneKind> {
+    match value {
+        "shell" => Some(PaneKind::Shell),
+        "agent" => Some(PaneKind::Agent),
+        _ => None,
+    }
+}
+
+fn parse_progress_value(value: &Value) -> Result<Option<WorkdeskProgress>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    let Some(object) = value.as_object() else {
+        return Err("progress must be an object with `label` and `value`".to_string());
+    };
+    let label = object
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .ok_or_else(|| "progress.label is required".to_string())?;
+    let value = object
+        .get("value")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "progress.value is required".to_string())?;
+
+    Ok(Some(WorkdeskProgress::new(label, value as u8)))
+}
+
+fn automation_pane_json(desk: &WorkdeskState, pane_id: PaneId, desk_active: bool) -> Value {
+    let pane = desk
+        .panes
+        .iter()
+        .find(|pane| pane.id == pane_id)
+        .expect("automation pane target should exist");
+    let attention = desk.pane_attention(pane_id);
+    let status = desk
+        .terminal_statuses
+        .get(&pane_id)
+        .cloned()
+        .unwrap_or(None);
+
+    json!({
+        "id": pane.id.raw(),
+        "title": pane.title,
+        "kind": match pane.kind {
+            PaneKind::Shell => "shell",
+            PaneKind::Agent => "agent",
+        },
+        "focused": desk.active_pane == Some(pane_id),
+        "desk_active": desk_active,
+        "attention": {
+            "state": attention.state,
+            "unread": attention.unread,
+            "last_attention_sequence": attention.last_attention_sequence,
+            "last_activity_sequence": attention.last_activity_sequence,
+        },
+        "status": status,
+    })
+}
+
+fn automation_workdesk_summary_json(index: usize, desk: &WorkdeskState, active: bool) -> Value {
+    let attention = desk.workdesk_attention_summary();
+
+    json!({
+        "index": index,
+        "active": active,
+        "name": desk.name,
+        "summary": desk.summary,
+        "intent": desk.metadata.intent,
+        "cwd": desk.metadata.cwd,
+        "branch": desk.metadata.branch,
+        "status": desk.metadata.status,
+        "progress": desk.metadata.progress.as_ref().map(|progress| json!({
+            "label": progress.label,
+            "value": progress.value,
+        })),
+        "pane_count": desk.panes.len(),
+        "live_count": desk.terminals.len(),
+        "active_pane_id": desk.active_pane.map(PaneId::raw),
+        "active_pane_title": desk.active_pane.map(|_| desk.active_pane_title()),
+        "attention": {
+            "highest": attention.highest,
+            "unread_count": attention.unread_count,
+        },
+    })
+}
+
+fn automation_workdesk_state_json(index: usize, desk: &WorkdeskState, active: bool) -> Value {
+    json!({
+        "workdesk": automation_workdesk_summary_json(index, desk, active),
+        "panes": desk.panes.iter().map(|pane| automation_pane_json(desk, pane.id, active)).collect::<Vec<_>>(),
+    })
+}
+
+fn initial_workdesks() -> Vec<WorkdeskState> {
+    vec![workdesk_from_template(
+        WorkdeskTemplate::ShellDesk,
+        WorkdeskDraft::from_template("Shell Desk".to_string(), WorkdeskTemplate::ShellDesk),
+    )]
+}
+
+#[cfg(test)]
 fn blank_workdesk(name: impl Into<String>, summary: impl Into<String>) -> WorkdeskState {
     WorkdeskState::new(name, summary, Vec::new())
 }
@@ -3955,6 +5892,7 @@ fn shutdown_workdesk_terminals(workdesk: &mut WorkdeskState) {
     }
     workdesk.terminals.clear();
     workdesk.terminal_revisions.clear();
+    workdesk.terminal_statuses.clear();
     workdesk.terminal_views.clear();
 }
 
@@ -3969,23 +5907,60 @@ fn workdesk_card(
     context_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     menu_button_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let attention_summary = desk.workdesk_attention_summary();
+    let attention_tint = if attention_summary.highest == AttentionState::Idle {
+        accent
+    } else {
+        attention_summary.highest.tint()
+    };
     let border = if is_active || is_menu_open {
         accent
+    } else if attention_summary.unread_count > 0 {
+        attention_tint
     } else {
         rgb(0x24313b).into()
     };
     let background = if is_active || is_menu_open {
-        rgb(0x162028)
+        rgb(0x131b22)
     } else {
-        rgb(0x11181e)
+        rgb(0x0f151b)
     };
-    let focus = desk.active_pane_title();
+    let focus_label = if desk.active_pane.is_some() {
+        desk.active_pane_title()
+    } else {
+        "No focus".to_string()
+    };
+    let focus_attention = desk
+        .active_pane
+        .map(|pane_id| desk.pane_attention(pane_id).state)
+        .unwrap_or(AttentionState::Idle);
+    let live_label = if desk.terminals.is_empty() {
+        "Idle".to_string()
+    } else {
+        format!("Live {}", desk.terminals.len())
+    };
+    let intent_label = desk.intent_label();
+    let cwd_label = compact_cwd_label(&desk.metadata.cwd);
+    let branch_label = desk
+        .metadata
+        .branch
+        .trim()
+        .is_empty()
+        .then_some("no-branch".to_string())
+        .unwrap_or_else(|| desk.metadata.branch.clone());
+    let status_label = desk.status_label();
+    let progress_label = desk.progress_label();
+    let desk_label = if is_active {
+        "Active".to_string()
+    } else {
+        format!("Desk {}", index + 1)
+    };
 
     div()
         .flex()
         .flex_col()
         .gap_2()
-        .p_3()
+        .p_2()
         .bg(background)
         .border_1()
         .border_color(border)
@@ -4006,32 +5981,62 @@ fn workdesk_card(
                 .items_center()
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(accent)
-                        .child(format!("Desk {}", index + 1)),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(attention_indicator(
+                            attention_summary.highest,
+                            attention_summary.unread_count > 0,
+                        ))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(accent)
+                                .child(desk_label),
+                        ),
                 )
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap_2()
+                        .gap_1()
                         .child(
                             div()
                                 .px_2()
-                                .py_1()
+                                .py(px(2.0))
                                 .rounded_full()
                                 .bg(rgb(0x0c1116))
                                 .text_xs()
                                 .text_color(rgb(0x9da8b1))
-                                .child(format!("{} panes", desk.panes.len())),
+                                .child(live_label),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py(px(2.0))
+                                .rounded_full()
+                                .bg(rgb(0x0c1116))
+                                .border_1()
+                                .border_color(if attention_summary.unread_count > 0 {
+                                    attention_tint
+                                } else {
+                                    rgb(0x24313b).into()
+                                })
+                                .text_xs()
+                                .text_color(if attention_summary.unread_count > 0 {
+                                    attention_tint
+                                } else {
+                                    rgb(0x9da8b1).into()
+                                })
+                                .child(format!("{}", attention_summary.unread_count)),
                         )
                         .child(
                             div()
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .w(px(28.0))
-                                .h(px(28.0))
+                                .w(px(24.0))
+                                .h(px(24.0))
                                 .bg(if is_menu_open {
                                     rgb(0x1c2730)
                                 } else {
@@ -4047,7 +6052,7 @@ fn workdesk_card(
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })
-                                .on_mouse_up(MouseButton::Left, menu_button_listener)
+                                        .on_mouse_up(MouseButton::Left, menu_button_listener)
                                 .child(div().text_xs().text_color(rgb(0x9da8b1)).child("•••")),
                         ),
                 ),
@@ -4056,19 +6061,148 @@ fn workdesk_card(
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x90a0aa))
-                .child(desk.summary.clone()),
+                .text_color(accent)
+                .child(intent_label),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x9aa6af))
+                .child(preview),
         )
         .child(
             div()
                 .flex()
+                .items_center()
+                .gap_1()
                 .flex_wrap()
-                .gap_2()
-                .child(status_chip("Live", format!("{}", desk.terminals.len())))
-                .child(status_chip("Layout", desk.layout_mode.label().to_string()))
-                .child(status_chip("Focus", focus)),
+                .child(context_pill(cwd_label, rgb(0x7f8a94).into()))
+                .child(context_pill(branch_label, rgb(0x7cc7ff).into()))
+                .when_some(progress_label, |row, progress| {
+                    row.child(context_pill(progress, rgb(0x77d19a).into()))
+                })
+                .when_some(status_label, |row, status| {
+                    row.child(context_pill(status, attention_tint))
+                }),
         )
-        .child(div().text_xs().text_color(rgb(0xb7c1c8)).child(preview))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(attention_indicator(focus_attention, false))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f8a94))
+                                .child(focus_label),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x6f7c86))
+                                .child(format!("{}", desk.panes.len())),
+                        )
+                        .when(attention_summary.unread_count > 0, |row| {
+                            row.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(attention_tint)
+                                    .child(format!("{} unread", attention_summary.unread_count)),
+                            )
+                        }),
+                ),
+        )
+}
+
+fn workdesk_template_card(
+    template: WorkdeskTemplate,
+    selected: bool,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let accent = template.accent();
+    let border = if selected { accent } else { rgb(0x293742).into() };
+    let background = if selected { rgb(0x17212a) } else { rgb(0x121920) };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_3()
+        .bg(background)
+        .border_1()
+        .border_color(border)
+        .rounded_lg()
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, listener)
+        .child(div().text_sm().text_color(accent).child(template.label()))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x90a0aa))
+                .child(template.summary()),
+        )
+}
+
+fn workdesk_editor_field(
+    label: &str,
+    value: String,
+    active: bool,
+    accent: gpui::Hsla,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let label = label.to_string();
+    let border = if active { accent } else { rgb(0x293742).into() };
+    let background = if active { rgb(0x16212a) } else { rgb(0x121920) };
+    let text_tint: gpui::Hsla = if value.is_empty() {
+        rgb(0x67737d).into()
+    } else {
+        rgb(0xe4ebf1).into()
+    };
+    let placeholder = format!("{label}...");
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_3()
+        .bg(background)
+        .border_1()
+        .border_color(border)
+        .rounded_lg()
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, listener)
+        .child(div().text_xs().text_color(accent).child(label))
+        .child(
+            div()
+                .text_sm()
+                .text_color(text_tint)
+                .child(if value.is_empty() {
+                    placeholder
+                } else if active {
+                    format!("{value}|")
+                } else {
+                    value
+                }),
+        )
 }
 
 fn workdesk_menu_item(
@@ -4229,28 +6363,54 @@ fn control_button(
         .child(div().text_xs().text_color(accent).child(label))
 }
 
-fn toggle_button(
+fn compact_dock_button(
+    label: &str,
+    accent: gpui::Hsla,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let label = label.to_string();
+
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .min_w(px(36.0))
+        .px_2()
+        .py_1()
+        .cursor_pointer()
+        .bg(rgb(0x161d24))
+        .border_1()
+        .border_color(rgb(0x2b3641))
+        .rounded_md()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, listener)
+        .child(div().text_xs().text_color(accent).child(label))
+}
+
+fn compact_toggle_button(
     label: &str,
     accent: gpui::Hsla,
     active: bool,
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let label = label.to_string();
-    let background = if active { rgb(0x1f2932) } else { rgb(0x171d24) };
+    let background = if active { rgb(0x1d2730) } else { rgb(0x161d24) };
     let border = if active { accent } else { rgb(0x2b3641).into() };
 
     div()
         .flex()
         .items_center()
         .justify_center()
-        .min_w(px(52.0))
-        .px_3()
-        .py_2()
+        .min_w(px(40.0))
+        .px_2()
+        .py_1()
         .cursor_pointer()
         .bg(background)
         .border_1()
         .border_color(border)
-        .rounded_lg()
+        .rounded_md()
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
@@ -4275,6 +6435,76 @@ fn status_chip(label: &str, value: String) -> impl IntoElement {
         .bg(rgb(0x171d24))
         .child(div().text_xs().text_color(rgb(0x7f8a94)).child(label))
         .child(div().text_xs().text_color(rgb(0xdce2e8)).child(value))
+}
+
+fn context_pill(value: impl Into<String>, tint: gpui::Hsla) -> impl IntoElement {
+    let value = value.into();
+
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded_full()
+        .bg(rgb(0x151c23))
+        .border_1()
+        .border_color(rgb(0x2b3641))
+        .child(div().text_xs().text_color(tint).child(value))
+}
+
+fn inspector_row(label: &str, value: impl Into<String>) -> impl IntoElement {
+    let label = label.to_string();
+    let value = value.into();
+
+    div()
+        .flex()
+        .justify_between()
+        .items_start()
+        .gap_4()
+        .child(div().text_xs().text_color(rgb(0x7f8a94)).child(label))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0xdce2e8))
+                .max_w(px(220.0))
+                .text_right()
+                .child(value),
+        )
+}
+
+fn signal_dot(color: gpui::Hsla, filled: bool) -> impl IntoElement {
+    div()
+        .w(px(8.0))
+        .h(px(8.0))
+        .rounded_full()
+        .bg(if filled { color } else { rgba(0x00000000).into() })
+        .border_1()
+        .border_color(color)
+}
+
+fn attention_indicator(state: AttentionState, unread: bool) -> impl IntoElement {
+    let tint = state.tint();
+    let filled = state != AttentionState::Idle;
+
+    div()
+        .relative()
+        .w(px(10.0))
+        .h(px(10.0))
+        .child(signal_dot(tint, filled))
+        .when(unread, |root| {
+            root.child(
+                div()
+                    .absolute()
+                    .left(px(-2.0))
+                    .top(px(-2.0))
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(tint),
+            )
+        })
 }
 
 fn workdesk_accent(index: usize) -> gpui::Hsla {
@@ -4640,6 +6870,34 @@ fn grid_projection(panes: &[PaneRecord]) -> GridProjection {
     projection
 }
 
+fn next_attention_target_for_workdesks(workdesks: &[WorkdeskState]) -> Option<(usize, PaneId)> {
+    let mut best: Option<((u64, usize, u64), PaneId)> = None;
+
+    for (desk_index, desk) in workdesks.iter().enumerate() {
+        for pane in &desk.panes {
+            let attention = desk.pane_attention(pane.id);
+            if !attention.unread || !attention.state.is_attention() {
+                continue;
+            }
+
+            let candidate_key = (
+                attention.last_attention_sequence.max(1),
+                desk_index,
+                pane.id.raw(),
+            );
+
+            if best
+                .as_ref()
+                .map_or(true, |(best_key, _)| candidate_key < *best_key)
+            {
+                best = Some((candidate_key, pane.id));
+            }
+        }
+    }
+
+    best.map(|((_, desk_index, _), pane_id)| (desk_index, pane_id))
+}
+
 fn split_layout_frames(
     panes: &[PaneRecord],
     _active_pane: Option<PaneId>,
@@ -4859,6 +7117,50 @@ fn terminal_footer_label(snapshot: &Option<TerminalSnapshot>) -> String {
     } else {
         format!("{mode} {}x{} {status}", snapshot.cols, snapshot.rows_count)
     }
+}
+
+fn infer_attention_state_from_snapshot(
+    pane_kind: &PaneKind,
+    snapshot: &TerminalSnapshot,
+) -> AttentionState {
+    let status = snapshot.status.as_deref().unwrap_or("Running");
+    let normalized = status.to_ascii_lowercase();
+
+    if normalized.contains("error")
+        || normalized.contains("failed")
+        || normalized.contains("exited via")
+        || (normalized.contains("exited with code") && !normalized.contains("code 0"))
+    {
+        return AttentionState::Error;
+    }
+
+    if snapshot.closed
+        || normalized.contains("exited with code 0")
+        || normalized.contains("terminated")
+    {
+        return AttentionState::Waiting;
+    }
+
+    match pane_kind {
+        PaneKind::Agent => AttentionState::Working,
+        PaneKind::Shell => AttentionState::Idle,
+    }
+}
+
+fn post_attention_notification(title: String, body: String) {
+    #[cfg(target_os = "macos")]
+    {
+        let title = escape_applescript_string(&title);
+        let body = escape_applescript_string(&body);
+        let _ = Command::new("osascript")
+            .arg("-e")
+            .arg(format!("display notification \"{body}\" with title \"{title}\""))
+            .spawn();
+    }
+}
+
+fn escape_applescript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn terminal_body(
@@ -5284,6 +7586,40 @@ mod tests {
     }
 
     #[test]
+    fn persisted_workdesk_round_trips_attention_state() {
+        let mut state = WorkdeskState::new(
+            "Desk",
+            "Summary",
+            vec![PaneRecord {
+                id: PaneId::new(9),
+                title: "Agent".to_string(),
+                kind: PaneKind::Agent,
+                position: WorkdeskPoint::new(0.0, 0.0),
+                size: WorkdeskSize::new(720.0, 420.0),
+            }],
+        );
+        state.attention_sequence = 14;
+        state.pane_attention.insert(
+            PaneId::new(9),
+            PaneAttention {
+                state: AttentionState::Error,
+                unread: true,
+                last_attention_sequence: 12,
+                last_activity_sequence: 8,
+            },
+        );
+
+        let restored = PersistedWorkdesk::from_state(&state).into_state();
+        let attention = restored.pane_attention(PaneId::new(9));
+
+        assert_eq!(restored.attention_sequence, 14);
+        assert_eq!(attention.state, AttentionState::Error);
+        assert!(attention.unread);
+        assert_eq!(attention.last_attention_sequence, 12);
+        assert_eq!(attention.last_activity_sequence, 8);
+    }
+
+    #[test]
     fn shortcut_reassignment_clears_previous_owner() {
         let mut shortcuts = ShortcutMap::default();
         let binding = ShortcutBinding::parse("cmd-shift-n").unwrap();
@@ -5335,6 +7671,86 @@ mod tests {
     }
 
     #[test]
+    fn next_attention_target_picks_oldest_unread_attention() {
+        let mut left = WorkdeskState::new(
+            "Left",
+            "Summary",
+            vec![PaneRecord {
+                id: PaneId::new(1),
+                title: "Shell".to_string(),
+                kind: PaneKind::Shell,
+                position: WorkdeskPoint::new(0.0, 0.0),
+                size: WorkdeskSize::new(920.0, 560.0),
+            }],
+        );
+        left.pane_attention.insert(
+            PaneId::new(1),
+            PaneAttention {
+                state: AttentionState::Waiting,
+                unread: true,
+                last_attention_sequence: 7,
+                last_activity_sequence: 7,
+            },
+        );
+
+        let mut right = WorkdeskState::new(
+            "Right",
+            "Summary",
+            vec![PaneRecord {
+                id: PaneId::new(2),
+                title: "Agent".to_string(),
+                kind: PaneKind::Agent,
+                position: WorkdeskPoint::new(0.0, 0.0),
+                size: WorkdeskSize::new(720.0, 420.0),
+            }],
+        );
+        right.pane_attention.insert(
+            PaneId::new(2),
+            PaneAttention {
+                state: AttentionState::Error,
+                unread: true,
+                last_attention_sequence: 11,
+                last_activity_sequence: 11,
+            },
+        );
+
+        assert_eq!(
+            next_attention_target_for_workdesks(&[left, right]),
+            Some((0, PaneId::new(1)))
+        );
+    }
+
+    #[test]
+    fn focusing_pane_clears_unread_but_keeps_error_state() {
+        let mut state = WorkdeskState::new(
+            "Desk",
+            "Summary",
+            vec![PaneRecord {
+                id: PaneId::new(3),
+                title: "Agent".to_string(),
+                kind: PaneKind::Agent,
+                position: WorkdeskPoint::new(0.0, 0.0),
+                size: WorkdeskSize::new(720.0, 420.0),
+            }],
+        );
+        state.pane_attention.insert(
+            PaneId::new(3),
+            PaneAttention {
+                state: AttentionState::Error,
+                unread: true,
+                last_attention_sequence: 5,
+                last_activity_sequence: 4,
+            },
+        );
+
+        state.focus_pane(PaneId::new(3));
+        let attention = state.pane_attention(PaneId::new(3));
+
+        assert_eq!(attention.state, AttentionState::Error);
+        assert!(!attention.unread);
+    }
+
+    #[test]
     fn persisted_empty_workdesk_round_trips() {
         let restored =
             PersistedWorkdesk::from_state(&blank_workdesk("Desk", "Summary")).into_state();
@@ -5346,12 +7762,130 @@ mod tests {
     }
 
     #[test]
-    fn initial_workdesks_start_with_single_blank_desk() {
+    fn persisted_workdesk_round_trips_metadata() {
+        let mut state = WorkdeskState::new("Desk", "Summary", Vec::new());
+        state.metadata = WorkdeskMetadata {
+            intent: "Ship the fix".to_string(),
+            cwd: "/tmp/project".to_string(),
+            branch: "codex/phase-3".to_string(),
+            status: Some("Building".to_string()),
+            progress: Some(WorkdeskProgress::new("Build", 42)),
+        };
+
+        let restored = PersistedWorkdesk::from_state(&state).into_state();
+
+        assert_eq!(restored.metadata.intent, "Ship the fix");
+        assert_eq!(restored.metadata.cwd, "/tmp/project");
+        assert_eq!(restored.metadata.branch, "codex/phase-3");
+        assert_eq!(restored.metadata.status.as_deref(), Some("Building"));
+        assert_eq!(
+            restored.metadata.progress.as_ref().map(|progress| progress.value),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn initial_workdesks_start_with_shell_template() {
         let workdesks = initial_workdesks();
 
         assert_eq!(workdesks.len(), 1);
-        assert_eq!(workdesks[0].name, "Workdesk 1");
-        assert_eq!(workdesks[0].summary, DEFAULT_WORKDESK_SUMMARY);
-        assert!(workdesks[0].panes.is_empty());
+        assert_eq!(workdesks[0].name, "Shell Desk");
+        assert_eq!(workdesks[0].summary, WorkdeskTemplate::ShellDesk.summary());
+        assert_eq!(workdesks[0].panes.len(), 1);
+        assert_eq!(workdesks[0].panes[0].kind, PaneKind::Shell);
+        assert_eq!(workdesks[0].metadata.intent, WorkdeskTemplate::ShellDesk.intent());
+    }
+
+    #[test]
+    fn automation_server_round_trips_request_lines() {
+        let socket_path = std::env::temp_dir().join(format!(
+            "canvas-automation-test-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        let server = start_automation_server_at(socket_path.clone())
+            .expect("automation server should start");
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
+            .expect("socket should accept clients");
+
+        stream
+            .write_all(br#"{"id":1,"method":"state.current","params":{}}"#)
+            .expect("request should write");
+        stream.write_all(b"\n").expect("newline should write");
+
+        let envelope = server
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("automation envelope should be received");
+        assert_eq!(envelope.request.method, "state.current");
+        envelope
+            .response_tx
+            .send(AutomationResponse::success(
+                envelope.request.id.clone(),
+                json!({ "ok": true }),
+            ))
+            .expect("response should send");
+
+        let mut response_line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut response_line)
+            .expect("response line should read");
+        let response: Value =
+            serde_json::from_str(response_line.trim()).expect("response should be valid json");
+
+        assert_eq!(response["ok"], Value::Bool(true));
+        assert_eq!(response["result"]["ok"], Value::Bool(true));
+
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn automation_state_json_includes_metadata_and_panes() {
+        let mut desk = WorkdeskState::new(
+            "Desk",
+            "Summary",
+            vec![PaneRecord {
+                id: PaneId::new(7),
+                title: "Agent".to_string(),
+                kind: PaneKind::Agent,
+                position: WorkdeskPoint::new(0.0, 0.0),
+                size: WorkdeskSize::new(720.0, 420.0),
+            }],
+        );
+        desk.metadata = WorkdeskMetadata {
+            intent: "Ship".to_string(),
+            cwd: "/tmp/project".to_string(),
+            branch: "codex/test".to_string(),
+            status: Some("Working".to_string()),
+            progress: Some(WorkdeskProgress::new("Build", 64)),
+        };
+        desk.pane_attention.insert(
+            PaneId::new(7),
+            PaneAttention {
+                state: AttentionState::Waiting,
+                unread: true,
+                last_attention_sequence: 9,
+                last_activity_sequence: 6,
+            },
+        );
+        desk.terminal_statuses
+            .insert(PaneId::new(7), Some("Running".to_string()));
+
+        let payload = automation_workdesk_state_json(0, &desk, true);
+
+        assert_eq!(payload["workdesk"]["intent"], Value::String("Ship".to_string()));
+        assert_eq!(
+            payload["workdesk"]["progress"]["value"],
+            Value::Number(64.into())
+        );
+        assert_eq!(payload["panes"][0]["id"], Value::Number(7.into()));
+        assert_eq!(payload["panes"][0]["kind"], Value::String("agent".to_string()));
+        assert_eq!(
+            payload["panes"][0]["attention"]["state"],
+            Value::String("waiting".to_string())
+        );
     }
 }

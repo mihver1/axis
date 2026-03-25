@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/canvas-app",
+    "apps/canvas-cli",
     "crates/canvas-core",
     "crates/canvas-terminal",
     "crates/process-manager",
