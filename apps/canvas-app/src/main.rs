@@ -7,9 +7,10 @@ use canvas_terminal::{
 };
 use gpui::{
     div, font, prelude::*, px, rgb, size, App, Application, Bounds, ClipboardItem, Context,
-    FocusHandle, FontStyle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, TextRun,
-    Timer, UnderlineStyle, Window, WindowBounds, WindowOptions,
+    DispatchPhase, FocusHandle, FontStyle, FontWeight, KeyDownEvent, MagnifyGestureEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent,
+    SharedString, SmartMagnifyGestureEvent, StrikethroughStyle, StyledText, SwipeGestureEvent,
+    TextRun, Timer, TouchEvent, TouchPhase, UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,6 +25,12 @@ const MIN_ZOOM: f32 = 0.5;
 const MAX_ZOOM: f32 = 2.5;
 const SCROLL_WHEEL_LINE_HEIGHT: f32 = 20.0;
 const SCROLL_ZOOM_SENSITIVITY: f32 = 0.0025;
+const PINCH_MIN_ZOOM_FACTOR: f32 = 0.01;
+const SWIPE_PAN_VIEWPORT_FRACTION: f32 = 0.35;
+const SMART_MAGNIFY_RESET_EPSILON: f32 = 0.08;
+const THREE_FINGER_PAN_SURFACE_SCALE: f32 = 1.15;
+const THREE_FINGER_PAN_MIN_DELTA_PIXELS: f32 = 0.5;
+const THREE_FINGER_SWIPE_SUPPRESSION: Duration = Duration::from_millis(250);
 const GRID_STEP_WORLD: f32 = 160.0;
 const MIN_PANE_WIDTH: f32 = 320.0;
 const MIN_PANE_HEIGHT: f32 = 220.0;
@@ -76,6 +83,14 @@ struct CanvasShell {
     cursor_blink_visible: bool,
     last_cursor_blink_at: Instant,
     persist_generation: u64,
+    touchpad_pan_state: Option<TouchpadPanState>,
+    last_touchpad_pan_end: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct TouchpadPanState {
+    touch_ids: Vec<u64>,
+    last_centroid: gpui::Point<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -744,6 +759,8 @@ impl CanvasShell {
             cursor_blink_visible: true,
             last_cursor_blink_at: Instant::now(),
             persist_generation: 0,
+            touchpad_pan_state: None,
+            last_touchpad_pan_end: None,
         };
 
         if let Some(notice) = boot_notice {
@@ -1186,6 +1203,149 @@ impl CanvasShell {
 
         self.request_persist(cx);
         cx.notify();
+    }
+
+    fn end_touchpad_pan(&mut self) {
+        if self.touchpad_pan_state.take().is_some() {
+            self.last_touchpad_pan_end = Some(Instant::now());
+        }
+    }
+
+    fn on_touch_event(&mut self, event: &TouchEvent, window: &Window, cx: &mut Context<Self>) {
+        if !matches!(self.active_workdesk().drag_state, DragState::Idle)
+            || self.active_workdesk().layout_mode != LayoutMode::Free
+        {
+            self.end_touchpad_pan();
+            return;
+        }
+
+        if event.touches.len() != 3 {
+            self.end_touchpad_pan();
+            return;
+        }
+
+        let Some(centroid) = event.centroid() else {
+            self.end_touchpad_pan();
+            return;
+        };
+
+        let touch_ids = event
+            .touches
+            .iter()
+            .map(|touch| touch.id)
+            .collect::<Vec<_>>();
+        let viewport = window.window_bounds().get_bounds();
+        let usable_width = (f32::from(viewport.size.width) - SIDEBAR_WIDTH).max(220.0);
+        let usable_height = f32::from(viewport.size.height).max(220.0);
+        let mut pan_delta = None;
+
+        match &mut self.touchpad_pan_state {
+            Some(state) if state.touch_ids == touch_ids => {
+                let delta = centroid - state.last_centroid;
+                let screen_delta = gpui::point(
+                    px(delta.x * usable_width * THREE_FINGER_PAN_SURFACE_SCALE),
+                    px(-delta.y * usable_height * THREE_FINGER_PAN_SURFACE_SCALE),
+                );
+
+                state.last_centroid = centroid;
+
+                if matches!(event.touch_phase, TouchPhase::Moved)
+                    && (f32::from(screen_delta.x).abs() >= THREE_FINGER_PAN_MIN_DELTA_PIXELS
+                        || f32::from(screen_delta.y).abs() >= THREE_FINGER_PAN_MIN_DELTA_PIXELS)
+                {
+                    pan_delta = Some(screen_delta);
+                }
+            }
+            _ => {
+                self.touchpad_pan_state = Some(TouchpadPanState {
+                    touch_ids,
+                    last_centroid: centroid,
+                });
+            }
+        }
+
+        if let Some(screen_delta) = pan_delta {
+            self.active_workdesk_mut().pan_by_screen_delta(screen_delta);
+            self.request_persist(cx);
+            cx.notify();
+        }
+    }
+
+    fn should_suppress_swipe(&self) -> bool {
+        self.last_touchpad_pan_end
+            .is_some_and(|ended_at| ended_at.elapsed() <= THREE_FINGER_SWIPE_SUPPRESSION)
+    }
+
+    fn handles_canvas_gesture(&self, position: gpui::Point<Pixels>) -> bool {
+        f32::from(position.x) > SIDEBAR_WIDTH
+            && matches!(self.active_workdesk().drag_state, DragState::Idle)
+            && self.active_workdesk().layout_mode == LayoutMode::Free
+    }
+
+    fn on_magnify_gesture(&mut self, event: &MagnifyGestureEvent, cx: &mut Context<Self>) {
+        if !self.handles_canvas_gesture(event.position) || !event.magnification.is_finite() {
+            return;
+        }
+
+        let zoom_factor = (1.0 + event.magnification).max(PINCH_MIN_ZOOM_FACTOR);
+        if self.zoom_about_screen_position(event.position, zoom_factor) {
+            self.request_persist(cx);
+            cx.notify();
+        }
+    }
+
+    fn on_swipe_gesture(
+        &mut self,
+        event: &SwipeGestureEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.should_suppress_swipe() {
+            return;
+        }
+
+        if !matches!(event.touch_phase, TouchPhase::Ended)
+            || !self.handles_canvas_gesture(event.position)
+        {
+            return;
+        }
+
+        if event.delta.x == 0.0 && event.delta.y == 0.0 {
+            return;
+        }
+
+        let viewport = window.window_bounds().get_bounds();
+        let step_x = (f32::from(viewport.size.width) - SIDEBAR_WIDTH).max(220.0)
+            * SWIPE_PAN_VIEWPORT_FRACTION;
+        let step_y = f32::from(viewport.size.height).max(220.0) * SWIPE_PAN_VIEWPORT_FRACTION;
+        self.active_workdesk_mut().pan_by_screen_delta(gpui::point(
+            px(-event.delta.x * step_x),
+            px(-event.delta.y * step_y),
+        ));
+        self.request_persist(cx);
+        cx.notify();
+    }
+
+    fn on_smart_magnify_gesture(
+        &mut self,
+        event: &SmartMagnifyGestureEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.handles_canvas_gesture(event.position) {
+            return;
+        }
+
+        let workdesk = self.active_workdesk();
+        let near_reset = (workdesk.zoom - 1.0).abs() <= SMART_MAGNIFY_RESET_EPSILON
+            && workdesk.camera.x.abs() <= 24.0
+            && workdesk.camera.y.abs() <= 24.0;
+
+        if near_reset {
+            self.fit_to_panes(window, cx);
+        } else {
+            self.reset_view(cx);
+        }
     }
 
     fn on_trackpad_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
@@ -2198,6 +2358,58 @@ impl Render for CanvasShell {
                 )
             })
             .collect::<Vec<_>>();
+
+        window.on_mouse_event({
+            let entity = entity.clone();
+            move |event: &TouchEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+
+                entity.update(cx, |this, cx| {
+                    this.on_touch_event(event, window, cx);
+                });
+            }
+        });
+
+        window.on_mouse_event({
+            let entity = entity.clone();
+            move |event: &MagnifyGestureEvent, phase, _, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+
+                entity.update(cx, |this, cx| {
+                    this.on_magnify_gesture(event, cx);
+                });
+            }
+        });
+
+        window.on_mouse_event({
+            let entity = entity.clone();
+            move |event: &SwipeGestureEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+
+                entity.update(cx, |this, cx| {
+                    this.on_swipe_gesture(event, window, cx);
+                });
+            }
+        });
+
+        window.on_mouse_event({
+            let entity = entity.clone();
+            move |event: &SmartMagnifyGestureEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+
+                entity.update(cx, |this, cx| {
+                    this.on_smart_magnify_gesture(event, window, cx);
+                });
+            }
+        });
 
         div()
             .relative()
