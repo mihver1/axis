@@ -110,7 +110,14 @@ fn parse_cli(args: Vec<String>) -> Result<CliOptions, String> {
     }
 
     let method = resolve_method_alias(command);
-    let params = parse_key_value_args(&args[cursor..])?;
+    let mut params = parse_key_value_args(&args[cursor..])?;
+    if let Some(kind) = default_kind_for_alias(command) {
+        if let Some(object) = params.as_object_mut() {
+            object
+                .entry("kind".to_string())
+                .or_insert_with(|| Value::String(kind.to_string()));
+        }
+    }
 
     Ok(CliOptions {
         socket_path,
@@ -127,13 +134,26 @@ fn resolve_method_alias(command: &str) -> &str {
         "select-desk" => "workdesk.select",
         "rename-desk" => "workdesk.rename",
         "new-pane" => "pane.create",
+        "new-browser" => "pane.create",
+        "new-editor" => "pane.create",
         "focus-pane" => "pane.focus",
+        "list-surfaces" => "surface.list",
+        "focus-surface" => "surface.focus",
+        "close-surface" => "surface.close",
         "set-attention" => "attention.set",
         "clear-attention" => "attention.clear",
         "set-status" => "status.set",
         "set-progress" => "progress.set",
         "notify" => "notification.create",
         other => other,
+    }
+}
+
+fn default_kind_for_alias(command: &str) -> Option<&'static str> {
+    match command {
+        "new-browser" => Some("browser"),
+        "new-editor" => Some("editor"),
+        _ => None,
     }
 }
 
@@ -201,7 +221,11 @@ fn insert_param_value(target: &mut Map<String, Value>, key: &str, value: Value) 
     }
 }
 
-fn send_request(socket_path: &Path, method: &str, params: Value) -> Result<AutomationResponse, String> {
+fn send_request(
+    socket_path: &Path,
+    method: &str,
+    params: Value,
+) -> Result<AutomationResponse, String> {
     let mut stream = UnixStream::connect(socket_path).map_err(|error| {
         format!(
             "connect {}: {error}\nLaunch `canvas-app` first or pass `--socket <path>`.",
@@ -259,7 +283,12 @@ Aliases:
   select-desk       -> workdesk.select
   rename-desk       -> workdesk.rename
   new-pane          -> pane.create
+  new-browser       -> pane.create (kind=browser)
+  new-editor        -> pane.create (kind=editor)
   focus-pane        -> pane.focus
+  list-surfaces     -> surface.list
+  focus-surface     -> surface.focus
+  close-surface     -> surface.close
   set-attention     -> attention.set
   clear-attention   -> attention.clear
   set-status        -> status.set
@@ -273,6 +302,9 @@ Examples:
   canvas set-status workdesk_index=0 value=Reviewing
   canvas set-progress workdesk_index=0 label=Build value=55
   canvas new-pane workdesk_index=0 kind=agent title='Verifier'
+  canvas new-browser workdesk_index=0 url='https://example.com'
+  canvas new-editor workdesk_index=0 file_path='/tmp/notes.rs'
+  canvas list-surfaces workdesk_index=0 pane_id=3
   canvas set-attention workdesk_index=0 pane_id=3 state=waiting unread=true
   canvas raw pane.create '{{\"workdesk_index\":0,\"kind\":\"shell\"}}'
 
@@ -291,6 +323,9 @@ mod tests {
     fn resolves_aliases() {
         assert_eq!(resolve_method_alias("state"), "state.current");
         assert_eq!(resolve_method_alias("new-pane"), "pane.create");
+        assert_eq!(resolve_method_alias("new-browser"), "pane.create");
+        assert_eq!(resolve_method_alias("new-editor"), "pane.create");
+        assert_eq!(resolve_method_alias("list-surfaces"), "surface.list");
         assert_eq!(resolve_method_alias("workdesk.list"), "workdesk.list");
     }
 
@@ -304,7 +339,10 @@ mod tests {
         ])
         .expect("params should parse");
 
-        assert_eq!(params["progress"]["label"], Value::String("Build".to_string()));
+        assert_eq!(
+            params["progress"]["label"],
+            Value::String("Build".to_string())
+        );
         assert_eq!(params["progress"]["value"], Value::Number(55.into()));
         assert_eq!(params["desktop"], Value::Bool(true));
         assert_eq!(params["name"], Value::String("Desk".to_string()));
@@ -322,5 +360,39 @@ mod tests {
         assert_eq!(options.method, "pane.create");
         assert_eq!(options.params["workdesk_index"], Value::Number(0.into()));
         assert_eq!(options.params["kind"], Value::String("agent".to_string()));
+    }
+
+    #[test]
+    fn new_browser_alias_injects_kind() {
+        let options = parse_cli(vec![
+            "new-browser".to_string(),
+            "workdesk_index=0".to_string(),
+            "url=https://example.com".to_string(),
+        ])
+        .expect("cli should parse");
+
+        assert_eq!(options.method, "pane.create");
+        assert_eq!(options.params["kind"], Value::String("browser".to_string()));
+        assert_eq!(
+            options.params["url"],
+            Value::String("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn new_editor_alias_injects_kind() {
+        let options = parse_cli(vec![
+            "new-editor".to_string(),
+            "workdesk_index=0".to_string(),
+            "file_path=/tmp/main.rs".to_string(),
+        ])
+        .expect("cli should parse");
+
+        assert_eq!(options.method, "pane.create");
+        assert_eq!(options.params["kind"], Value::String("editor".to_string()));
+        assert_eq!(
+            options.params["file_path"],
+            Value::String("/tmp/main.rs".to_string())
+        );
     }
 }

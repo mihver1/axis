@@ -1,5 +1,6 @@
 [package]
 name = "canvas-core"
+build = "build.rs"
 edition.workspace = true
 license.workspace = true
 publish = false
@@ -8,4 +9,3 @@ version.workspace = true
 
 [lib]
 path = "src/lib.rs"
-

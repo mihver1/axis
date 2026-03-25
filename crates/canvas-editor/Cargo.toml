@@ -1,0 +1,20 @@
+[package]
+name = "canvas-editor"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tree-sitter = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-markdown = "0.7"
+tree-sitter-rust = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-typescript = "0.23"
+tree-sitter-yaml = "0.7"
+unicode-segmentation = "1"

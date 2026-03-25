@@ -1,15 +1,20 @@
-use canvas_core::{PaneId, PaneKind, PaneRecord, Point as WorkdeskPoint, Size as WorkdeskSize};
+use canvas_core::{
+    PaneId, PaneKind, PaneRecord, Point as WorkdeskPoint, Size as WorkdeskSize, SurfaceId,
+    SurfaceKind, SurfaceRecord,
+};
+use canvas_editor::{EditorBuffer, HighlightKind};
 use canvas_terminal::{
-    ghostty_build_info, grid_size_for_pane, spawn_terminal_session, TerminalColor, TerminalRow,
-    TerminalSession, TerminalSnapshot,
+    ghostty_build_info, spawn_terminal_session_with_grid, TerminalColor, TerminalGridSize,
+    TerminalRow, TerminalSession, TerminalSnapshot,
 };
 use gpui::{
-    div, font, prelude::*, px, rgb, rgba, size, App, Application, Bounds, ClipboardItem, Context,
-    FocusHandle, FontStyle, FontWeight, KeyDownEvent, KeybindingKeystroke, Keystroke,
+    div, font, prelude::*, px, relative, rgb, rgba, size, App, Application, Bounds, ClipboardItem,
+    Context, Element, ElementId, ElementInputHandler, EntityInputHandler, FocusHandle, FontStyle,
+    FontWeight, GlobalElementId, KeyDownEvent, KeybindingKeystroke, Keystroke, LayoutId,
     MagnifyGestureEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    ScrollWheelEvent, SharedString, SmartMagnifyGestureEvent, StrikethroughStyle, StyledText,
-    SwipeGestureEvent, TextRun, Timer, TouchEvent, TouchPhase, UnderlineStyle, Window,
-    WindowBounds, WindowOptions,
+    Point as GpuiPoint, ScrollWheelEvent, SharedString, SmartMagnifyGestureEvent, Style,
+    StyledText, SwipeGestureEvent, TextRun, Timer, TitlebarOptions, TouchEvent, TouchPhase,
+    UTF16Selection, Window, WindowBounds, WindowOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -18,6 +23,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     io::{BufRead, BufReader, Write},
+    ops::Range,
     os::unix::{fs::PermissionsExt, net::UnixListener},
     path::PathBuf,
     process::Command,
@@ -42,11 +48,15 @@ const MIN_PANE_HEIGHT: f32 = 220.0;
 const DEFAULT_SHELL_SIZE: WorkdeskSize = WorkdeskSize::new(920.0, 560.0);
 const DEFAULT_AGENT_SIZE: WorkdeskSize = WorkdeskSize::new(720.0, 420.0);
 const SIDEBAR_WIDTH: f32 = 216.0;
+const SIDEBAR_COLLAPSED_WIDTH: f32 = 72.0;
 const WORKDESK_MENU_WIDTH: f32 = 208.0;
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const TERMINAL_SELECTION_BG: u32 = 0x2d5b88;
 const TERMINAL_SELECTION_FG: u32 = 0xf4f8fb;
 const TERMINAL_BODY_INSET: f32 = 12.0;
+const TERMINAL_FONT_SIZE: f32 = 13.0;
+const TERMINAL_CELL_WIDTH: f32 = 7.8;
+const TERMINAL_CELL_HEIGHT: f32 = 18.0;
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_millis(240);
 const GRID_ACTIVE_MARGIN_X: f32 = 56.0;
 const GRID_ACTIVE_MARGIN_TOP: f32 = 34.0;
@@ -64,9 +74,15 @@ const SPLIT_GAP: f32 = 14.0;
 const SHORTCUT_PANEL_WIDTH: f32 = 540.0;
 const SHORTCUT_PANEL_MARGIN: f32 = 20.0;
 const FLOATING_DOCK_MARGIN: f32 = 16.0;
-const CONTEXT_STRIP_MARGIN_BOTTOM: f32 = 68.0;
 const INSPECTOR_PANEL_WIDTH: f32 = 360.0;
 const WORKDESK_EDITOR_WIDTH: f32 = 436.0;
+const SIDEBAR_WINDOW_CONTROLS_INSET: f32 = 34.0;
+const NOTIFICATION_PANEL_WIDTH: f32 = 264.0;
+
+#[cfg(target_os = "macos")]
+const TERMINAL_FONT_FAMILY: &str = "Menlo";
+#[cfg(not(target_os = "macos"))]
+const TERMINAL_FONT_FAMILY: &str = ".ZedMono";
 
 #[derive(Clone)]
 struct WorkdeskState {
@@ -75,11 +91,15 @@ struct WorkdeskState {
     metadata: WorkdeskMetadata,
     panes: Vec<PaneRecord>,
     pane_attention: HashMap<PaneId, PaneAttention>,
-    terminals: HashMap<PaneId, TerminalSession>,
-    terminal_revisions: HashMap<PaneId, u64>,
-    terminal_statuses: HashMap<PaneId, Option<String>>,
-    terminal_views: HashMap<PaneId, TerminalViewState>,
+    terminals: HashMap<SurfaceId, TerminalSession>,
+    terminal_revisions: HashMap<SurfaceId, u64>,
+    terminal_statuses: HashMap<SurfaceId, Option<String>>,
+    terminal_views: HashMap<SurfaceId, TerminalViewState>,
+    terminal_grids: HashMap<SurfaceId, TerminalGridSize>,
+    editors: HashMap<SurfaceId, EditorBuffer>,
+    editor_views: HashMap<SurfaceId, EditorViewState>,
     next_pane_serial: u64,
+    next_surface_serial: u64,
     attention_sequence: u64,
     layout_mode: LayoutMode,
     grid_layout: GridLayoutState,
@@ -103,6 +123,9 @@ struct CanvasShell {
     shortcuts: ShortcutMap,
     shortcut_editor: ShortcutEditorState,
     inspector_open: bool,
+    sidebar_collapsed: bool,
+    notifications_open: bool,
+    mock_notifications_unread: usize,
     cursor_blink_visible: bool,
     last_cursor_blink_at: Instant,
     persist_generation: u64,
@@ -202,6 +225,10 @@ enum DragState {
         pane_id: PaneId,
         metrics: TerminalFrameMetrics,
     },
+    SelectingEditor {
+        pane_id: PaneId,
+        surface_id: SurfaceId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,6 +296,10 @@ enum ShortcutAction {
     ClearActiveAttention,
     SpawnShellPane,
     SpawnAgentPane,
+    SpawnBrowserPane,
+    SpawnEditorPane,
+    NextSurface,
+    PreviousSurface,
     CloseActivePane,
     SpawnWorkdesk,
     SelectPreviousWorkdesk,
@@ -341,6 +372,13 @@ struct PaneViewportFrame {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct TerminalTextMetrics {
+    font_size: f32,
+    line_height: f32,
+    cell_width: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ExposeLayoutFrame {
     left: f32,
     top: f32,
@@ -386,7 +424,28 @@ struct PersistedPane {
     position: PersistedPoint,
     size: PersistedSize,
     #[serde(default)]
+    active_surface_id: Option<u64>,
+    #[serde(default)]
+    surfaces: Vec<PersistedSurface>,
+    #[serde(default)]
+    stack_title: Option<String>,
+    #[serde(default)]
     attention: PaneAttention,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedSurface {
+    id: u64,
+    title: String,
+    kind: PersistedPaneKind,
+    #[serde(default)]
+    browser_url: Option<String>,
+    #[serde(default)]
+    editor_file_path: Option<String>,
+    #[serde(default)]
+    dirty: bool,
+    #[serde(default)]
+    editor_buffer_text: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -402,6 +461,8 @@ enum PersistedLayoutMode {
 enum PersistedPaneKind {
     Shell,
     Agent,
+    Browser,
+    Editor,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -455,6 +516,15 @@ struct TerminalViewState {
     selection: Option<TerminalSelection>,
 }
 
+#[derive(Clone, Default)]
+struct EditorViewState {
+    text_bounds: Option<Bounds<Pixels>>,
+    line_height: f32,
+    char_width: f32,
+    gutter_width: f32,
+    viewport_lines: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TerminalSelection {
     anchor: TerminalCell,
@@ -489,6 +559,286 @@ impl TerminalFrameMetrics {
             .max(0.0) as usize)
             .min(max_row);
         TerminalCell { row, col }
+    }
+}
+
+impl EditorViewState {
+    fn offset_for_point(
+        &self,
+        editor: &EditorBuffer,
+        position: GpuiPoint<Pixels>,
+    ) -> Option<usize> {
+        let bounds = self.text_bounds?;
+        let local = bounds.localize(&position)?;
+        let line = editor
+            .scroll_top_line()
+            .saturating_add(
+                (f32::from(local.y) / self.line_height.max(1.0))
+                    .floor()
+                    .max(0.0) as usize,
+            )
+            .min(editor.line_count().saturating_sub(1));
+        let column = ((f32::from(local.x) / self.char_width.max(1.0))
+            .round()
+            .max(0.0)) as usize;
+        Some(editor.offset_for_line_col(line, column))
+    }
+
+    fn bounds_for_range(
+        &self,
+        editor: &EditorBuffer,
+        range: Range<usize>,
+    ) -> Option<Bounds<Pixels>> {
+        let bounds = self.text_bounds?;
+        let start = range.start.min(editor.text().len());
+        let (line, column) = editor.line_col_for_offset(start);
+        let visible_line = line.saturating_sub(editor.scroll_top_line());
+        let origin = gpui::point(
+            bounds.left() + px(column as f32 * self.char_width),
+            bounds.top() + px(visible_line as f32 * self.line_height),
+        );
+        Some(Bounds::new(
+            origin,
+            gpui::size(px(self.char_width.max(2.0)), px(self.line_height.max(2.0))),
+        ))
+    }
+}
+
+struct EditorInputOverlay {
+    shell: gpui::Entity<CanvasShell>,
+    active: bool,
+    surface_id: SurfaceId,
+    line_height: f32,
+    char_width: f32,
+    viewport_lines: usize,
+}
+
+impl IntoElement for EditorInputOverlay {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for EditorInputOverlay {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let surface_id = self.surface_id;
+        let line_height = self.line_height;
+        let char_width = self.char_width;
+        let viewport_lines = self.viewport_lines;
+        self.shell.update(cx, |shell, _cx| {
+            shell
+                .active_workdesk_mut()
+                .editor_views
+                .entry(surface_id)
+                .or_default()
+                .text_bounds = Some(bounds);
+            if let Some(view) = shell
+                .active_workdesk_mut()
+                .editor_views
+                .get_mut(&surface_id)
+            {
+                view.line_height = line_height;
+                view.char_width = char_width;
+                view.gutter_width = 0.0;
+                view.viewport_lines = viewport_lines.max(1);
+            }
+        });
+        if !self.active {
+            return;
+        }
+        let focus_handle = self.shell.read(cx).focus_handle.clone();
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.shell.clone()),
+            cx,
+        );
+    }
+}
+
+impl EntityInputHandler for CanvasShell {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let editor = self.active_editor()?;
+        let range = editor.range_from_utf16(&range_utf16);
+        adjusted_range.replace(editor.range_to_utf16(&range));
+        Some(editor.text().get(range)?.to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let editor = self.active_editor()?;
+        Some(UTF16Selection {
+            range: editor.range_to_utf16(&editor.selection().range),
+            reversed: editor.selection().reversed,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let editor = self.active_editor()?;
+        editor
+            .marked_range()
+            .map(|range| editor.range_to_utf16(range))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pane_id, surface_id)) = self.active_editor_ids() else {
+            return;
+        };
+        {
+            let Some(editor) = self.active_editor_mut() else {
+                return;
+            };
+            let Some(marked_range) = editor.marked_range().cloned() else {
+                return;
+            };
+            let marked_text = editor
+                .text()
+                .get(marked_range.clone())
+                .unwrap_or_default()
+                .to_string();
+            let _ = editor.replace_text_in_range_utf16(
+                Some(editor.range_to_utf16(&marked_range)),
+                &marked_text,
+            );
+        }
+        self.sync_editor_surface_metadata(pane_id, surface_id);
+        self.request_persist(cx);
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pane_id, surface_id)) = self.active_editor_ids() else {
+            return;
+        };
+        let changed = self
+            .active_editor_mut()
+            .is_some_and(|editor| editor.replace_text_in_range_utf16(range_utf16, text));
+        if changed {
+            self.sync_editor_surface_metadata(pane_id, surface_id);
+            self.active_workdesk_mut().note_pane_activity(pane_id);
+            self.cursor_blink_visible = true;
+            self.last_cursor_blink_at = Instant::now();
+            self.request_persist(cx);
+            cx.notify();
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pane_id, surface_id)) = self.active_editor_ids() else {
+            return;
+        };
+        let changed = self.active_editor_mut().is_some_and(|editor| {
+            editor.replace_and_mark_text_in_range_utf16(
+                range_utf16,
+                new_text,
+                new_selected_range_utf16,
+            )
+        });
+        if changed {
+            self.sync_editor_surface_metadata(pane_id, surface_id);
+            self.active_workdesk_mut().note_pane_activity(pane_id);
+            self.cursor_blink_visible = true;
+            self.last_cursor_blink_at = Instant::now();
+            self.request_persist(cx);
+            cx.notify();
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let editor = self.active_editor()?;
+        let view = self.active_editor_view()?;
+        let range = editor.range_from_utf16(&range_utf16);
+        view.bounds_for_range(editor, range)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let editor = self.active_editor()?;
+        let view = self.active_editor_view()?;
+        view.offset_for_point(editor, point)
+            .map(|offset| editor.offset_to_utf16(offset))
     }
 }
 
@@ -635,7 +985,12 @@ impl WorkdeskProgress {
 
 impl WorkdeskTemplate {
     fn all() -> [Self; 4] {
-        [Self::ShellDesk, Self::AgentReview, Self::Debug, Self::Implementation]
+        [
+            Self::ShellDesk,
+            Self::AgentReview,
+            Self::Debug,
+            Self::Implementation,
+        ]
     }
 
     fn from_api_name(value: &str) -> Option<Self> {
@@ -675,7 +1030,9 @@ impl WorkdeskTemplate {
             Self::ShellDesk => "Run commands, inspect state, and keep one terminal ready.",
             Self::AgentReview => "Review agent output, verify claims, and keep evidence nearby.",
             Self::Debug => "Pin the repro, keep logs visible, and iterate on fixes.",
-            Self::Implementation => "Ship a scoped change, verify locally, and keep the build green.",
+            Self::Implementation => {
+                "Ship a scoped change, verify locally, and keep the build green."
+            }
         }
     }
 
@@ -835,6 +1192,8 @@ impl From<&PaneKind> for PersistedPaneKind {
         match value {
             PaneKind::Shell => Self::Shell,
             PaneKind::Agent => Self::Agent,
+            PaneKind::Browser => Self::Browser,
+            PaneKind::Editor => Self::Editor,
         }
     }
 }
@@ -844,6 +1203,8 @@ impl From<PersistedPaneKind> for PaneKind {
         match value {
             PersistedPaneKind::Shell => Self::Shell,
             PersistedPaneKind::Agent => Self::Agent,
+            PersistedPaneKind::Browser => Self::Browser,
+            PersistedPaneKind::Editor => Self::Editor,
         }
     }
 }
@@ -898,13 +1259,17 @@ impl GridDirection {
     }
 }
 
-const SHORTCUT_ACTIONS: [ShortcutAction; 25] = [
+const SHORTCUT_ACTIONS: [ShortcutAction; 29] = [
     ShortcutAction::ToggleShortcutPanel,
     ShortcutAction::ToggleInspector,
     ShortcutAction::NextAttention,
     ShortcutAction::ClearActiveAttention,
     ShortcutAction::SpawnShellPane,
     ShortcutAction::SpawnAgentPane,
+    ShortcutAction::SpawnBrowserPane,
+    ShortcutAction::SpawnEditorPane,
+    ShortcutAction::NextSurface,
+    ShortcutAction::PreviousSurface,
     ShortcutAction::CloseActivePane,
     ShortcutAction::SpawnWorkdesk,
     ShortcutAction::SelectPreviousWorkdesk,
@@ -938,7 +1303,9 @@ impl ShortcutGroup {
 
     fn summary(self) -> &'static str {
         match self {
-            Self::Workspace => "Create panes, move between desks, inspect attention, and open utility overlays.",
+            Self::Workspace => {
+                "Create panes, move between desks, inspect attention, and open utility overlays."
+            }
             Self::Layout => "Switch layout modes and move focus in directional layouts.",
             Self::View => "Control the freeform camera without touching the mouse.",
             Self::Terminal => "Use familiar clipboard and selection actions in the active pane.",
@@ -959,6 +1326,10 @@ impl ShortcutAction {
             Self::ClearActiveAttention => "clear-active-attention",
             Self::SpawnShellPane => "spawn-shell-pane",
             Self::SpawnAgentPane => "spawn-agent-pane",
+            Self::SpawnBrowserPane => "spawn-browser-pane",
+            Self::SpawnEditorPane => "spawn-editor-pane",
+            Self::NextSurface => "next-surface",
+            Self::PreviousSurface => "previous-surface",
             Self::CloseActivePane => "close-active-pane",
             Self::SpawnWorkdesk => "spawn-workdesk",
             Self::SelectPreviousWorkdesk => "select-previous-workdesk",
@@ -996,6 +1367,10 @@ impl ShortcutAction {
             | Self::ClearActiveAttention
             | Self::SpawnShellPane
             | Self::SpawnAgentPane
+            | Self::SpawnBrowserPane
+            | Self::SpawnEditorPane
+            | Self::NextSurface
+            | Self::PreviousSurface
             | Self::CloseActivePane
             | Self::SpawnWorkdesk
             | Self::SelectPreviousWorkdesk
@@ -1023,6 +1398,10 @@ impl ShortcutAction {
             Self::ClearActiveAttention => "Clear active attention",
             Self::SpawnShellPane => "New shell pane",
             Self::SpawnAgentPane => "New agent pane",
+            Self::SpawnBrowserPane => "New browser pane",
+            Self::SpawnEditorPane => "Open file in editor",
+            Self::NextSurface => "Next surface in pane",
+            Self::PreviousSurface => "Previous surface in pane",
             Self::CloseActivePane => "Close active pane",
             Self::SpawnWorkdesk => "New workdesk",
             Self::SelectPreviousWorkdesk => "Previous workdesk",
@@ -1061,7 +1440,15 @@ impl ShortcutAction {
             }
             Self::SpawnShellPane => "Create a new shell pane near the viewport center.",
             Self::SpawnAgentPane => "Create a new agent pane near the viewport center.",
-            Self::CloseActivePane => "Close the focused pane and its live terminal session.",
+            Self::SpawnBrowserPane => "Create a new browser pane near the viewport center.",
+            Self::SpawnEditorPane => "Open a file picker and create or focus an editor surface.",
+            Self::NextSurface => "Cycle to the next surface stacked inside the active pane.",
+            Self::PreviousSurface => {
+                "Cycle to the previous surface stacked inside the active pane."
+            }
+            Self::CloseActivePane => {
+                "Close the focused surface, or the pane if it is the last one."
+            }
             Self::SpawnWorkdesk => "Create a fresh workdesk and switch focus to it.",
             Self::SelectPreviousWorkdesk => {
                 "Move focus to the workdesk on the left side of the rail."
@@ -1093,6 +1480,10 @@ impl ShortcutAction {
             Self::ClearActiveAttention => Some("cmd-alt-k"),
             Self::SpawnShellPane => Some("cmd-shift-n"),
             Self::SpawnAgentPane => Some("cmd-alt-n"),
+            Self::SpawnBrowserPane => Some("cmd-shift-b"),
+            Self::SpawnEditorPane => Some("cmd-shift-e"),
+            Self::NextSurface => Some("ctrl-tab"),
+            Self::PreviousSurface => Some("ctrl-shift-tab"),
             Self::CloseActivePane => Some("cmd-shift-w"),
             Self::SpawnWorkdesk => Some("cmd-shift-d"),
             Self::SelectPreviousWorkdesk => Some("cmd-alt-["),
@@ -1100,7 +1491,7 @@ impl ShortcutAction {
             Self::LayoutFree => Some("cmd-shift-f"),
             Self::LayoutGrid => Some("cmd-shift-g"),
             Self::LayoutSplit => Some("cmd-shift-s"),
-            Self::ToggleGridExpose => Some("cmd-shift-e"),
+            Self::ToggleGridExpose => Some("cmd-shift-o"),
             Self::NavigateLeft => Some("cmd-shift-left"),
             Self::NavigateRight => Some("cmd-shift-right"),
             Self::NavigateUp => Some("cmd-shift-up"),
@@ -1315,9 +1706,14 @@ impl PaneViewportFrame {
         }
     }
 
-    fn for_grid(pane: &PaneRecord, viewport_width: f32, viewport_height: f32) -> Self {
+    fn for_grid(
+        pane: &PaneRecord,
+        viewport_width: f32,
+        viewport_height: f32,
+        sidebar_width: f32,
+    ) -> Self {
         let available_width =
-            (viewport_width - SIDEBAR_WIDTH - GRID_ACTIVE_MARGIN_X * 2.0).max(MIN_PANE_WIDTH);
+            (viewport_width - sidebar_width - GRID_ACTIVE_MARGIN_X * 2.0).max(MIN_PANE_WIDTH);
         let available_height =
             (viewport_height - GRID_ACTIVE_MARGIN_TOP - GRID_ACTIVE_MARGIN_BOTTOM)
                 .max(MIN_PANE_HEIGHT);
@@ -1326,7 +1722,7 @@ impl PaneViewportFrame {
             .clamp(0.72, 1.35);
         let width = pane.size.width * zoom;
         let height = pane.size.height * zoom;
-        let x = SIDEBAR_WIDTH + GRID_ACTIVE_MARGIN_X + (available_width - width).max(0.0) * 0.5;
+        let x = sidebar_width + GRID_ACTIVE_MARGIN_X + (available_width - width).max(0.0) * 0.5;
         let y = GRID_ACTIVE_MARGIN_TOP + (available_height - height).max(0.0) * 0.5;
 
         Self {
@@ -1360,14 +1756,17 @@ impl WorkdeskState {
         let name = name.into();
         let summary = summary.into();
         let next_pane_serial = panes.iter().map(|pane| pane.id.raw()).max().unwrap_or(0) + 1;
+        let next_surface_serial = panes
+            .iter()
+            .flat_map(|pane| pane.surfaces.iter().map(|surface| surface.id.raw()))
+            .max()
+            .unwrap_or(0)
+            + 1;
         let active_pane = panes.last().map(|pane| pane.id);
         let pane_attention = panes
             .iter()
             .map(|pane| {
-                let state = match pane.kind {
-                    PaneKind::Shell => AttentionState::Idle,
-                    PaneKind::Agent => AttentionState::Working,
-                };
+                let state = baseline_attention_state_for_kind(&pane.kind);
                 (
                     pane.id,
                     PaneAttention {
@@ -1390,7 +1789,11 @@ impl WorkdeskState {
             terminal_revisions: HashMap::new(),
             terminal_statuses: HashMap::new(),
             terminal_views: HashMap::new(),
+            terminal_grids: HashMap::new(),
+            editors: HashMap::new(),
+            editor_views: HashMap::new(),
             next_pane_serial,
+            next_surface_serial,
             attention_sequence: 0,
             layout_mode: LayoutMode::Free,
             grid_layout: GridLayoutState::default(),
@@ -1402,23 +1805,93 @@ impl WorkdeskState {
         }
     }
 
-    fn sync_terminal_revisions(&mut self) -> Vec<PaneId> {
+    fn pane(&self, pane_id: PaneId) -> Option<&PaneRecord> {
+        self.panes.iter().find(|pane| pane.id == pane_id)
+    }
+
+    fn pane_mut(&mut self, pane_id: PaneId) -> Option<&mut PaneRecord> {
+        self.panes.iter_mut().find(|pane| pane.id == pane_id)
+    }
+
+    fn surface_owner(&self, surface_id: SurfaceId) -> Option<PaneId> {
+        self.panes
+            .iter()
+            .find(|pane| pane.surfaces.iter().any(|surface| surface.id == surface_id))
+            .map(|pane| pane.id)
+    }
+
+    fn surface_mut(&mut self, surface_id: SurfaceId) -> Option<&mut SurfaceRecord> {
+        self.panes
+            .iter_mut()
+            .find_map(|pane| pane.surface_mut(surface_id))
+    }
+
+    fn active_surface_id_for_pane(&self, pane_id: PaneId) -> Option<SurfaceId> {
+        self.pane(pane_id).map(|pane| pane.active_surface_id)
+    }
+
+    fn active_surface_for_pane(&self, pane_id: PaneId) -> Option<&SurfaceRecord> {
+        self.pane(pane_id).and_then(PaneRecord::active_surface)
+    }
+
+    fn active_terminal_surface_id_for_pane(&self, pane_id: PaneId) -> Option<SurfaceId> {
+        self.active_surface_for_pane(pane_id)
+            .filter(|surface| surface.kind.is_terminal())
+            .map(|surface| surface.id)
+    }
+
+    fn active_terminal_session_for_pane(&self, pane_id: PaneId) -> Option<&TerminalSession> {
+        let surface_id = self.active_terminal_surface_id_for_pane(pane_id)?;
+        self.terminals.get(&surface_id)
+    }
+
+    fn active_terminal_view_for_pane(&self, pane_id: PaneId) -> Option<&TerminalViewState> {
+        let surface_id = self.active_terminal_surface_id_for_pane(pane_id)?;
+        self.terminal_views.get(&surface_id)
+    }
+
+    fn focus_surface(&mut self, pane_id: PaneId, surface_id: SurfaceId) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.focus_surface(surface_id);
+        }
+        self.focus_pane(pane_id);
+    }
+
+    fn next_surface_id(&self, pane_id: PaneId, backwards: bool) -> Option<SurfaceId> {
+        self.pane(pane_id)
+            .and_then(|pane| pane.next_surface_id(backwards))
+    }
+
+    fn sync_terminal_revisions(&mut self) -> Vec<(PaneId, SurfaceId)> {
         let mut changed = Vec::new();
 
-        for (pane_id, terminal) in &self.terminals {
+        for (surface_id, terminal) in &self.terminals {
             let revision = terminal.revision();
-            if self.terminal_revisions.get(pane_id).copied() != Some(revision) {
-                self.terminal_revisions.insert(*pane_id, revision);
-                changed.push(*pane_id);
+            if self.terminal_revisions.get(surface_id).copied() != Some(revision) {
+                self.terminal_revisions.insert(*surface_id, revision);
+                if let Some(pane_id) = self.surface_owner(*surface_id) {
+                    changed.push((pane_id, *surface_id));
+                }
             }
         }
 
         self.terminal_revisions
-            .retain(|pane_id, _| self.terminals.contains_key(pane_id));
+            .retain(|surface_id, _| self.terminals.contains_key(surface_id));
         self.terminal_statuses
-            .retain(|pane_id, _| self.terminals.contains_key(pane_id));
+            .retain(|surface_id, _| self.terminals.contains_key(surface_id));
         self.terminal_views
-            .retain(|pane_id, _| self.terminals.contains_key(pane_id));
+            .retain(|surface_id, _| self.terminals.contains_key(surface_id));
+        self.terminal_grids
+            .retain(|surface_id, _| self.terminals.contains_key(surface_id));
+        let live_surface_ids = self
+            .panes
+            .iter()
+            .flat_map(|pane| pane.surfaces.iter().map(|surface| surface.id))
+            .collect::<Vec<_>>();
+        self.editors
+            .retain(|surface_id, _| live_surface_ids.contains(surface_id));
+        self.editor_views
+            .retain(|surface_id, _| live_surface_ids.contains(surface_id));
         self.pane_attention
             .retain(|pane_id, _| self.panes.iter().any(|pane| pane.id == *pane_id));
 
@@ -1431,7 +1904,10 @@ impl WorkdeskState {
     }
 
     fn pane_attention(&self, pane_id: PaneId) -> PaneAttention {
-        self.pane_attention.get(&pane_id).copied().unwrap_or_default()
+        self.pane_attention
+            .get(&pane_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     fn pane_attention_mut(&mut self, pane_id: PaneId) -> &mut PaneAttention {
@@ -1487,21 +1963,27 @@ impl WorkdeskState {
 
     fn attach_terminal_session(
         &mut self,
-        pane_id: PaneId,
+        surface_id: SurfaceId,
         kind: &PaneKind,
         title: &str,
-        size: WorkdeskSize,
+        grid: TerminalGridSize,
     ) {
-        match spawn_terminal_session(kind, title, size) {
+        match spawn_terminal_session_with_grid(kind, title, grid) {
             Ok(session) => {
-                self.terminal_revisions.insert(pane_id, session.revision());
-                self.terminal_statuses.insert(pane_id, None);
-                self.terminals.insert(pane_id, session);
-                self.terminal_views.entry(pane_id).or_default();
+                self.terminal_revisions
+                    .insert(surface_id, session.revision());
+                self.terminal_statuses.insert(surface_id, None);
+                self.terminal_grids.insert(surface_id, grid);
+                self.terminals.insert(surface_id, session);
+                self.terminal_views.entry(surface_id).or_default();
+                let Some(pane_id) = self.surface_owner(surface_id) else {
+                    return;
+                };
                 self.pane_attention.entry(pane_id).or_insert(PaneAttention {
                     state: match kind {
                         PaneKind::Shell => AttentionState::Idle,
                         PaneKind::Agent => AttentionState::Working,
+                        PaneKind::Browser | PaneKind::Editor => AttentionState::Idle,
                     },
                     unread: false,
                     last_attention_sequence: 0,
@@ -1534,16 +2016,8 @@ impl WorkdeskState {
                 (pane.size.width + f32::from(delta.x) / self.zoom).max(MIN_PANE_WIDTH);
             pane.size.height =
                 (pane.size.height + f32::from(delta.y) / self.zoom).max(MIN_PANE_HEIGHT);
-
-            if let Some(terminal) = self.terminals.get(&pane_id) {
-                if let Err(error) = terminal.resize(grid_size_for_pane(pane.size)) {
-                    self.runtime_notice = Some(SharedString::from(format!(
-                        "terminal resize failed for {}: {}",
-                        pane.title, error
-                    )));
-                }
-            }
         }
+        self.resize_terminals_for_pane(pane_id);
     }
 
     fn zoom_about_screen_position(
@@ -1593,6 +2067,9 @@ impl WorkdeskState {
             DragState::SelectingTerminal { pane_id, .. } => {
                 format!("Selecting pane #{}", pane_id.raw())
             }
+            DragState::SelectingEditor { pane_id, .. } => {
+                format!("Editing pane #{}", pane_id.raw())
+            }
         }
     }
 
@@ -1601,6 +2078,43 @@ impl WorkdeskState {
             .and_then(|pane_id| self.panes.iter().find(|pane| pane.id == pane_id))
             .map(|pane| pane.title.clone())
             .unwrap_or_else(|| "None".to_string())
+    }
+
+    fn resize_terminals_for_pane(&mut self, pane_id: PaneId) {
+        let Some(pane) = self.pane(pane_id) else {
+            return;
+        };
+        let grid = terminal_grid_size_for_pane(pane.size, pane.surfaces.len());
+        self.resize_terminals_for_pane_to_grid(pane_id, grid);
+    }
+
+    fn resize_terminals_for_pane_to_grid(&mut self, pane_id: PaneId, grid: TerminalGridSize) {
+        let Some(pane) = self.pane(pane_id) else {
+            return;
+        };
+        let pane_title = pane.title.clone();
+        let terminal_surface_ids = pane
+            .surfaces
+            .iter()
+            .filter(|surface| surface.kind.is_terminal())
+            .map(|surface| surface.id)
+            .collect::<Vec<_>>();
+
+        for surface_id in terminal_surface_ids {
+            if self.terminal_grids.get(&surface_id).copied() == Some(grid) {
+                continue;
+            }
+            if let Some(terminal) = self.terminals.get(&surface_id) {
+                if let Err(error) = terminal.resize(grid) {
+                    self.runtime_notice = Some(SharedString::from(format!(
+                        "terminal resize failed for {}: {}",
+                        pane_title, error
+                    )));
+                } else {
+                    self.terminal_grids.insert(surface_id, grid);
+                }
+            }
+        }
     }
 
     fn intent_label(&self) -> String {
@@ -1616,7 +2130,10 @@ impl WorkdeskState {
     }
 
     fn clear_selection(&mut self, pane_id: PaneId) {
-        if let Some(view) = self.terminal_views.get_mut(&pane_id) {
+        let Some(surface_id) = self.active_surface_id_for_pane(pane_id) else {
+            return;
+        };
+        if let Some(view) = self.terminal_views.get_mut(&surface_id) {
             view.selection = None;
         }
     }
@@ -1627,17 +2144,17 @@ impl WorkdeskState {
         }
     }
 
-    fn begin_selection(&mut self, pane_id: PaneId, cell: TerminalCell) {
-        self.terminal_views.entry(pane_id).or_default().selection = Some(TerminalSelection {
+    fn begin_selection(&mut self, surface_id: SurfaceId, cell: TerminalCell) {
+        self.terminal_views.entry(surface_id).or_default().selection = Some(TerminalSelection {
             anchor: cell,
             focus: cell,
         });
     }
 
-    fn update_selection(&mut self, pane_id: PaneId, cell: TerminalCell) {
+    fn update_selection(&mut self, surface_id: SurfaceId, cell: TerminalCell) {
         if let Some(selection) = self
             .terminal_views
-            .entry(pane_id)
+            .entry(surface_id)
             .or_default()
             .selection
             .as_mut()
@@ -1692,6 +2209,25 @@ impl PersistedWorkdesk {
                     kind: PersistedPaneKind::from(&pane.kind),
                     position: PersistedPoint::from(pane.position),
                     size: PersistedSize::from(pane.size),
+                    active_surface_id: Some(pane.active_surface_id.raw()),
+                    surfaces: pane
+                        .surfaces
+                        .iter()
+                        .map(|surface| PersistedSurface {
+                            id: surface.id.raw(),
+                            title: surface.title.clone(),
+                            kind: PersistedPaneKind::from(&surface.kind),
+                            browser_url: surface.browser_url.clone(),
+                            editor_file_path: surface.editor_file_path.clone(),
+                            dirty: surface.dirty,
+                            editor_buffer_text: state
+                                .editors
+                                .get(&surface.id)
+                                .and_then(|editor| editor.persisted_buffer_text())
+                                .map(ToOwned::to_owned),
+                        })
+                        .collect(),
+                    stack_title: pane.stack_title.clone(),
                     attention: state.pane_attention(pane.id),
                 })
                 .collect(),
@@ -1720,14 +2256,89 @@ impl PersistedWorkdesk {
             .iter()
             .map(|pane| (PaneId::new(pane.id), pane.attention))
             .collect::<HashMap<_, _>>();
+        let mut editor_restores = Vec::new();
         let panes = panes
             .into_iter()
-            .map(|pane| PaneRecord {
-                id: PaneId::new(pane.id),
-                title: pane.title,
-                kind: pane.kind.into(),
-                position: pane.position.into(),
-                size: pane.size.into(),
+            .map(|pane| {
+                let persisted_surfaces = if pane.surfaces.is_empty() {
+                    vec![PersistedSurface {
+                        id: pane.id,
+                        title: pane.title.clone(),
+                        kind: pane.kind,
+                        browser_url: None,
+                        editor_file_path: None,
+                        dirty: false,
+                        editor_buffer_text: None,
+                    }]
+                } else {
+                    pane.surfaces
+                };
+                let mut runtime_surfaces = persisted_surfaces
+                    .iter()
+                    .map(|surface| {
+                        let kind: PaneKind = surface.kind.into();
+                        let mut runtime = match kind {
+                            PaneKind::Browser => SurfaceRecord::browser(
+                                SurfaceId::new(surface.id),
+                                surface.title.clone(),
+                                surface
+                                    .browser_url
+                                    .clone()
+                                    .unwrap_or_else(|| "https://example.com".to_string()),
+                            ),
+                            PaneKind::Editor => SurfaceRecord::editor(
+                                SurfaceId::new(surface.id),
+                                surface.title.clone(),
+                                surface
+                                    .editor_file_path
+                                    .clone()
+                                    .unwrap_or_else(|| surface.title.clone()),
+                                surface.dirty,
+                            ),
+                            PaneKind::Shell | PaneKind::Agent => SurfaceRecord::new(
+                                SurfaceId::new(surface.id),
+                                surface.title.clone(),
+                                kind,
+                            ),
+                        };
+                        runtime.browser_url = surface.browser_url.clone();
+                        runtime.editor_file_path = surface.editor_file_path.clone();
+                        runtime.dirty = surface.dirty;
+                        runtime
+                    })
+                    .collect::<Vec<_>>();
+
+                for surface in &persisted_surfaces {
+                    if matches!(surface.kind, PersistedPaneKind::Editor) {
+                        if let Some(path) = surface.editor_file_path.clone() {
+                            editor_restores.push((
+                                SurfaceId::new(surface.id),
+                                path,
+                                surface.dirty,
+                                surface.editor_buffer_text.clone(),
+                            ));
+                        }
+                    }
+                }
+
+                let first_surface = runtime_surfaces
+                    .drain(..1)
+                    .next()
+                    .expect("pane should contain at least one surface");
+                let mut runtime_pane = PaneRecord::new(
+                    PaneId::new(pane.id),
+                    pane.position.into(),
+                    pane.size.into(),
+                    first_surface,
+                    pane.stack_title,
+                );
+                for surface in runtime_surfaces {
+                    runtime_pane.push_surface(surface, false);
+                }
+                if let Some(active_surface_id) = pane.active_surface_id.map(SurfaceId::new) {
+                    runtime_pane.focus_surface(active_surface_id);
+                }
+                runtime_pane
             })
             .collect::<Vec<_>>();
 
@@ -1744,6 +2355,16 @@ impl PersistedWorkdesk {
         state.grid_layout = GridLayoutState::default();
         state.drag_state = DragState::Idle;
         state.runtime_notice = None;
+        for (surface_id, path, dirty, buffer_text) in editor_restores {
+            let editor = match buffer_text {
+                Some(text) => EditorBuffer::restore(path, text, dirty),
+                None => match EditorBuffer::load(&path) {
+                    Ok(editor) => editor,
+                    Err(_) => EditorBuffer::restore(path, "", dirty),
+                },
+            };
+            state.editors.insert(surface_id, editor);
+        }
         state
     }
 }
@@ -1777,6 +2398,9 @@ impl CanvasShell {
             shortcuts,
             shortcut_editor: ShortcutEditorState::default(),
             inspector_open: false,
+            sidebar_collapsed: false,
+            notifications_open: false,
+            mock_notifications_unread: 3,
             cursor_blink_visible: true,
             last_cursor_blink_at: Instant::now(),
             persist_generation: 0,
@@ -1805,6 +2429,14 @@ impl CanvasShell {
         &mut self.workdesks[self.active_workdesk]
     }
 
+    fn sidebar_width(&self) -> f32 {
+        if self.sidebar_collapsed {
+            SIDEBAR_COLLAPSED_WIDTH
+        } else {
+            SIDEBAR_WIDTH
+        }
+    }
+
     fn shortcut_label(&self, action: ShortcutAction) -> String {
         self.shortcuts.display_label(action)
     }
@@ -1813,6 +2445,260 @@ impl CanvasShell {
         if let Some(workdesk) = self.workdesks.get_mut(self.active_workdesk) {
             workdesk.runtime_notice = Some(SharedString::from(message.into()));
         }
+    }
+
+    fn active_editor_ids(&self) -> Option<(PaneId, SurfaceId)> {
+        let pane_id = self.active_workdesk().active_pane?;
+        let surface = self.active_workdesk().active_surface_for_pane(pane_id)?;
+        (surface.kind == PaneKind::Editor).then_some((pane_id, surface.id))
+    }
+
+    fn active_editor(&self) -> Option<&EditorBuffer> {
+        let (_, surface_id) = self.active_editor_ids()?;
+        self.active_workdesk().editors.get(&surface_id)
+    }
+
+    fn active_editor_mut(&mut self) -> Option<&mut EditorBuffer> {
+        let (_, surface_id) = self.active_editor_ids()?;
+        self.active_workdesk_mut().editors.get_mut(&surface_id)
+    }
+
+    fn active_editor_view(&self) -> Option<&EditorViewState> {
+        let (_, surface_id) = self.active_editor_ids()?;
+        self.active_workdesk().editor_views.get(&surface_id)
+    }
+
+    fn sync_editor_surface_metadata(&mut self, pane_id: PaneId, surface_id: SurfaceId) {
+        let Some(editor) = self
+            .workdesks
+            .get(self.active_workdesk)
+            .and_then(|desk| desk.editors.get(&surface_id))
+        else {
+            return;
+        };
+        let title = editor.title();
+        let file_path = editor.path_string();
+        let dirty = editor.dirty();
+        if let Some(surface) = self.workdesks[self.active_workdesk].surface_mut(surface_id) {
+            surface.title = title;
+            surface.editor_file_path = Some(file_path);
+            surface.dirty = dirty;
+        }
+        if let Some(pane) = self.workdesks[self.active_workdesk].pane_mut(pane_id) {
+            pane.sync_from_active_surface();
+        }
+    }
+
+    fn find_editor_surface_by_path(
+        &self,
+        desk_index: usize,
+        canonical_path: &str,
+    ) -> Option<(PaneId, SurfaceId)> {
+        let desk = self.workdesks.get(desk_index)?;
+        desk.panes.iter().find_map(|pane| {
+            pane.surfaces.iter().find_map(|surface| {
+                (surface.kind == PaneKind::Editor
+                    && surface
+                        .editor_file_path
+                        .as_deref()
+                        .is_some_and(|path| canonical_path_string(path) == canonical_path))
+                .then_some((pane.id, surface.id))
+            })
+        })
+    }
+
+    fn build_surface_record(
+        surface_id: SurfaceId,
+        kind: PaneKind,
+        title: Option<String>,
+        url: Option<String>,
+        file_path: Option<String>,
+    ) -> Result<(SurfaceRecord, Option<EditorBuffer>), String> {
+        match kind {
+            PaneKind::Shell | PaneKind::Agent => {
+                let title = title.unwrap_or_else(|| {
+                    format!("{} {}", base_label_for_kind(&kind), surface_id.raw())
+                });
+                Ok((SurfaceRecord::new(surface_id, title, kind), None))
+            }
+            PaneKind::Browser => {
+                let url = url.unwrap_or_else(|| "https://example.com".to_string());
+                let title = title.unwrap_or_else(|| browser_title(&url));
+                Ok((SurfaceRecord::browser(surface_id, title, url), None))
+            }
+            PaneKind::Editor => {
+                let file_path =
+                    file_path.ok_or_else(|| "editor surfaces require `file_path`".to_string())?;
+                let canonical_path = canonical_path_string(&file_path);
+                let editor = match EditorBuffer::load(&canonical_path) {
+                    Ok(editor) => editor,
+                    Err(_) => EditorBuffer::restore(&canonical_path, "", false),
+                };
+                let title = title.unwrap_or_else(|| editor.title());
+                Ok((
+                    SurfaceRecord::editor(surface_id, title, editor.path_string(), editor.dirty()),
+                    Some(editor),
+                ))
+            }
+        }
+    }
+
+    fn initialize_surface_runtime(
+        desk: &mut WorkdeskState,
+        pane_size: WorkdeskSize,
+        pane_surface_count: usize,
+        surface: &SurfaceRecord,
+        editor: Option<EditorBuffer>,
+    ) {
+        match surface.kind {
+            PaneKind::Shell | PaneKind::Agent => {
+                desk.attach_terminal_session(
+                    surface.id,
+                    &surface.kind,
+                    &surface.title,
+                    terminal_grid_size_for_pane(pane_size, pane_surface_count),
+                );
+            }
+            PaneKind::Editor => {
+                if let Some(editor) = editor {
+                    desk.editors.insert(surface.id, editor);
+                }
+            }
+            PaneKind::Browser => {}
+        }
+    }
+
+    fn spawn_surface_on_workdesk(
+        &mut self,
+        desk_index: usize,
+        target_pane_id: Option<PaneId>,
+        kind: PaneKind,
+        title: Option<String>,
+        url: Option<String>,
+        file_path: Option<String>,
+        focus: bool,
+    ) -> Result<(PaneId, SurfaceId), String> {
+        let editor_lookup_path = if kind == PaneKind::Editor {
+            file_path.as_deref().map(canonical_path_string)
+        } else {
+            None
+        };
+        if let Some(canonical_path) = editor_lookup_path.as_deref() {
+            if target_pane_id.is_none() {
+                if let Some((pane_id, surface_id)) =
+                    self.find_editor_surface_by_path(desk_index, canonical_path)
+                {
+                    if focus {
+                        self.workdesks[desk_index].focus_surface(pane_id, surface_id);
+                        self.active_workdesk = desk_index;
+                    }
+                    return Ok((pane_id, surface_id));
+                }
+            }
+        }
+
+        let desk = &mut self.workdesks[desk_index];
+        let surface_id = SurfaceId::new(desk.next_surface_serial);
+        desk.next_surface_serial += 1;
+        let requested_file_path = file_path.or(editor_lookup_path);
+        let (surface, editor) =
+            Self::build_surface_record(surface_id, kind.clone(), title, url, requested_file_path)?;
+
+        if let Some(pane_id) = target_pane_id {
+            let pane = desk
+                .pane_mut(pane_id)
+                .ok_or_else(|| format!("pane {} was not found", pane_id.raw()))?;
+            let pane_size = pane.size;
+            pane.push_surface(surface.clone(), focus);
+            let pane_surface_count = pane.surfaces.len();
+            Self::initialize_surface_runtime(desk, pane_size, pane_surface_count, &surface, editor);
+            desk.resize_terminals_for_pane(pane_id);
+            if focus {
+                desk.focus_surface(pane_id, surface_id);
+                self.active_workdesk = desk_index;
+            }
+            return Ok((pane_id, surface_id));
+        }
+
+        let size = default_size_for_kind(&kind);
+        let pane_id = PaneId::new(desk.next_pane_serial);
+        desk.next_pane_serial += 1;
+        let cascade = 36.0 * (desk.panes.len() % 6) as f32;
+        let position = desk
+            .active_pane
+            .and_then(|active_pane_id| {
+                desk.panes
+                    .iter()
+                    .find(|pane| pane.id == active_pane_id)
+                    .map(|pane| {
+                        let horizontal_offset = if desk.layout_mode == LayoutMode::Free {
+                            42.0
+                        } else {
+                            pane.size.width + 96.0
+                        };
+                        WorkdeskPoint::new(
+                            pane.position.x + horizontal_offset,
+                            pane.position.y + 42.0 * ((desk.panes.len() % 3) as f32),
+                        )
+                    })
+            })
+            .unwrap_or_else(|| WorkdeskPoint::new(80.0 + cascade, 96.0 + cascade));
+        let pane = PaneRecord::new(pane_id, position, size, surface.clone(), None);
+        desk.panes.push(pane);
+        Self::initialize_surface_runtime(desk, size, 1, &surface, editor);
+        if focus {
+            desk.focus_surface(pane_id, surface_id);
+            self.active_workdesk = desk_index;
+        }
+        desk.drag_state = DragState::Idle;
+        Ok((pane_id, surface_id))
+    }
+
+    fn close_surface(&mut self, pane_id: PaneId, surface_id: SurfaceId, cx: &mut Context<Self>) {
+        let remaining_surfaces = self
+            .active_workdesk()
+            .pane(pane_id)
+            .map(|pane| pane.surfaces.len())
+            .unwrap_or(0);
+        if remaining_surfaces <= 1 {
+            self.close_pane(pane_id, cx);
+            return;
+        }
+
+        let desk = self.active_workdesk_mut();
+        let Some(pane) = desk.pane_mut(pane_id) else {
+            return;
+        };
+        pane.remove_surface(surface_id);
+        if let Some(terminal) = desk.terminals.remove(&surface_id) {
+            terminal.close();
+        }
+        desk.terminal_revisions.remove(&surface_id);
+        desk.terminal_statuses.remove(&surface_id);
+        desk.terminal_views.remove(&surface_id);
+        desk.terminal_grids.remove(&surface_id);
+        desk.editors.remove(&surface_id);
+        desk.editor_views.remove(&surface_id);
+        desk.resize_terminals_for_pane(pane_id);
+        desk.focus_pane(pane_id);
+        self.request_persist(cx);
+        cx.notify();
+    }
+
+    fn cycle_active_pane_surface(&mut self, backwards: bool, cx: &mut Context<Self>) -> bool {
+        let Some(pane_id) = self.active_workdesk().active_pane else {
+            return false;
+        };
+        let Some(next_surface_id) = self.active_workdesk().next_surface_id(pane_id, backwards)
+        else {
+            return false;
+        };
+        let desk = self.active_workdesk_mut();
+        desk.focus_surface(pane_id, next_surface_id);
+        desk.note_pane_activity(pane_id);
+        self.request_persist(cx);
+        cx.notify();
+        true
     }
 
     fn workdesk_name_for_template(&self, template: WorkdeskTemplate) -> String {
@@ -1866,7 +2752,8 @@ impl CanvasShell {
         match editor.mode {
             WorkdeskEditorMode::Create => {
                 let name = self.workdesk_name_for_template(editor.template);
-                let draft = normalize_workdesk_draft(editor.draft, &name, editor.template.summary());
+                let draft =
+                    normalize_workdesk_draft(editor.draft, &name, editor.template.summary());
                 let mut desk = workdesk_from_template(editor.template, draft);
                 boot_workdesk_terminals(&mut desk);
                 self.workdesks.push(desk);
@@ -1882,7 +2769,8 @@ impl CanvasShell {
                 let current_name = self.workdesks[index].name.clone();
                 let current_summary = self.workdesks[index].summary.clone();
                 let fallback_name = self.unique_workdesk_name_except(index, &current_name);
-                let draft = normalize_workdesk_draft(editor.draft, &fallback_name, &current_summary);
+                let draft =
+                    normalize_workdesk_draft(editor.draft, &fallback_name, &current_summary);
                 let desk = &mut self.workdesks[index];
                 desk.name = draft.name;
                 desk.summary = draft.summary;
@@ -1927,7 +2815,8 @@ impl CanvasShell {
             return true;
         }
 
-        if matches!(keystroke.key.as_str(), "backspace" | "delete") && !keystroke.modifiers.modified()
+        if matches!(keystroke.key.as_str(), "backspace" | "delete")
+            && !keystroke.modifiers.modified()
         {
             editor.draft.field_value_mut(editor.active_field).pop();
             cx.notify();
@@ -2055,16 +2944,112 @@ impl CanvasShell {
                 let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
                 let kind = json_string_at(&request.params, &["kind"])
                     .and_then(|value| parse_pane_kind(&value))
-                    .ok_or_else(|| "pane.create requires `kind` = `shell` or `agent`".to_string())?;
+                    .ok_or_else(|| {
+                        "pane.create requires `kind` = `shell`, `agent`, `browser`, or `editor`"
+                            .to_string()
+                    })?;
                 let title = json_string_at(&request.params, &["title"]);
+                let url = json_string_at(&request.params, &["url"]);
+                let file_path = json_string_at(&request.params, &["file_path"]);
                 let focus = json_bool_at(&request.params, &["focus"]).unwrap_or(true);
-                let pane_id = self.spawn_pane_on_workdesk(desk_index, kind, title, focus);
+                let (pane_id, _) = self.spawn_surface_on_workdesk(
+                    desk_index, None, kind, title, url, file_path, focus,
+                )?;
                 self.request_persist(cx);
                 Ok(automation_pane_json(
                     &self.workdesks[desk_index],
                     pane_id,
                     desk_index == self.active_workdesk,
                 ))
+            }
+            "surface.list" => {
+                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
+                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
+                let desk = &self.workdesks[desk_index];
+                let pane = desk
+                    .pane(pane_id)
+                    .ok_or_else(|| format!("pane {} was not found", pane_id.raw()))?;
+                Ok(Value::Array(
+                    pane.surfaces
+                        .iter()
+                        .map(|surface| automation_surface_json(desk, pane_id, surface))
+                        .collect(),
+                ))
+            }
+            "surface.create" => {
+                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
+                let target_pane_id = json_u64_at(&request.params, &["pane_id"]).map(PaneId::new);
+                let kind = json_string_at(&request.params, &["kind"])
+                    .and_then(|value| parse_pane_kind(&value))
+                    .ok_or_else(|| {
+                        "surface.create requires `kind` = `shell`, `agent`, `browser`, or `editor`"
+                            .to_string()
+                    })?;
+                let title = json_string_at(&request.params, &["title"]);
+                let url = json_string_at(&request.params, &["url"]);
+                let file_path = json_string_at(&request.params, &["file_path"]);
+                let focus = json_bool_at(&request.params, &["focus"]).unwrap_or(true);
+                let (pane_id, surface_id) = self.spawn_surface_on_workdesk(
+                    desk_index,
+                    target_pane_id,
+                    kind,
+                    title,
+                    url,
+                    file_path,
+                    focus,
+                )?;
+                self.request_persist(cx);
+                let desk = &self.workdesks[desk_index];
+                let pane = desk
+                    .pane(pane_id)
+                    .ok_or_else(|| format!("pane {} was not found", pane_id.raw()))?;
+                let surface = pane
+                    .surface(surface_id)
+                    .ok_or_else(|| format!("surface {} was not found", surface_id.raw()))?;
+                Ok(json!({
+                    "pane": automation_pane_json(desk, pane_id, desk_index == self.active_workdesk),
+                    "surface": automation_surface_json(desk, pane_id, surface),
+                }))
+            }
+            "surface.focus" => {
+                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
+                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
+                let surface_id =
+                    self.resolve_automation_surface_id(desk_index, pane_id, &request.params)?;
+                self.active_workdesk = desk_index;
+                self.workdesks[desk_index].focus_surface(pane_id, surface_id);
+                self.request_persist(cx);
+                Ok(automation_pane_json(
+                    &self.workdesks[desk_index],
+                    pane_id,
+                    true,
+                ))
+            }
+            "surface.close" => {
+                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
+                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
+                let surface_id =
+                    self.resolve_automation_surface_id(desk_index, pane_id, &request.params)?;
+                let pane_had_multiple = self.workdesks[desk_index]
+                    .pane(pane_id)
+                    .map(|pane| pane.surfaces.len() > 1)
+                    .unwrap_or(false);
+                self.active_workdesk = desk_index;
+                self.close_surface(pane_id, surface_id, cx);
+                self.request_persist(cx);
+                if pane_had_multiple {
+                    Ok(automation_pane_json(
+                        &self.workdesks[desk_index],
+                        pane_id,
+                        true,
+                    ))
+                } else {
+                    Ok(json!({
+                        "pane_closed": true,
+                        "pane_id": pane_id.raw(),
+                        "surface_id": surface_id.raw(),
+                    }))
+                }
             }
             "pane.focus" => {
                 let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
@@ -2085,7 +3070,8 @@ impl CanvasShell {
                 let state = json_string_at(&request.params, &["state"])
                     .and_then(|value| AttentionState::from_api_name(&value))
                     .ok_or_else(|| "attention.set requires `state`".to_string())?;
-                let unread = json_bool_at(&request.params, &["unread"]).unwrap_or(state.is_attention());
+                let unread =
+                    json_bool_at(&request.params, &["unread"]).unwrap_or(state.is_attention());
                 self.set_pane_attention(desk_index, pane_id, state, unread, true, cx);
                 Ok(automation_pane_json(
                     &self.workdesks[desk_index],
@@ -2124,9 +3110,9 @@ impl CanvasShell {
                         parse_progress_value(progress_value)?
                     } else {
                         let label = require_json_string_at(&request.params, &["label"], "label")?;
-                        let value = progress_value
-                            .as_u64()
-                            .ok_or_else(|| "`value` must be an integer from 0 to 100".to_string())?;
+                        let value = progress_value.as_u64().ok_or_else(|| {
+                            "`value` must be an integer from 0 to 100".to_string()
+                        })?;
                         Some(WorkdeskProgress::new(label, value as u8))
                     }
                 } else {
@@ -2148,7 +3134,8 @@ impl CanvasShell {
                     .as_deref()
                     .map(|title| format!("{title} · {body}"))
                     .unwrap_or_else(|| body.clone());
-                self.workdesks[desk_index].runtime_notice = Some(SharedString::from(message.clone()));
+                self.workdesks[desk_index].runtime_notice =
+                    Some(SharedString::from(message.clone()));
                 if json_bool_at(&request.params, &["desktop"]).unwrap_or(false) {
                     post_attention_notification(
                         title.unwrap_or_else(|| "Canvas".to_string()),
@@ -2190,7 +3177,11 @@ impl CanvasShell {
         Ok(self.active_workdesk)
     }
 
-    fn resolve_automation_pane_id(&self, desk_index: usize, params: &Value) -> Result<PaneId, String> {
+    fn resolve_automation_pane_id(
+        &self,
+        desk_index: usize,
+        params: &Value,
+    ) -> Result<PaneId, String> {
         let desk = self
             .workdesks
             .get(desk_index)
@@ -2209,6 +3200,35 @@ impl CanvasShell {
 
         desk.active_pane
             .ok_or_else(|| format!("workdesk `{}` does not have an active pane", desk.name))
+    }
+
+    fn resolve_automation_surface_id(
+        &self,
+        desk_index: usize,
+        pane_id: PaneId,
+        params: &Value,
+    ) -> Result<SurfaceId, String> {
+        let desk = self
+            .workdesks
+            .get(desk_index)
+            .ok_or_else(|| format!("workdesk index {desk_index} is out of range"))?;
+        let pane = desk
+            .pane(pane_id)
+            .ok_or_else(|| format!("pane {} was not found", pane_id.raw()))?;
+
+        if let Some(raw_id) = json_u64_at(params, &["surface_id", "id"]) {
+            let surface_id = SurfaceId::new(raw_id);
+            if pane.surface(surface_id).is_some() {
+                return Ok(surface_id);
+            }
+            return Err(format!(
+                "surface {} was not found on pane {}",
+                raw_id,
+                pane_id.raw()
+            ));
+        }
+
+        Ok(pane.active_surface_id)
     }
 
     fn automation_state_json(&self) -> Value {
@@ -2230,14 +3250,13 @@ impl CanvasShell {
         };
 
         match pane.kind {
-            PaneKind::Shell => AttentionState::Idle,
             PaneKind::Agent => desk
-                .terminals
-                .get(&pane_id)
+                .active_terminal_session_for_pane(pane_id)
                 .map(|terminal| terminal.snapshot())
                 .filter(|snapshot| !snapshot.closed)
                 .map(|_| AttentionState::Working)
                 .unwrap_or(AttentionState::Idle),
+            PaneKind::Shell | PaneKind::Browser | PaneKind::Editor => AttentionState::Idle,
         }
     }
 
@@ -2594,6 +3613,7 @@ impl CanvasShell {
                     self.active_grid_pane_id(),
                     f32::from(viewport.size.width),
                     f32::from(viewport.size.height),
+                    self.sidebar_width(),
                 );
                 directional_projection_for_frames(&frames)
             }
@@ -2667,11 +3687,29 @@ impl CanvasShell {
                 self.spawn_pane(PaneKind::Agent, window, cx);
                 true
             }
+            ShortcutAction::SpawnBrowserPane => {
+                self.spawn_pane(PaneKind::Browser, window, cx);
+                true
+            }
+            ShortcutAction::SpawnEditorPane => {
+                self.open_editor_picker(cx);
+                true
+            }
+            ShortcutAction::NextSurface => self.cycle_active_pane_surface(false, cx),
+            ShortcutAction::PreviousSurface => self.cycle_active_pane_surface(true, cx),
             ShortcutAction::CloseActivePane => {
                 let Some(pane_id) = self.active_workdesk().active_pane else {
                     return false;
                 };
-                self.close_pane(pane_id, cx);
+                let surface_id = self
+                    .active_workdesk()
+                    .pane(pane_id)
+                    .map(|pane| pane.active_surface_id);
+                if let Some(surface_id) = surface_id {
+                    self.close_surface(pane_id, surface_id, cx);
+                } else {
+                    self.close_pane(pane_id, cx);
+                }
                 true
             }
             ShortcutAction::SpawnWorkdesk => {
@@ -2813,12 +3851,12 @@ impl CanvasShell {
                 changed = true;
             }
 
-            for pane_id in changed_panes {
+            for (pane_id, surface_id) in changed_panes {
                 let snapshot = {
                     let Some(desk) = self.workdesks.get(desk_index) else {
                         continue;
                     };
-                    let Some(terminal) = desk.terminals.get(&pane_id) else {
+                    let Some(terminal) = desk.terminals.get(&surface_id) else {
                         continue;
                     };
                     terminal.snapshot()
@@ -2826,18 +3864,18 @@ impl CanvasShell {
 
                 let previous_status = self.workdesks[desk_index]
                     .terminal_statuses
-                    .get(&pane_id)
+                    .get(&surface_id)
                     .cloned()
                     .unwrap_or(None);
                 self.workdesks[desk_index]
                     .terminal_statuses
-                    .insert(pane_id, snapshot.status.clone());
+                    .insert(surface_id, snapshot.status.clone());
                 self.workdesks[desk_index].note_pane_activity(pane_id);
 
                 if previous_status != snapshot.status {
-                    changed =
-                        self.handle_terminal_attention_transition(desk_index, pane_id, &snapshot, cx)
-                            || changed;
+                    changed = self
+                        .handle_terminal_attention_transition(desk_index, pane_id, &snapshot, cx)
+                        || changed;
                 }
             }
         }
@@ -2857,8 +3895,9 @@ impl CanvasShell {
 
     fn viewport_center(&self, window: &Window) -> gpui::Point<Pixels> {
         let viewport = window.window_bounds().get_bounds();
-        let visible_width = (f32::from(viewport.size.width) - SIDEBAR_WIDTH).max(1.0);
-        gpui::point(px(SIDEBAR_WIDTH + visible_width * 0.5), viewport.center().y)
+        let sidebar_width = self.sidebar_width();
+        let visible_width = (f32::from(viewport.size.width) - sidebar_width).max(1.0);
+        gpui::point(px(sidebar_width + visible_width * 0.5), viewport.center().y)
     }
 
     fn screen_to_world(&self, position: gpui::Point<Pixels>) -> WorkdeskPoint {
@@ -2922,7 +3961,7 @@ impl CanvasShell {
         let margin = 96.0;
         let content_width = (max_x - min_x).max(1.0);
         let content_height = (max_y - min_y).max(1.0);
-        let available_width = (viewport_width - SIDEBAR_WIDTH - margin * 2.0).max(1.0);
+        let available_width = (viewport_width - self.sidebar_width() - margin * 2.0).max(1.0);
         let available_height = (viewport_height - margin * 2.0).max(1.0);
         let fitted_zoom = (available_width / content_width)
             .min(available_height / content_height)
@@ -2938,6 +3977,93 @@ impl CanvasShell {
         cx.notify();
     }
 
+    fn sync_visible_terminal_grids(
+        &mut self,
+        window: &Window,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) {
+        let sidebar_width = self.sidebar_width();
+        let layout_mode = self.active_workdesk().layout_mode;
+        let grid_expose_open =
+            layout_mode == LayoutMode::Grid && self.active_workdesk().grid_layout.expose_open;
+        let active_grid_pane_id = self.active_grid_pane_id();
+        let camera = self.active_workdesk().camera;
+        let zoom = self.active_workdesk().zoom;
+        let panes = self.active_workdesk().panes.clone();
+
+        let pane_frames = match layout_mode {
+            LayoutMode::Free => panes
+                .iter()
+                .map(|pane| {
+                    (
+                        pane.id,
+                        PaneViewportFrame {
+                            x: camera.x + pane.position.x * zoom,
+                            y: camera.y + pane.position.y * zoom,
+                            width: pane.size.width * zoom,
+                            height: pane.size.height * zoom,
+                            zoom,
+                            allow_layout_drag: true,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+            LayoutMode::ClassicSplit => split_layout_frames(
+                &panes,
+                active_grid_pane_id,
+                viewport_width,
+                viewport_height,
+                sidebar_width,
+            ),
+            LayoutMode::Grid => {
+                if grid_expose_open {
+                    Vec::new()
+                } else {
+                    active_grid_pane_id
+                        .and_then(|pane_id| {
+                            panes.iter().find(|pane| pane.id == pane_id).map(|pane| {
+                                (
+                                    pane.id,
+                                    PaneViewportFrame::for_grid(
+                                        pane,
+                                        viewport_width,
+                                        viewport_height,
+                                        sidebar_width,
+                                    ),
+                                )
+                            })
+                        })
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                }
+            }
+        };
+
+        let grid_updates = pane_frames
+            .into_iter()
+            .filter_map(|(pane_id, frame)| {
+                let pane = panes.iter().find(|pane| pane.id == pane_id)?;
+                pane.surfaces
+                    .iter()
+                    .any(|surface| surface.kind.is_terminal())
+                    .then_some((
+                        pane_id,
+                        terminal_grid_size_for_frame(
+                            frame,
+                            pane.surfaces.len(),
+                            terminal_text_metrics(window, frame.zoom),
+                        ),
+                    ))
+            })
+            .collect::<Vec<_>>();
+
+        let desk = self.active_workdesk_mut();
+        for (pane_id, grid) in grid_updates {
+            desk.resize_terminals_for_pane_to_grid(pane_id, grid);
+        }
+    }
+
     fn spawn_pane_on_workdesk(
         &mut self,
         desk_index: usize,
@@ -2945,53 +4071,15 @@ impl CanvasShell {
         title: Option<String>,
         focus: bool,
     ) -> PaneId {
-        let size = match kind {
-            PaneKind::Shell => DEFAULT_SHELL_SIZE,
-            PaneKind::Agent => DEFAULT_AGENT_SIZE,
-        };
-        let base_label = match kind {
-            PaneKind::Shell => "Shell",
-            PaneKind::Agent => "Agent",
-        };
-        let desk = &mut self.workdesks[desk_index];
-        let pane_id = PaneId::new(desk.next_pane_serial);
-        desk.next_pane_serial += 1;
-        let cascade = 36.0 * (desk.panes.len() % 6) as f32;
-        let position = desk
-            .active_pane
-            .and_then(|active_pane_id| {
-                desk.panes
-                    .iter()
-                    .find(|pane| pane.id == active_pane_id)
-                    .map(|pane| {
-                        let horizontal_offset = if desk.layout_mode == LayoutMode::Free {
-                            42.0
-                        } else {
-                            pane.size.width + 96.0
-                        };
-                        WorkdeskPoint::new(
-                            pane.position.x + horizontal_offset,
-                            pane.position.y + 42.0 * ((desk.panes.len() % 3) as f32),
-                        )
-                    })
-            })
-            .unwrap_or_else(|| WorkdeskPoint::new(80.0 + cascade, 96.0 + cascade));
-        let title = title.unwrap_or_else(|| format!("{base_label} {}", pane_id.raw()));
-
-        desk.panes.push(PaneRecord {
-            id: pane_id,
-            title: title.clone(),
-            kind: kind.clone(),
-            position,
-            size,
-        });
-        desk.attach_terminal_session(pane_id, &kind, &title, size);
-        if focus {
-            desk.focus_pane(pane_id);
-            self.active_workdesk = desk_index;
+        match self.spawn_surface_on_workdesk(desk_index, None, kind, title, None, None, focus) {
+            Ok((pane_id, _)) => pane_id,
+            Err(error) => {
+                self.set_runtime_notice(error);
+                self.active_workdesk()
+                    .active_pane
+                    .unwrap_or_else(|| PaneId::new(0))
+            }
         }
-        desk.drag_state = DragState::Idle;
-        pane_id
     }
 
     fn spawn_pane(&mut self, kind: PaneKind, window: &Window, cx: &mut Context<Self>) {
@@ -3014,17 +4102,66 @@ impl CanvasShell {
         cx.notify();
     }
 
+    fn open_editor_picker(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open file in Canvas".into()),
+        });
+        let desk_index = self.active_workdesk;
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = receiver.await else {
+                return;
+            };
+            let Ok(Some(paths)) = result else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let path_string = path.display().to_string();
+            let _ = this.update(cx, |this, cx| {
+                match this.spawn_surface_on_workdesk(
+                    desk_index,
+                    None,
+                    PaneKind::Editor,
+                    None,
+                    None,
+                    Some(path_string),
+                    true,
+                ) {
+                    Ok(_) => {
+                        this.request_persist(cx);
+                        cx.notify();
+                    }
+                    Err(error) => this.set_runtime_notice(error),
+                }
+            });
+        })
+        .detach();
+    }
+
     fn close_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
         let desk = self.active_workdesk_mut();
+        let removed_surfaces = desk
+            .pane(pane_id)
+            .map(|pane| pane.surfaces.clone())
+            .unwrap_or_default();
         desk.panes.retain(|pane| pane.id != pane_id);
 
-        if let Some(terminal) = desk.terminals.remove(&pane_id) {
-            terminal.close();
+        for surface in removed_surfaces {
+            if let Some(terminal) = desk.terminals.remove(&surface.id) {
+                terminal.close();
+            }
+            desk.terminal_revisions.remove(&surface.id);
+            desk.terminal_statuses.remove(&surface.id);
+            desk.terminal_views.remove(&surface.id);
+            desk.terminal_grids.remove(&surface.id);
+            desk.editors.remove(&surface.id);
+            desk.editor_views.remove(&surface.id);
         }
         desk.pane_attention.remove(&pane_id);
-        desk.terminal_revisions.remove(&pane_id);
-        desk.terminal_statuses.remove(&pane_id);
-        desk.terminal_views.remove(&pane_id);
 
         if desk.active_pane == Some(pane_id) {
             desk.active_pane = desk.panes.last().map(|pane| pane.id);
@@ -3074,7 +4211,7 @@ impl CanvasShell {
             .map(|touch| touch.id)
             .collect::<Vec<_>>();
         let viewport = window.window_bounds().get_bounds();
-        let usable_width = (f32::from(viewport.size.width) - SIDEBAR_WIDTH).max(220.0);
+        let usable_width = (f32::from(viewport.size.width) - self.sidebar_width()).max(220.0);
         let usable_height = f32::from(viewport.size.height).max(220.0);
         let mut pan_delta = None;
 
@@ -3116,7 +4253,7 @@ impl CanvasShell {
     }
 
     fn handles_canvas_gesture(&self, position: gpui::Point<Pixels>) -> bool {
-        f32::from(position.x) > SIDEBAR_WIDTH
+        f32::from(position.x) > self.sidebar_width()
             && matches!(self.active_workdesk().drag_state, DragState::Idle)
             && self.active_workdesk().layout_mode == LayoutMode::Free
     }
@@ -3154,7 +4291,7 @@ impl CanvasShell {
         }
 
         let viewport = window.window_bounds().get_bounds();
-        let step_x = (f32::from(viewport.size.width) - SIDEBAR_WIDTH).max(220.0)
+        let step_x = (f32::from(viewport.size.width) - self.sidebar_width()).max(220.0)
             * SWIPE_PAN_VIEWPORT_FRACTION;
         let step_y = f32::from(viewport.size.height).max(220.0) * SWIPE_PAN_VIEWPORT_FRACTION;
         self.active_workdesk_mut().pan_by_screen_delta(gpui::point(
@@ -3224,6 +4361,8 @@ impl CanvasShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.dismiss_workdesk_menu();
+        self.dismiss_notifications();
         if self.active_workdesk().layout_mode == LayoutMode::Grid
             && self.active_workdesk().grid_layout.expose_open
         {
@@ -3296,7 +4435,34 @@ impl CanvasShell {
             DragState::SelectingTerminal { pane_id, metrics } => {
                 let cell = metrics.cell_at(event.position);
                 let desk = self.active_workdesk_mut();
-                desk.update_selection(pane_id, cell);
+                if let Some(surface_id) = desk.active_terminal_surface_id_for_pane(pane_id) {
+                    desk.update_selection(surface_id, cell);
+                }
+                cx.notify();
+            }
+            DragState::SelectingEditor {
+                pane_id,
+                surface_id,
+            } => {
+                let offset = {
+                    let Some(editor) = self.active_workdesk().editors.get(&surface_id) else {
+                        return;
+                    };
+                    let Some(view) = self.active_workdesk().editor_views.get(&surface_id) else {
+                        return;
+                    };
+                    view.offset_for_point(editor, event.position)
+                };
+                let Some(offset) = offset else {
+                    return;
+                };
+                let desk = self.active_workdesk_mut();
+                desk.focus_surface(pane_id, surface_id);
+                if let Some(editor) = desk.editors.get_mut(&surface_id) {
+                    editor.move_to_offset(offset, true);
+                }
+                self.cursor_blink_visible = true;
+                self.last_cursor_blink_at = Instant::now();
                 cx.notify();
             }
         }
@@ -3387,10 +4553,19 @@ impl CanvasShell {
             }
         }
 
+        if self.handle_editor_key_down(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
         let Some(pane_id) = self.active_workdesk().active_pane else {
             return;
         };
-        let Some(terminal) = self.active_workdesk().terminals.get(&pane_id).cloned() else {
+        let Some(terminal) = self
+            .active_workdesk()
+            .active_terminal_session_for_pane(pane_id)
+            .cloned()
+        else {
             return;
         };
 
@@ -3478,7 +4653,10 @@ impl CanvasShell {
     ) {
         let desk = self.active_workdesk_mut();
         desk.focus_pane(pane_id);
-        desk.begin_selection(pane_id, metrics.cell_at(position));
+        let Some(surface_id) = desk.active_terminal_surface_id_for_pane(pane_id) else {
+            return;
+        };
+        desk.begin_selection(surface_id, metrics.cell_at(position));
         desk.drag_state = DragState::SelectingTerminal { pane_id, metrics };
         self.cursor_blink_visible = true;
         self.last_cursor_blink_at = Instant::now();
@@ -3496,7 +4674,10 @@ impl CanvasShell {
             return;
         }
 
-        let Some(terminal) = self.active_workdesk().terminals.get(&pane_id) else {
+        let Some(terminal) = self
+            .active_workdesk()
+            .active_terminal_session_for_pane(pane_id)
+        else {
             return;
         };
         let snapshot = terminal.snapshot();
@@ -3538,6 +4719,297 @@ impl CanvasShell {
         cx.notify();
     }
 
+    fn begin_editor_selection(
+        &mut self,
+        pane_id: PaneId,
+        surface_id: SurfaceId,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = {
+            let Some(editor) = self.active_workdesk().editors.get(&surface_id) else {
+                return;
+            };
+            let Some(view) = self.active_workdesk().editor_views.get(&surface_id) else {
+                return;
+            };
+            view.offset_for_point(editor, position)
+        };
+        let Some(offset) = offset else {
+            return;
+        };
+        let desk = self.active_workdesk_mut();
+        desk.focus_surface(pane_id, surface_id);
+        if let Some(editor) = desk.editors.get_mut(&surface_id) {
+            editor.move_to_offset(offset, false);
+        }
+        desk.drag_state = DragState::SelectingEditor {
+            pane_id,
+            surface_id,
+        };
+        cx.notify();
+    }
+
+    fn on_editor_scroll(
+        &mut self,
+        surface_id: SurfaceId,
+        event: &ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if event.modifiers.platform {
+            return;
+        }
+
+        let delta = event.delta.pixel_delta(px(SCROLL_WHEEL_LINE_HEIGHT));
+        let dominant_axis = if delta.y.abs() > delta.x.abs() {
+            delta.y
+        } else {
+            delta.x
+        };
+        let mut lines = (f32::from(dominant_axis) / SCROLL_WHEEL_LINE_HEIGHT).round() as isize;
+        if lines == 0 && dominant_axis != px(0.0) {
+            lines = if f32::from(dominant_axis).is_sign_positive() {
+                1
+            } else {
+                -1
+            };
+        }
+
+        let viewport_lines = self
+            .active_workdesk()
+            .editor_views
+            .get(&surface_id)
+            .map(|view| view.viewport_lines)
+            .unwrap_or(20);
+        if let Some(editor) = self.active_workdesk_mut().editors.get_mut(&surface_id) {
+            editor.scroll_by_lines(lines, viewport_lines);
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn handle_editor_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let Some((pane_id, surface_id)) = self.active_editor_ids() else {
+            return false;
+        };
+        let viewport_lines = self
+            .active_workdesk()
+            .editor_views
+            .get(&surface_id)
+            .map(|view| view.viewport_lines)
+            .unwrap_or(24);
+        let keystroke = &event.keystroke;
+        let mut changed = false;
+        let mut changed_search_only = false;
+
+        if self
+            .active_editor()
+            .is_some_and(|editor| editor.search_state().open)
+        {
+            if keystroke.key == "escape" && !keystroke.modifiers.modified() {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.close_search();
+                }
+                cx.notify();
+                return true;
+            }
+            if keystroke.key == "enter" && !keystroke.modifiers.modified() {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.next_search_match();
+                }
+                cx.notify();
+                return true;
+            }
+            if matches!(keystroke.key.as_str(), "backspace" | "delete")
+                && !keystroke.modifiers.modified()
+            {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.pop_search_text();
+                }
+                cx.notify();
+                return true;
+            }
+            if let Some(text) = editable_keystroke_text(keystroke) {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.append_search_text(&text);
+                }
+                cx.notify();
+                return true;
+            }
+        }
+
+        if keystroke.modifiers.platform {
+            match keystroke.key.as_str() {
+                "s" => {
+                    match self
+                        .active_editor_mut()
+                        .and_then(|editor| editor.save().ok())
+                    {
+                        Some(()) => {
+                            self.sync_editor_surface_metadata(pane_id, surface_id);
+                            self.request_persist(cx);
+                            self.set_runtime_notice("Saved editor buffer");
+                            cx.notify();
+                        }
+                        None => self.set_runtime_notice("Editor save failed"),
+                    }
+                    return true;
+                }
+                "f" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.open_search();
+                    }
+                    cx.notify();
+                    return true;
+                }
+                "g" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        if keystroke.modifiers.shift {
+                            editor.previous_search_match();
+                        } else {
+                            editor.next_search_match();
+                        }
+                    }
+                    cx.notify();
+                    return true;
+                }
+                "z" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        changed = if keystroke.modifiers.shift {
+                            editor.redo()
+                        } else {
+                            editor.undo()
+                        };
+                    }
+                }
+                "c" => {
+                    if let Some(text) = self
+                        .active_editor()
+                        .and_then(|editor| editor.selected_text())
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+                    }
+                    return true;
+                }
+                "x" => {
+                    if let Some(text) = self
+                        .active_editor()
+                        .and_then(|editor| editor.selected_text())
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+                    }
+                    if let Some(editor) = self.active_editor_mut() {
+                        changed = editor.replace_selection("");
+                    }
+                }
+                "v" => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Some(editor) = self.active_editor_mut() {
+                            changed = editor.replace_selection(&text);
+                        }
+                    }
+                }
+                "a" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.select_all();
+                    }
+                    cx.notify();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        match keystroke.key.as_str() {
+            "left" => {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.move_left(keystroke.modifiers.shift);
+                }
+                changed_search_only = true;
+            }
+            "right" => {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.move_right(keystroke.modifiers.shift);
+                }
+                changed_search_only = true;
+            }
+            "up" => {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.move_up(keystroke.modifiers.shift);
+                }
+                changed_search_only = true;
+            }
+            "down" => {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.move_down(keystroke.modifiers.shift);
+                }
+                changed_search_only = true;
+            }
+            "home" => {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.move_home(keystroke.modifiers.shift);
+                }
+                changed_search_only = true;
+            }
+            "end" => {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.move_end(keystroke.modifiers.shift);
+                }
+                changed_search_only = true;
+            }
+            "pageup" => {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.page_up(keystroke.modifiers.shift, viewport_lines);
+                }
+                changed_search_only = true;
+            }
+            "pagedown" => {
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.page_down(keystroke.modifiers.shift, viewport_lines);
+                }
+                changed_search_only = true;
+            }
+            "backspace" => {
+                if let Some(editor) = self.active_editor_mut() {
+                    changed = editor.backspace();
+                }
+            }
+            "delete" => {
+                if let Some(editor) = self.active_editor_mut() {
+                    changed = editor.delete_forward();
+                }
+            }
+            "enter" => {
+                if let Some(editor) = self.active_editor_mut() {
+                    changed = editor.insert_newline();
+                }
+            }
+            "tab" if !keystroke.modifiers.modified() || keystroke.modifiers.shift => {
+                if let Some(editor) = self.active_editor_mut() {
+                    changed = editor.insert_tab();
+                }
+            }
+            _ => {
+                if editable_keystroke_text(keystroke).is_none() {
+                    return false;
+                }
+                return false;
+            }
+        }
+
+        if changed {
+            self.sync_editor_surface_metadata(pane_id, surface_id);
+            self.request_persist(cx);
+        }
+        if changed || changed_search_only {
+            self.active_workdesk_mut().note_pane_activity(pane_id);
+            cx.notify();
+            return true;
+        }
+
+        false
+    }
+
     fn execute_terminal_shortcut_action(
         &mut self,
         action: ShortcutAction,
@@ -3546,7 +5018,11 @@ impl CanvasShell {
         let Some(pane_id) = self.active_workdesk().active_pane else {
             return false;
         };
-        let Some(terminal) = self.active_workdesk().terminals.get(&pane_id).cloned() else {
+        let Some(terminal) = self
+            .active_workdesk()
+            .active_terminal_session_for_pane(pane_id)
+            .cloned()
+        else {
             return false;
         };
         let snapshot = terminal.snapshot();
@@ -3555,8 +5031,7 @@ impl CanvasShell {
             ShortcutAction::TerminalCopySelection => {
                 let selected_text = self
                     .active_workdesk()
-                    .terminal_views
-                    .get(&pane_id)
+                    .active_terminal_view_for_pane(pane_id)
                     .and_then(|view| view.selection)
                     .and_then(|selection| terminal_selection_text(&snapshot, selection));
 
@@ -3602,14 +5077,16 @@ impl CanvasShell {
                 let last_row = snapshot.rows.len().saturating_sub(1);
                 let last_col = usize::from(snapshot.cols.saturating_sub(1));
                 let desk = self.active_workdesk_mut();
-                desk.begin_selection(pane_id, TerminalCell { row: 0, col: 0 });
-                desk.update_selection(
-                    pane_id,
-                    TerminalCell {
-                        row: last_row,
-                        col: last_col,
-                    },
-                );
+                if let Some(surface_id) = desk.active_terminal_surface_id_for_pane(pane_id) {
+                    desk.begin_selection(surface_id, TerminalCell { row: 0, col: 0 });
+                    desk.update_selection(
+                        surface_id,
+                        TerminalCell {
+                            row: last_row,
+                            col: last_col,
+                        },
+                    );
+                }
                 cx.notify();
                 true
             }
@@ -3623,6 +5100,7 @@ impl CanvasShell {
         }
 
         self.dismiss_workdesk_menu();
+        self.dismiss_notifications();
         self.active_workdesk_mut().drag_state = DragState::Idle;
         self.active_workdesk = index;
         self.active_workdesk_mut().drag_state = DragState::Idle;
@@ -3639,6 +5117,28 @@ impl CanvasShell {
 
     fn dismiss_workdesk_menu(&mut self) -> bool {
         self.workdesk_menu.take().is_some()
+    }
+
+    fn dismiss_notifications(&mut self) -> bool {
+        let was_open = self.notifications_open;
+        self.notifications_open = false;
+        was_open
+    }
+
+    fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
+        self.notifications_open = !self.notifications_open;
+        if self.notifications_open {
+            self.mock_notifications_unread = 0;
+            self.dismiss_workdesk_menu();
+        }
+        cx.notify();
+    }
+
+    fn toggle_sidebar_collapsed(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.dismiss_workdesk_menu();
+        self.dismiss_notifications();
+        cx.notify();
     }
 
     fn open_workdesk_menu(
@@ -3786,12 +5286,21 @@ impl CanvasShell {
         pane: &PaneRecord,
         _stack_index: usize,
         frame: PaneViewportFrame,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let workdesk = self.active_workdesk();
         let pane_id = pane.id;
+        let active_surface = pane
+            .active_surface()
+            .expect("pane should always contain an active surface");
+        let active_surface_id = active_surface.id;
+        let active_surface_kind = active_surface.kind.clone();
+        let active_surface_title = active_surface.title.clone();
+        let active_surface_dirty = active_surface.dirty;
+        let active_browser_url = active_surface.browser_url.clone();
         let is_active = workdesk.active_pane == Some(pane.id);
-        let accent = pane_accent(&pane.kind);
+        let accent = pane_accent(&active_surface_kind);
         let pane_attention = workdesk.pane_attention(pane.id);
         let attention_tint = pane_attention.state.tint();
         let border = if pane_attention.state.is_attention() {
@@ -3810,127 +5319,186 @@ impl CanvasShell {
         let screen_y = frame.y;
         let screen_width = frame.width;
         let screen_height = frame.height;
-        let header_height = 34.0 * frame.zoom.clamp(0.78, 1.3);
+        let header_height = terminal_header_height_for_surface_count(pane.surfaces.len())
+            * frame.zoom.clamp(0.78, 1.3);
         let pane_padding = 12.0 * frame.zoom.clamp(0.85, 1.25);
         let resize_handle_size = 14.0 * frame.zoom.clamp(0.85, 1.3);
-        let terminal_snapshot = workdesk
-            .terminals
-            .get(&pane.id)
-            .map(|terminal| terminal.snapshot());
+        let terminal_metrics = terminal_text_metrics(window, frame.zoom);
+        let terminal_snapshot = active_surface_kind
+            .is_terminal()
+            .then(|| {
+                workdesk
+                    .terminals
+                    .get(&active_surface_id)
+                    .map(|terminal| terminal.snapshot())
+            })
+            .flatten();
         let terminal_view = workdesk
             .terminal_views
-            .get(&pane.id)
+            .get(&active_surface_id)
             .cloned()
             .unwrap_or_default();
         let runtime_title = terminal_snapshot
             .as_ref()
             .map(|snapshot| snapshot.title.clone())
-            .unwrap_or_else(|| pane.title.clone());
-        let terminal_body_metrics = terminal_snapshot
-            .as_ref()
-            .map(|snapshot| terminal_frame_metrics(frame.zoom, screen_x, screen_y, snapshot));
-        let terminal_body = terminal_body(
-            &terminal_snapshot,
-            &terminal_view,
-            frame.zoom,
-            is_active,
-            self.cursor_blink_visible,
-        );
+            .unwrap_or_else(|| active_surface_title.clone());
         let status_tint = if pane_attention.state == AttentionState::Idle {
-            terminal_snapshot
-                .as_ref()
-                .map(|snapshot| {
-                    if snapshot.closed {
-                        rgb(0xff9b88).into()
+            match active_surface_kind {
+                PaneKind::Shell | PaneKind::Agent => terminal_snapshot
+                    .as_ref()
+                    .map(|snapshot| {
+                        if snapshot.closed {
+                            rgb(0xff9b88).into()
+                        } else if is_active {
+                            accent
+                        } else {
+                            rgb(0x55616b).into()
+                        }
+                    })
+                    .unwrap_or_else(|| rgb(0x55616b).into()),
+                PaneKind::Browser => {
+                    if is_active {
+                        accent
+                    } else {
+                        rgb(0x55616b).into()
+                    }
+                }
+                PaneKind::Editor => {
+                    if active_surface_dirty {
+                        rgb(0xf0d35f).into()
                     } else if is_active {
                         accent
                     } else {
                         rgb(0x55616b).into()
                     }
-                })
-                .unwrap_or_else(|| rgb(0x55616b).into())
+                }
+            }
         } else {
             attention_tint
         };
+        let entity = cx.entity();
 
         let header = {
+            let close_surface_id = active_surface_id;
+            let close_surface_count = pane.surfaces.len();
             let header = div()
                 .flex()
-                .justify_between()
-                .items_center()
-                .gap_2()
+                .flex_col()
+                .justify_center()
+                .gap_1()
                 .h(px(header_height))
                 .px(px(pane_padding))
+                .py(px(6.0 * frame.zoom.clamp(0.9, 1.2)))
                 .bg(header_bg)
                 .border_b_1()
                 .border_color(border)
                 .child(
                     div()
-                        .flex_1()
                         .flex()
+                        .justify_between()
                         .items_center()
                         .gap_2()
-                        .overflow_hidden()
                         .child(
                             div()
-                                .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation();
-                                })
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.cycle_manual_pane_attention(pane_id, cx);
-                                        cx.stop_propagation();
-                                    }),
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .cursor_pointer()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.cycle_manual_pane_attention(pane_id, cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child(attention_indicator(
+                                            pane_attention.state,
+                                            pane_attention.unread,
+                                        )),
                                 )
-                                .child(attention_indicator(pane_attention.state, pane_attention.unread)),
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(status_tint)
+                                        .child(surface_kind_slug(&active_surface_kind)),
+                                )
+                                .child(div().text_sm().child(runtime_title.clone())),
                         )
                         .child(
-                            div()
-                                .text_xs()
-                                .text_color(status_tint)
-                                .child(match pane.kind {
-                                    PaneKind::Shell => "shell",
-                                    PaneKind::Agent => "agent",
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .child(runtime_title),
+                            div().flex().items_center().gap_1().child(
+                                div()
+                                    .cursor_pointer()
+                                    .w(px(24.0))
+                                    .h(px(24.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .bg(rgb(0x23171a))
+                                    .text_xs()
+                                    .text_color(rgb(0xffc4b5))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            if close_surface_count > 1 {
+                                                this.close_surface(pane_id, close_surface_id, cx);
+                                            } else {
+                                                this.close_pane(pane_id, cx);
+                                            }
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child("X"),
+                            ),
                         ),
-                )
-                .child(
+                );
+
+            let header = if pane.surfaces.len() > 1 {
+                header.child(
                     div()
                         .flex()
                         .items_center()
                         .gap_1()
-                        .child(
-                            div()
-                                .cursor_pointer()
-                                .w(px(24.0))
-                                .h(px(24.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_md()
-                                .bg(rgb(0x23171a))
-                                .text_xs()
-                                .text_color(rgb(0xffc4b5))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation();
+                        .overflow_hidden()
+                        .children(
+                            pane.surfaces
+                                .iter()
+                                .map(|surface| {
+                                    let surface_id = surface.id;
+                                    let active = surface_id == active_surface_id;
+                                    surface_stack_chip(
+                                        surface,
+                                        active,
+                                        pane_accent(&surface.kind),
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.active_workdesk_mut()
+                                                .focus_surface(pane_id, surface_id);
+                                            this.active_workdesk_mut().note_pane_activity(pane_id);
+                                            this.cursor_blink_visible = true;
+                                            this.last_cursor_blink_at = Instant::now();
+                                            this.request_persist(cx);
+                                            window.focus(&this.focus_handle);
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }),
+                                    )
                                 })
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.close_pane(pane_id, cx);
-                                        cx.stop_propagation();
-                                    }),
-                                )
-                                .child("X"),
+                                .collect::<Vec<_>>(),
                         ),
-                );
+                )
+            } else {
+                header
+            };
 
             if frame.allow_layout_drag {
                 header.cursor_move().on_mouse_down(
@@ -3946,25 +5514,285 @@ impl CanvasShell {
             }
         };
 
-        let body = div()
-            .flex()
-            .flex_1()
-            .overflow_hidden()
-            .p(px(pane_padding))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    if let Some(metrics) = terminal_body_metrics {
-                        this.begin_terminal_selection(pane_id, event.position, metrics, cx);
-                        window.focus(&this.focus_handle);
-                        cx.stop_propagation();
-                    }
-                }),
-            )
-            .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
-                this.on_terminal_scroll(pane_id, event, cx);
-            }))
-            .child(terminal_body);
+        let body = match active_surface_kind {
+            PaneKind::Shell | PaneKind::Agent => {
+                let terminal_body_metrics = terminal_snapshot.as_ref().map(|snapshot| {
+                    terminal_frame_metrics(
+                        terminal_metrics,
+                        screen_x,
+                        screen_y,
+                        header_height,
+                        pane_padding,
+                        snapshot,
+                    )
+                });
+                let terminal_body = terminal_body(
+                    &terminal_snapshot,
+                    &terminal_view,
+                    terminal_metrics,
+                    is_active,
+                    self.cursor_blink_visible,
+                );
+                div()
+                    .flex()
+                    .flex_1()
+                    .overflow_hidden()
+                    .p(px(pane_padding))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if let Some(metrics) = terminal_body_metrics {
+                                this.begin_terminal_selection(pane_id, event.position, metrics, cx);
+                                window.focus(&this.focus_handle);
+                                cx.stop_propagation();
+                            }
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                        this.on_terminal_scroll(pane_id, event, cx);
+                    }))
+                    .child(terminal_body)
+                    .into_any_element()
+            }
+            PaneKind::Editor => {
+                let font_size = 12.5 * frame.zoom.clamp(0.82, 1.18);
+                let line_height = 16.0 * frame.zoom.clamp(0.85, 1.18);
+                let char_width = 7.4 * frame.zoom.clamp(0.85, 1.18);
+                if let Some(editor) = workdesk.editors.get(&active_surface_id) {
+                    let search_matches = editor.search_matches();
+                    let search_height = if editor.search_state().open {
+                        34.0
+                    } else {
+                        0.0
+                    };
+                    let footer_height = 26.0;
+                    let viewport_lines = ((screen_height
+                        - header_height
+                        - pane_padding * 2.0
+                        - search_height
+                        - footer_height
+                        - 24.0)
+                        / line_height)
+                        .floor()
+                        .max(1.0) as usize;
+                    let gutter_width =
+                        ((editor.line_number_width() + 1) as f32 * char_width + 18.0).max(44.0);
+                    let line_number_width = editor.line_number_width();
+                    let visible_lines = editor
+                        .visible_line_range(viewport_lines)
+                        .map(|line_index| {
+                            let line_label =
+                                format!("{:>width$}", line_index + 1, width = line_number_width);
+                            div()
+                                .h(px(line_height))
+                                .flex()
+                                .items_start()
+                                .child(
+                                    div()
+                                        .w(px(gutter_width))
+                                        .pr_3()
+                                        .text_right()
+                                        .text_color(rgb(0x63717b))
+                                        .child(line_label),
+                                )
+                                .child(div().flex_1().whitespace_nowrap().child(
+                                    editor_line_display(
+                                        editor,
+                                        line_index,
+                                        is_active,
+                                        self.cursor_blink_visible,
+                                    ),
+                                ))
+                        })
+                        .collect::<Vec<_>>();
+                    let search_label = editor
+                        .search_state()
+                        .active_match
+                        .map(|index| format!("{}/{}", index + 1, search_matches.len()))
+                        .unwrap_or_else(|| format!("0/{}", search_matches.len()));
+                    let path_label = editor.path_string();
+                    let language_label = editor_language_label(editor);
+                    let dirty = editor.dirty();
+                    let external_modified = editor.external_modified();
+                    let surface_id = active_surface_id;
+
+                    div()
+                        .flex()
+                        .flex_1()
+                        .overflow_hidden()
+                        .p(px(pane_padding))
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .when(editor.search_state().open, |column| {
+                                    column.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_3()
+                                            .px_3()
+                                            .py_2()
+                                            .bg(rgb(0x131a20))
+                                            .border_1()
+                                            .border_color(rgb(0x24303a))
+                                            .rounded_md()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0xf0d35f))
+                                                    .child("Find"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_xs()
+                                                    .text_color(rgb(0xdce2e8))
+                                                    .child(editor.search_state().query.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x7f8a94))
+                                                    .child(search_label),
+                                            ),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .relative()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .p_2()
+                                        .bg(rgb(0x0f151a))
+                                        .border_1()
+                                        .border_color(rgb(0x24303a))
+                                        .rounded_md()
+                                        .font_family(".ZedMono")
+                                        .text_size(px(font_size))
+                                        .line_height(px(line_height))
+                                        .text_color(rgb(0xdce2e8))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, event: &MouseDownEvent, window, cx| {
+                                                    this.begin_editor_selection(
+                                                        pane_id,
+                                                        surface_id,
+                                                        event.position,
+                                                        cx,
+                                                    );
+                                                    window.focus(&this.focus_handle);
+                                                    cx.stop_propagation();
+                                                },
+                                            ),
+                                        )
+                                        .on_scroll_wheel(cx.listener(
+                                            move |this, event: &ScrollWheelEvent, _, cx| {
+                                                this.on_editor_scroll(surface_id, event, cx);
+                                            },
+                                        ))
+                                        .child(
+                                            div().flex().flex_col().gap_0().children(visible_lines),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(px(gutter_width + 8.0))
+                                                .top(px(8.0))
+                                                .right(px(8.0))
+                                                .bottom(px(8.0))
+                                                .child(EditorInputOverlay {
+                                                    shell: entity.clone(),
+                                                    active: is_active,
+                                                    surface_id,
+                                                    line_height,
+                                                    char_width,
+                                                    viewport_lines,
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_xs()
+                                                .text_color(rgb(0x7f8a94))
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .child(path_label),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(context_pill(language_label, accent))
+                                                .when(dirty, |row| {
+                                                    row.child(context_pill(
+                                                        "Dirty",
+                                                        rgb(0xf0d35f).into(),
+                                                    ))
+                                                })
+                                                .when(external_modified, |row| {
+                                                    row.child(context_pill(
+                                                        "Externally changed",
+                                                        rgb(0xff9b88).into(),
+                                                    ))
+                                                }),
+                                        ),
+                                ),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .flex_1()
+                        .overflow_hidden()
+                        .p(px(pane_padding))
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(rgb(0x0f151a))
+                                .border_1()
+                                .border_color(rgb(0x24303a))
+                                .rounded_md()
+                                .text_color(rgb(0xffb7a6))
+                                .child("editor buffer offline"),
+                        )
+                        .into_any_element()
+                }
+            }
+            PaneKind::Browser => {
+                let url = active_browser_url.unwrap_or_else(|| "https://example.com".to_string());
+                let open_url = url.clone();
+                div()
+                    .flex()
+                    .flex_1()
+                    .overflow_hidden()
+                    .p(px(pane_padding))
+                    .child(browser_preview_card(
+                        &url,
+                        accent,
+                        cx.listener(move |_, _, _, cx| {
+                            cx.open_url(&open_url);
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .into_any_element()
+            }
+        };
 
         let surface = div()
             .absolute()
@@ -4036,6 +5864,8 @@ impl Render for CanvasShell {
         let viewport = window.window_bounds().get_bounds();
         let viewport_width = f32::from(viewport.size.width);
         let viewport_height = f32::from(viewport.size.height);
+        self.sync_visible_terminal_grids(window, viewport_width, viewport_height);
+        let sidebar_width = self.sidebar_width();
         let open_workdesk_menu = self.workdesk_menu;
         let workdesk = self.active_workdesk();
         let layout_mode = workdesk.layout_mode;
@@ -4050,6 +5880,7 @@ impl Render for CanvasShell {
                     self.active_grid_pane_id(),
                     viewport_width,
                     viewport_height,
+                    sidebar_width,
                 )
             })
             .unwrap_or_default();
@@ -4066,7 +5897,7 @@ impl Render for CanvasShell {
         };
 
         let grid_frame_zoom = active_grid_pane.map(|(_, pane)| {
-            PaneViewportFrame::for_grid(pane, viewport_width, viewport_height).zoom
+            PaneViewportFrame::for_grid(pane, viewport_width, viewport_height, sidebar_width).zoom
         });
         let active_split_zoom = self.active_grid_pane_id().and_then(|pane_id| {
             split_frames
@@ -4075,7 +5906,14 @@ impl Render for CanvasShell {
                 .map(|(_, frame)| frame.zoom)
         });
         let expose_layout = grid_expose_open
-            .then(|| expose_layout_frame(&workdesk.panes, viewport_width, viewport_height))
+            .then(|| {
+                expose_layout_frame(
+                    &workdesk.panes,
+                    viewport_width,
+                    viewport_height,
+                    sidebar_width,
+                )
+            })
             .flatten();
 
         let background_elements = match layout_mode {
@@ -4147,7 +5985,7 @@ impl Render for CanvasShell {
                 elements
             }
             LayoutMode::Grid => {
-                let viewport_left = SIDEBAR_WIDTH + GRID_ACTIVE_MARGIN_X * 0.45;
+                let viewport_left = sidebar_width + GRID_ACTIVE_MARGIN_X * 0.45;
                 let viewport_top = GRID_ACTIVE_MARGIN_TOP * 0.5;
                 let viewport_card_width =
                     (viewport_width - viewport_left - GRID_ACTIVE_MARGIN_X * 0.45).max(320.0);
@@ -4167,10 +6005,10 @@ impl Render for CanvasShell {
             }
             LayoutMode::ClassicSplit => vec![div()
                 .absolute()
-                .left(px(SIDEBAR_WIDTH + SPLIT_MARGIN_X))
+                .left(px(sidebar_width + SPLIT_MARGIN_X))
                 .top(px(SPLIT_MARGIN_TOP))
                 .w(px(
-                    (viewport_width - SIDEBAR_WIDTH - SPLIT_MARGIN_X * 2.0).max(320.0)
+                    (viewport_width - sidebar_width - SPLIT_MARGIN_X * 2.0).max(320.0)
                 ))
                 .h(px((viewport_height
                     - SPLIT_MARGIN_TOP
@@ -4192,6 +6030,7 @@ impl Render for CanvasShell {
                         pane,
                         index,
                         PaneViewportFrame::from_free(pane, workdesk),
+                        window,
                         cx,
                     )
                 })
@@ -4207,7 +6046,7 @@ impl Render for CanvasShell {
                             workdesk
                                 .panes
                                 .get(index)
-                                .map(|pane| self.pane_surface(pane, index, *frame, cx))
+                                .map(|pane| self.pane_surface(pane, index, *frame, window, cx))
                         })
                 })
                 .collect::<Vec<_>>(),
@@ -4220,7 +6059,13 @@ impl Render for CanvasShell {
                             vec![self.pane_surface(
                                 pane,
                                 index,
-                                PaneViewportFrame::for_grid(pane, viewport_width, viewport_height),
+                                PaneViewportFrame::for_grid(
+                                    pane,
+                                    viewport_width,
+                                    viewport_height,
+                                    sidebar_width,
+                                ),
+                                window,
                                 cx,
                             )]
                         })
@@ -4254,6 +6099,7 @@ impl Render for CanvasShell {
                         pane,
                         viewport_width,
                         viewport_height,
+                        sidebar_width,
                         cx.listener(move |this, _, _, cx| {
                             this.activate_grid_pane(hint.pane_id, false, cx);
                             cx.stop_propagation();
@@ -4297,9 +6143,9 @@ impl Render for CanvasShell {
 
             vec![div()
                 .absolute()
-                .left(px(SIDEBAR_WIDTH))
+                .left(px(sidebar_width))
                 .top(px(0.0))
-                .w(px(viewport_width - SIDEBAR_WIDTH))
+                .w(px(viewport_width - sidebar_width))
                 .h(px(viewport_height))
                 .bg(rgb(0x0b1014))
                 .border_l_1()
@@ -4340,49 +6186,6 @@ impl Render for CanvasShell {
         };
 
         let active_pane = workdesk.active_pane_title();
-        let active_terminal_snapshot = workdesk
-            .active_pane
-            .and_then(|pane_id| workdesk.terminals.get(&pane_id).map(|terminal| terminal.snapshot()));
-        let active_attention = workdesk
-            .active_pane
-            .map(|pane_id| workdesk.pane_attention(pane_id))
-            .unwrap_or_default();
-        let active_terminal_status = terminal_footer_label(&active_terminal_snapshot);
-        let workdesk_intent = workdesk.intent_label();
-        let workdesk_status = workdesk.status_label();
-        let workdesk_progress = workdesk.progress_label();
-        let context_accent = workdesk
-            .active_pane
-            .map(|pane_id| {
-                let attention = workdesk.pane_attention(pane_id);
-                if attention.state == AttentionState::Idle {
-                    workdesk
-                        .panes
-                        .iter()
-                        .find(|pane| pane.id == pane_id)
-                        .map(|pane| pane_accent(&pane.kind))
-                        .unwrap_or_else(|| rgb(0x7f8a94).into())
-                } else {
-                    attention.state.tint()
-                }
-            })
-            .unwrap_or_else(|| rgb(0x7f8a94).into());
-        let layout_hint = match layout_mode {
-            LayoutMode::Free => "Free · drag and zoom".to_string(),
-            LayoutMode::Grid => {
-                if grid_expose_open {
-                    "Expose · choose a pane".to_string()
-                } else {
-                    "Grid · directional focus".to_string()
-                }
-            }
-            LayoutMode::ClassicSplit => "Split · directional focus".to_string(),
-        };
-        let context_title = if workdesk.active_pane.is_some() {
-            format!("{} / {}", workdesk.name, active_pane)
-        } else {
-            workdesk.name.clone()
-        };
         let inspector_zoom_label = match layout_mode {
             LayoutMode::Grid => {
                 if grid_expose_open {
@@ -4400,6 +6203,11 @@ impl Render for CanvasShell {
         };
         let show_inspector = cfg!(debug_assertions) && self.inspector_open;
         let inspector_toggle_label = self.shortcut_label(ShortcutAction::ToggleInspector);
+        let sidebar_header_inset = if cfg!(target_os = "macos") {
+            SIDEBAR_WINDOW_CONTROLS_INSET
+        } else {
+            0.0
+        };
         let workdesk_cards = self
             .workdesks
             .iter()
@@ -4417,29 +6225,137 @@ impl Render for CanvasShell {
                         .collect::<Vec<_>>()
                         .join(" · ")
                 };
-                workdesk_card(
-                    index,
-                    desk,
-                    index == self.active_workdesk,
-                    is_menu_open,
-                    preview,
-                    workdesk_accent(index),
-                    cx.listener(move |this, _, _, cx| {
-                        this.dismiss_workdesk_menu();
-                        this.select_workdesk(index, cx);
-                        cx.stop_propagation();
-                    }),
-                    cx.listener(move |this, event: &MouseUpEvent, _, cx| {
-                        this.open_workdesk_menu(index, event.position, cx);
-                        cx.stop_propagation();
-                    }),
-                    cx.listener(move |this, event: &MouseUpEvent, _, cx| {
-                        this.toggle_workdesk_menu(index, event.position, cx);
-                        cx.stop_propagation();
-                    }),
-                )
+                let accent = workdesk_accent(index);
+                if self.sidebar_collapsed {
+                    workdesk_compact_chip(
+                        index,
+                        desk,
+                        index == self.active_workdesk,
+                        accent,
+                        cx.listener(move |this, _, _, cx| {
+                            this.dismiss_workdesk_menu();
+                            this.select_workdesk(index, cx);
+                            cx.stop_propagation();
+                        }),
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            this.open_workdesk_menu(index, event.position, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element()
+                } else {
+                    workdesk_card(
+                        index,
+                        desk,
+                        index == self.active_workdesk,
+                        is_menu_open,
+                        preview,
+                        accent,
+                        cx.listener(move |this, _, _, cx| {
+                            this.dismiss_workdesk_menu();
+                            this.select_workdesk(index, cx);
+                            cx.stop_propagation();
+                        }),
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            this.open_workdesk_menu(index, event.position, cx);
+                            cx.stop_propagation();
+                        }),
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            this.toggle_workdesk_menu(index, event.position, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element()
+                }
             })
             .collect::<Vec<_>>();
+        let notification_panel_left = if self.sidebar_collapsed {
+            (sidebar_width + 12.0).max(84.0)
+        } else {
+            sidebar_width + 12.0
+        }
+        .min((viewport_width - NOTIFICATION_PANEL_WIDTH - 16.0).max(12.0));
+        let notification_overlay = self.notifications_open.then(|| {
+            div()
+                .absolute()
+                .left(px(notification_panel_left))
+                .top(px(22.0 + sidebar_header_inset))
+                .w(px(
+                    NOTIFICATION_PANEL_WIDTH.min((viewport_width - 24.0).max(220.0))
+                ))
+                .max_h(px(
+                    (viewport_height - 32.0 - sidebar_header_inset).max(180.0)
+                ))
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .bg(rgb(0x0f151b))
+                .border_1()
+                .border_color(rgb(0x2b3641))
+                .rounded_xl()
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    if this.dismiss_notifications() {
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x7cc7ff))
+                                        .child("Mock inbox"),
+                                )
+                                .child(div().text_sm().child("Notifications"))
+                                .child(div().text_xs().text_color(rgb(0x8e9ba5)).child(
+                                    "Temporary center until real notification plumbing lands.",
+                                )),
+                        )
+                        .child(control_button(
+                            "Close",
+                            rgb(0x7f8a94).into(),
+                            cx.listener(|this, _, _, cx| {
+                                if this.dismiss_notifications() {
+                                    cx.notify();
+                                }
+                                cx.stop_propagation();
+                            }),
+                        )),
+                )
+                .child(notification_item(
+                    "Agent ready",
+                    "Implement Agent finished a response and left the pane waiting.",
+                    rgb(0x7cc7ff).into(),
+                    true,
+                ))
+                .child(notification_item(
+                    "Build changed",
+                    "Implementation desk build status moved to 25% for the current branch.",
+                    rgb(0x77d19a).into(),
+                    false,
+                ))
+                .child(notification_item(
+                    "Review pending",
+                    "Shell Desk has a waiting pane that has not been revisited yet.",
+                    rgb(0xe59a49).into(),
+                    false,
+                ))
+        });
         let shortcut_path_label = shortcut_file_path().display().to_string();
         let recording_shortcut = self
             .shortcut_editor
@@ -4645,9 +6561,14 @@ impl Render for CanvasShell {
             let desk = self.workdesks.get(menu.index)?;
             let can_delete = self.workdesks.len() > 1;
             let menu_height = if can_delete { 220.0 } else { 174.0 };
-            let max_left = (SIDEBAR_WIDTH - WORKDESK_MENU_WIDTH - 12.0).max(12.0);
+            let min_left = if self.sidebar_collapsed {
+                sidebar_width + 8.0
+            } else {
+                12.0
+            };
+            let max_left = (viewport_width - WORKDESK_MENU_WIDTH - 12.0).max(min_left);
             let max_top = (viewport_height - menu_height - 12.0).max(12.0);
-            let left = (f32::from(menu.position.x) + 8.0).clamp(12.0, max_left);
+            let left = (f32::from(menu.position.x) + 8.0).clamp(min_left, max_left);
             let top = f32::from(menu.position.y).clamp(12.0, max_top);
             let accent = workdesk_accent(menu.index);
 
@@ -4807,11 +6728,11 @@ impl Render for CanvasShell {
                         .top(px((viewport_height * 0.14).max(44.0)))
                         .left(px(
                             ((viewport_width - WORKDESK_EDITOR_WIDTH) * 0.5)
-                                .max(SIDEBAR_WIDTH + 16.0),
+                                .max(sidebar_width + 16.0),
                         ))
                         .w(px(
                             WORKDESK_EDITOR_WIDTH.min(
-                                (viewport_width - SIDEBAR_WIDTH - FLOATING_DOCK_MARGIN * 2.0)
+                                (viewport_width - sidebar_width - FLOATING_DOCK_MARGIN * 2.0)
                                     .max(320.0),
                             ),
                         ))
@@ -4994,12 +6915,19 @@ impl Render for CanvasShell {
                     .absolute()
                     .left(px(0.0))
                     .top(px(0.0))
-                    .w(px(SIDEBAR_WIDTH))
+                    .w(px(sidebar_width))
                     .h(px(viewport_height))
+                    .relative()
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .p_3()
+                    .px(if self.sidebar_collapsed {
+                        px(2.0)
+                    } else {
+                        px(12.0)
+                    })
+                    .pb_3()
+                    .pt(px(14.0 + sidebar_header_inset))
                     .bg(rgb(0x0d1217))
                     .border_r_1()
                     .border_color(rgb(0x22303a))
@@ -5010,34 +6938,117 @@ impl Render for CanvasShell {
                     .on_scroll_wheel(|_, _, cx| {
                         cx.stop_propagation();
                     })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
+                    .when(!self.sidebar_collapsed, |sidebar| {
+                        sidebar.child(
+                            div()
+                                .absolute()
+                                .left(px(10.0))
+                                .top(px(10.0))
+                                .w(px((sidebar_width - 20.0)
+                                    .max(178.0)
+                                    .min((viewport_width - 20.0).max(120.0))))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .when(cfg!(target_os = "macos"), |row| {
+                                            row.child(div().w(px(56.0)))
+                                        })
+                                        .child(chrome_button(
+                                            "Bell",
+                                            rgb(0x7cc7ff).into(),
+                                            self.notifications_open,
+                                            Some(self.mock_notifications_unread),
+                                            cx.listener(|this, _, _, cx| {
+                                                this.toggle_notifications(cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        ))
+                                        .child(chrome_button(
+                                            "Hide",
+                                            rgb(0x90a0aa).into(),
+                                            false,
+                                            None,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.toggle_sidebar_collapsed(cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )),
+                                )
+                                .child(compact_dock_button(
+                                    "+",
+                                    rgb(0x77d19a).into(),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.open_workdesk_creator(cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )),
+                        )
+                    })
+                    .when(!self.sidebar_collapsed, |sidebar| {
+                        sidebar.child(
+                            div().flex().items_center().justify_between().gap_2().child(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap_1()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div().text_xs().text_color(rgb(0x7f8a94)).child("Canvas"),
+                                    )
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .text_color(rgb(0x7cc7ff))
-                                    .child("Desks"),
-                                    )
-                                    .child(div().text_sm().child("Workdesks")),
+                                            .text_sm()
+                                            .text_color(rgb(0xdce2e8))
+                                            .child("Workdesks"),
+                                    ),
+                            ),
+                        )
+                    })
+                    .when(self.sidebar_collapsed, |sidebar| {
+                        sidebar
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(10.0))
+                                    .top(px(14.0 + sidebar_header_inset))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(chrome_button(
+                                        "N",
+                                        rgb(0x7cc7ff).into(),
+                                        self.notifications_open,
+                                        Some(self.mock_notifications_unread),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.toggle_notifications(cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ))
+                                    .child(chrome_button(
+                                        ">",
+                                        rgb(0x90a0aa).into(),
+                                        false,
+                                        None,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.toggle_sidebar_collapsed(cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    )),
                             )
-                            .child(compact_dock_button(
+                            .child(div().flex().justify_center().child(compact_dock_button(
                                 "+",
                                 rgb(0x77d19a).into(),
                                 cx.listener(|this, _, _, cx| {
                                     this.open_workdesk_creator(cx);
                                     cx.stop_propagation();
                                 }),
-                            )),
-                    )
+                            )))
+                    })
                     .child(
                         div()
                             .id("workdesk-rail-scroll")
@@ -5046,152 +7057,135 @@ impl Render for CanvasShell {
                             .flex()
                             .flex_col()
                             .gap_2()
+                            .when(self.sidebar_collapsed, |rail| rail.items_center())
                             .children(workdesk_cards),
                     ),
             )
             .child(
                 div()
                     .absolute()
-                    .left(px(SIDEBAR_WIDTH + FLOATING_DOCK_MARGIN))
-                    .bottom(px(FLOATING_DOCK_MARGIN))
+                    .left(px(sidebar_width))
+                    .bottom(px(0.0))
+                    .w(px((viewport_width - sidebar_width).max(240.0)))
                     .flex()
                     .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py(px(6.0))
-                    .bg(rgb(0x11181f))
-                    .border_1()
-                    .border_color(rgb(0x2a3640))
-                    .rounded_lg()
-                    .shadow_lg()
+                    .justify_between()
+                    .gap_4()
+                    .px_4()
+                    .py_2()
+                    .bg(rgba(0x0d1217f0))
+                    .border_t_1()
+                    .border_color(rgb(0x25303a))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
                     .on_scroll_wheel(|_, _, cx| {
                         cx.stop_propagation();
                     })
-                    .child(compact_dock_button(
-                        "Shell",
-                        rgb(0xe59a49).into(),
-                        cx.listener(|this, _, window, cx| {
-                            this.spawn_pane(PaneKind::Shell, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    ))
-                    .child(compact_dock_button(
-                        "Agent",
-                        rgb(0x7cc7ff).into(),
-                        cx.listener(|this, _, window, cx| {
-                            this.spawn_pane(PaneKind::Agent, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    ))
-                    .child(dock_divider())
-                    .child(compact_toggle_button(
-                        "Free",
-                        rgb(0x77d19a).into(),
-                        layout_mode == LayoutMode::Free,
-                        cx.listener(|this, _, _, cx| {
-                            this.set_layout_mode(LayoutMode::Free, cx);
-                            cx.stop_propagation();
-                        }),
-                    ))
-                    .child(compact_toggle_button(
-                        "Grid",
-                        rgb(0xf0d35f).into(),
-                        layout_mode == LayoutMode::Grid,
-                        cx.listener(|this, _, _, cx| {
-                            this.set_layout_mode(LayoutMode::Grid, cx);
-                            cx.stop_propagation();
-                        }),
-                    ))
-                    .child(compact_toggle_button(
-                        "Split",
-                        rgb(0x7cc7ff).into(),
-                        layout_mode == LayoutMode::ClassicSplit,
-                        cx.listener(|this, _, _, cx| {
-                            this.set_layout_mode(LayoutMode::ClassicSplit, cx);
-                            cx.stop_propagation();
-                        }),
-                    ))
-                    .child(dock_divider())
-                    .child(compact_toggle_button(
-                        "Keys",
-                        rgb(0xb4a4ff).into(),
-                        self.shortcut_editor.open,
-                        cx.listener(|this, _, _, cx| {
-                            this.toggle_shortcut_panel(cx);
-                            cx.stop_propagation();
-                        }),
-                    ))
-                    .when(layout_mode == LayoutMode::Grid, |dock| {
-                        dock.child(compact_toggle_button(
-                            "Expose",
-                            rgb(0xb4a4ff).into(),
-                            grid_expose_open,
-                            cx.listener(|this, _, _, cx| {
-                                this.toggle_grid_expose(cx);
-                                cx.stop_propagation();
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(0x7f8a94)).child("Create"))
+                            .child(compact_dock_button(
+                                "Shell",
+                                rgb(0xe59a49).into(),
+                                cx.listener(|this, _, window, cx| {
+                                    this.spawn_pane(PaneKind::Shell, window, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ))
+                            .child(compact_dock_button(
+                                "Agent",
+                                rgb(0x7cc7ff).into(),
+                                cx.listener(|this, _, window, cx| {
+                                    this.spawn_pane(PaneKind::Agent, window, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ))
+                            .child(compact_dock_button(
+                                "Browser",
+                                rgb(0x77d19a).into(),
+                                cx.listener(|this, _, window, cx| {
+                                    this.spawn_pane(PaneKind::Browser, window, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ))
+                            .child(compact_dock_button(
+                                "Editor",
+                                rgb(0xb4a4ff).into(),
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_editor_picker(cx);
+                                    cx.stop_propagation();
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(0x7f8a94)).child("Layout"))
+                            .child(compact_toggle_button(
+                                "Free",
+                                rgb(0x77d19a).into(),
+                                layout_mode == LayoutMode::Free,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_layout_mode(LayoutMode::Free, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ))
+                            .child(compact_toggle_button(
+                                "Grid",
+                                rgb(0xf0d35f).into(),
+                                layout_mode == LayoutMode::Grid,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_layout_mode(LayoutMode::Grid, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ))
+                            .child(compact_toggle_button(
+                                "Split",
+                                rgb(0x7cc7ff).into(),
+                                layout_mode == LayoutMode::ClassicSplit,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_layout_mode(LayoutMode::ClassicSplit, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ))
+                            .child(dock_divider())
+                            .child(compact_toggle_button(
+                                "Keys",
+                                rgb(0xb4a4ff).into(),
+                                self.shortcut_editor.open,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_shortcut_panel(cx);
+                                    cx.stop_propagation();
+                                }),
+                            ))
+                            .when(layout_mode == LayoutMode::Grid, |dock| {
+                                dock.child(compact_toggle_button(
+                                    "Expose",
+                                    rgb(0xb4a4ff).into(),
+                                    grid_expose_open,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.toggle_grid_expose(cx);
+                                        cx.stop_propagation();
+                                    }),
+                                ))
+                            })
+                            .when(layout_mode == LayoutMode::Free, |dock| {
+                                dock.child(dock_divider()).child(compact_dock_button(
+                                    "Fit",
+                                    rgb(0x77d19a).into(),
+                                    cx.listener(|this, _, window, cx| {
+                                        this.fit_to_panes(window, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                ))
                             }),
-                        ))
-                    })
-                    .when(layout_mode == LayoutMode::Free, |dock| {
-                        dock.child(dock_divider()).child(compact_dock_button(
-                            "Fit",
-                            rgb(0x77d19a).into(),
-                            cx.listener(|this, _, window, cx| {
-                                this.fit_to_panes(window, cx);
-                                cx.stop_propagation();
-                            }),
-                        ))
-                    }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(SIDEBAR_WIDTH + FLOATING_DOCK_MARGIN))
-                    .bottom(px(CONTEXT_STRIP_MARGIN_BOTTOM))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .max_w(px(
-                        (viewport_width - SIDEBAR_WIDTH - FLOATING_DOCK_MARGIN * 2.0).max(220.0),
-                    ))
-                    .bg(rgba(0x10161be8))
-                    .border_1()
-                    .border_color(rgb(0x2a3640))
-                    .rounded_lg()
-                    .shadow_lg()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_scroll_wheel(|_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(context_pill(context_title, context_accent))
-                    .child(context_pill(workdesk_intent, rgb(0x7f8a94).into()))
-                    .when_some(workdesk_status, |strip, status| {
-                        strip.child(context_pill(status, context_accent))
-                    })
-                    .when_some(workdesk_progress, |strip, progress| {
-                        strip.child(context_pill(progress, rgb(0x77d19a).into()))
-                    })
-                    .when(workdesk.active_pane.is_some(), |strip| {
-                        strip.child(context_pill(active_terminal_status.clone(), rgb(0x7cc7ff).into()))
-                    })
-                    .when(active_attention.state != AttentionState::Idle, |strip| {
-                        strip.child(context_pill(
-                            if active_attention.unread {
-                                format!("{} · unread", active_attention.state.label())
-                            } else {
-                                active_attention.state.label().to_string()
-                            },
-                            active_attention.state.tint(),
-                        ))
-                    })
-                    .child(context_pill(layout_hint, rgb(0x7f8a94).into())),
+                    ),
             )
             .when(show_inspector, |root| {
                 root.child(
@@ -5202,17 +7196,22 @@ impl Render for CanvasShell {
                         .w(px(viewport_width))
                         .h(px(viewport_height))
                         .bg(rgba(0x09101680))
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                            this.close_inspector(cx);
-                            cx.stop_propagation();
-                        })),
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_inspector(cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
                 )
                 .child(
                     div()
                         .absolute()
                         .top(px(72.0))
                         .right(px(FLOATING_DOCK_MARGIN))
-                        .w(px(INSPECTOR_PANEL_WIDTH.min((viewport_width - 32.0).max(280.0))))
+                        .w(px(
+                            INSPECTOR_PANEL_WIDTH.min((viewport_width - 32.0).max(280.0))
+                        ))
                         .flex()
                         .flex_col()
                         .gap_3()
@@ -5243,12 +7242,9 @@ impl Render for CanvasShell {
                                                 .child("Developer Inspector"),
                                         )
                                         .child(div().text_lg().child("Debug surface"))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(0x90a0aa))
-                                                .child(format!("Toggle with {}", inspector_toggle_label)),
-                                        ),
+                                        .child(div().text_xs().text_color(rgb(0x90a0aa)).child(
+                                            format!("Toggle with {}", inspector_toggle_label),
+                                        )),
                                 )
                                 .child(compact_dock_button(
                                     "Close",
@@ -5278,6 +7274,7 @@ impl Render for CanvasShell {
             })
             .children(shortcut_overlay)
             .when_some(workdesk_editor_overlay, |root, overlay| root.child(overlay))
+            .when_some(notification_overlay, |root, overlay| root.child(overlay))
             .when_some(workdesk.runtime_notice.clone(), |root, notice| {
                 root.child(
                     div()
@@ -5345,6 +7342,12 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(SharedString::from("Canvas")),
+                    appears_transparent: true,
+                    traffic_light_position: cfg!(target_os = "macos")
+                        .then(|| gpui::point(px(14.0), px(14.0))),
+                }),
                 ..Default::default()
             },
             move |window, cx| {
@@ -5539,22 +7542,25 @@ fn automation_listener_loop(listener: UnixListener, sender: Sender<AutomationEnv
                         let (response_tx, response_rx) = mpsc::channel();
                         let id = request.id.clone();
                         if sender
-                            .send(AutomationEnvelope { request, response_tx })
+                            .send(AutomationEnvelope {
+                                request,
+                                response_tx,
+                            })
                             .is_err()
                         {
                             AutomationResponse::error(id, "automation command queue is closed")
                         } else {
-                            response_rx
-                                .recv()
-                                .unwrap_or_else(|_| {
-                                    AutomationResponse::error(
-                                        id,
-                                        "automation command dropped before completion",
-                                    )
-                                })
+                            response_rx.recv().unwrap_or_else(|_| {
+                                AutomationResponse::error(
+                                    id,
+                                    "automation command dropped before completion",
+                                )
+                            })
                         }
                     }
-                    Err(error) => AutomationResponse::error(None, format!("invalid request: {error}")),
+                    Err(error) => {
+                        AutomationResponse::error(None, format!("invalid request: {error}"))
+                    }
                 };
 
                 let Ok(payload) = serde_json::to_vec(&response) else {
@@ -5639,60 +7645,60 @@ fn normalize_workdesk_draft(
 fn workdesk_from_template(template: WorkdeskTemplate, draft: WorkdeskDraft) -> WorkdeskState {
     let draft = normalize_workdesk_draft(draft, template.base_name(), template.summary());
     let panes = match template {
-        WorkdeskTemplate::ShellDesk => vec![PaneRecord {
-            id: PaneId::new(1),
-            title: "Shell 1".to_string(),
-            kind: PaneKind::Shell,
-            position: WorkdeskPoint::new(120.0, 96.0),
-            size: DEFAULT_SHELL_SIZE,
-        }],
+        WorkdeskTemplate::ShellDesk => vec![single_surface_pane(
+            1,
+            "Shell 1",
+            PaneKind::Shell,
+            WorkdeskPoint::new(120.0, 96.0),
+            DEFAULT_SHELL_SIZE,
+        )],
         WorkdeskTemplate::AgentReview => vec![
-            PaneRecord {
-                id: PaneId::new(1),
-                title: "Review Shell".to_string(),
-                kind: PaneKind::Shell,
-                position: WorkdeskPoint::new(80.0, 96.0),
-                size: DEFAULT_SHELL_SIZE,
-            },
-            PaneRecord {
-                id: PaneId::new(2),
-                title: "Review Agent".to_string(),
-                kind: PaneKind::Agent,
-                position: WorkdeskPoint::new(1048.0, 132.0),
-                size: DEFAULT_AGENT_SIZE,
-            },
+            single_surface_pane(
+                1,
+                "Review Shell",
+                PaneKind::Shell,
+                WorkdeskPoint::new(80.0, 96.0),
+                DEFAULT_SHELL_SIZE,
+            ),
+            single_surface_pane(
+                2,
+                "Review Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(1048.0, 132.0),
+                DEFAULT_AGENT_SIZE,
+            ),
         ],
         WorkdeskTemplate::Debug => vec![
-            PaneRecord {
-                id: PaneId::new(1),
-                title: "Repro Shell".to_string(),
-                kind: PaneKind::Shell,
-                position: WorkdeskPoint::new(80.0, 96.0),
-                size: DEFAULT_SHELL_SIZE,
-            },
-            PaneRecord {
-                id: PaneId::new(2),
-                title: "Debug Agent".to_string(),
-                kind: PaneKind::Agent,
-                position: WorkdeskPoint::new(1048.0, 120.0),
-                size: DEFAULT_AGENT_SIZE,
-            },
+            single_surface_pane(
+                1,
+                "Repro Shell",
+                PaneKind::Shell,
+                WorkdeskPoint::new(80.0, 96.0),
+                DEFAULT_SHELL_SIZE,
+            ),
+            single_surface_pane(
+                2,
+                "Debug Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(1048.0, 120.0),
+                DEFAULT_AGENT_SIZE,
+            ),
         ],
         WorkdeskTemplate::Implementation => vec![
-            PaneRecord {
-                id: PaneId::new(1),
-                title: "Build Shell".to_string(),
-                kind: PaneKind::Shell,
-                position: WorkdeskPoint::new(80.0, 96.0),
-                size: DEFAULT_SHELL_SIZE,
-            },
-            PaneRecord {
-                id: PaneId::new(2),
-                title: "Implement Agent".to_string(),
-                kind: PaneKind::Agent,
-                position: WorkdeskPoint::new(1048.0, 132.0),
-                size: DEFAULT_AGENT_SIZE,
-            },
+            single_surface_pane(
+                1,
+                "Build Shell",
+                PaneKind::Shell,
+                WorkdeskPoint::new(80.0, 96.0),
+                DEFAULT_SHELL_SIZE,
+            ),
+            single_surface_pane(
+                2,
+                "Implement Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(1048.0, 132.0),
+                DEFAULT_AGENT_SIZE,
+            ),
         ],
     };
 
@@ -5713,6 +7719,94 @@ fn compact_cwd_label(path: &str) -> String {
         return parts[0].to_string();
     }
     format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+}
+
+fn single_surface_pane(
+    raw_id: u64,
+    title: impl Into<String>,
+    kind: PaneKind,
+    position: WorkdeskPoint,
+    size: WorkdeskSize,
+) -> PaneRecord {
+    single_surface_pane_with_ids(
+        PaneId::new(raw_id),
+        SurfaceId::new(raw_id),
+        title,
+        kind,
+        position,
+        size,
+    )
+}
+
+fn single_surface_pane_with_ids(
+    pane_id: PaneId,
+    surface_id: SurfaceId,
+    title: impl Into<String>,
+    kind: PaneKind,
+    position: WorkdeskPoint,
+    size: WorkdeskSize,
+) -> PaneRecord {
+    let title = title.into();
+    PaneRecord::new(
+        pane_id,
+        position,
+        size,
+        SurfaceRecord::new(surface_id, title, kind),
+        None,
+    )
+}
+
+fn baseline_attention_state_for_kind(kind: &SurfaceKind) -> AttentionState {
+    match kind {
+        SurfaceKind::Agent => AttentionState::Working,
+        SurfaceKind::Shell | SurfaceKind::Browser | SurfaceKind::Editor => AttentionState::Idle,
+    }
+}
+
+fn surface_kind_slug(kind: &SurfaceKind) -> &'static str {
+    match kind {
+        SurfaceKind::Shell => "shell",
+        SurfaceKind::Agent => "agent",
+        SurfaceKind::Browser => "browser",
+        SurfaceKind::Editor => "editor",
+    }
+}
+
+fn default_size_for_kind(kind: &PaneKind) -> WorkdeskSize {
+    match kind {
+        PaneKind::Shell => DEFAULT_SHELL_SIZE,
+        PaneKind::Agent => DEFAULT_AGENT_SIZE,
+        PaneKind::Browser => WorkdeskSize::new(980.0, 640.0),
+        PaneKind::Editor => WorkdeskSize::new(920.0, 620.0),
+    }
+}
+
+fn base_label_for_kind(kind: &PaneKind) -> &'static str {
+    match kind {
+        PaneKind::Shell => "Shell",
+        PaneKind::Agent => "Agent",
+        PaneKind::Browser => "Browser",
+        PaneKind::Editor => "Editor",
+    }
+}
+
+fn browser_title(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .filter(|host| !host.is_empty())
+        .unwrap_or("Browser")
+        .to_string()
+}
+
+fn canonical_path_string(path: &str) -> String {
+    PathBuf::from(path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(path))
+        .display()
+        .to_string()
 }
 
 fn editable_keystroke_text(keystroke: &Keystroke) -> Option<String> {
@@ -5754,7 +7848,9 @@ fn json_optional_string_at(params: &Value, keys: &[&str]) -> Result<Option<Strin
     match json_value_at(params, keys) {
         None => Ok(None),
         Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => Ok((!value.trim().is_empty()).then(|| value.trim().to_string())),
+        Some(Value::String(value)) => {
+            Ok((!value.trim().is_empty()).then(|| value.trim().to_string()))
+        }
         Some(_) => Err(format!("expected string or null for `{}`", keys[0])),
     }
 }
@@ -5775,6 +7871,8 @@ fn parse_pane_kind(value: &str) -> Option<PaneKind> {
     match value {
         "shell" => Some(PaneKind::Shell),
         "agent" => Some(PaneKind::Agent),
+        "browser" => Some(PaneKind::Browser),
+        "editor" => Some(PaneKind::Editor),
         _ => None,
     }
 }
@@ -5809,20 +7907,19 @@ fn automation_pane_json(desk: &WorkdeskState, pane_id: PaneId, desk_active: bool
         .expect("automation pane target should exist");
     let attention = desk.pane_attention(pane_id);
     let status = desk
-        .terminal_statuses
-        .get(&pane_id)
+        .active_terminal_surface_id_for_pane(pane_id)
+        .and_then(|surface_id| desk.terminal_statuses.get(&surface_id))
         .cloned()
         .unwrap_or(None);
 
     json!({
         "id": pane.id.raw(),
         "title": pane.title,
-        "kind": match pane.kind {
-            PaneKind::Shell => "shell",
-            PaneKind::Agent => "agent",
-        },
+        "kind": surface_kind_slug(&pane.kind),
         "focused": desk.active_pane == Some(pane_id),
         "desk_active": desk_active,
+        "active_surface_id": pane.active_surface_id.raw(),
+        "surface_count": pane.surfaces.len(),
         "attention": {
             "state": attention.state,
             "unread": attention.unread,
@@ -5830,6 +7927,41 @@ fn automation_pane_json(desk: &WorkdeskState, pane_id: PaneId, desk_active: bool
             "last_activity_sequence": attention.last_activity_sequence,
         },
         "status": status,
+        "surfaces": pane
+            .surfaces
+            .iter()
+            .map(|surface| automation_surface_json(desk, pane_id, surface))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn automation_surface_json(
+    desk: &WorkdeskState,
+    pane_id: PaneId,
+    surface: &SurfaceRecord,
+) -> Value {
+    let status = surface
+        .kind
+        .is_terminal()
+        .then(|| {
+            desk.terminal_statuses
+                .get(&surface.id)
+                .cloned()
+                .unwrap_or(None)
+        })
+        .flatten();
+
+    json!({
+        "id": surface.id.raw(),
+        "title": surface.title,
+        "kind": surface_kind_slug(&surface.kind),
+        "active": desk
+            .pane(pane_id)
+            .is_some_and(|pane| pane.active_surface_id == surface.id),
+        "status": status,
+        "dirty": surface.dirty,
+        "url": surface.browser_url,
+        "file_path": surface.editor_file_path,
     })
 }
 
@@ -5882,7 +8014,12 @@ fn blank_workdesk(name: impl Into<String>, summary: impl Into<String>) -> Workde
 fn boot_workdesk_terminals(workdesk: &mut WorkdeskState) {
     let panes_to_boot = workdesk.panes.clone();
     for pane in panes_to_boot {
-        workdesk.attach_terminal_session(pane.id, &pane.kind, &pane.title, pane.size);
+        let grid = terminal_grid_size_for_pane(pane.size, pane.surfaces.len());
+        for surface in pane.surfaces {
+            if surface.kind.is_terminal() {
+                workdesk.attach_terminal_session(surface.id, &surface.kind, &surface.title, grid);
+            }
+        }
     }
 }
 
@@ -5894,6 +8031,9 @@ fn shutdown_workdesk_terminals(workdesk: &mut WorkdeskState) {
     workdesk.terminal_revisions.clear();
     workdesk.terminal_statuses.clear();
     workdesk.terminal_views.clear();
+    workdesk.terminal_grids.clear();
+    workdesk.editors.clear();
+    workdesk.editor_views.clear();
 }
 
 fn workdesk_card(
@@ -5935,9 +8075,9 @@ fn workdesk_card(
         .map(|pane_id| desk.pane_attention(pane_id).state)
         .unwrap_or(AttentionState::Idle);
     let live_label = if desk.terminals.is_empty() {
-        "Idle".to_string()
+        "idle".to_string()
     } else {
-        format!("Live {}", desk.terminals.len())
+        format!("live {}", desk.terminals.len())
     };
     let intent_label = desk.intent_label();
     let cwd_label = compact_cwd_label(&desk.metadata.cwd);
@@ -5950,16 +8090,22 @@ fn workdesk_card(
         .unwrap_or_else(|| desk.metadata.branch.clone());
     let status_label = desk.status_label();
     let progress_label = desk.progress_label();
-    let desk_label = if is_active {
-        "Active".to_string()
+    let deck_label = if is_active {
+        "ACTIVE".to_string()
     } else {
-        format!("Desk {}", index + 1)
+        format!("{:02}", index + 1)
     };
+    let preview_label = if preview.trim().is_empty() {
+        focus_label.clone()
+    } else {
+        preview
+    };
+    let meta_line = format!("{cwd_label} · {branch_label} · {} panes", desk.panes.len());
 
     div()
         .flex()
         .flex_col()
-        .gap_2()
+        .gap_1()
         .p_2()
         .bg(background)
         .border_1()
@@ -5988,12 +8134,7 @@ fn workdesk_card(
                             attention_summary.highest,
                             attention_summary.unread_count > 0,
                         ))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(accent)
-                                .child(desk_label),
-                        ),
+                        .child(div().text_sm().child(desk.name.clone())),
                 )
                 .child(
                     div()
@@ -6007,36 +8148,40 @@ fn workdesk_card(
                                 .rounded_full()
                                 .bg(rgb(0x0c1116))
                                 .text_xs()
-                                .text_color(rgb(0x9da8b1))
-                                .child(live_label),
+                                .text_color(accent)
+                                .child(deck_label),
                         )
+                        .when(attention_summary.unread_count > 0, |row| {
+                            row.child(
+                                div()
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .rounded_full()
+                                    .bg(rgb(0x0c1116))
+                                    .border_1()
+                                    .border_color(attention_tint)
+                                    .text_xs()
+                                    .text_color(attention_tint)
+                                    .child(format!("{} unread", attention_summary.unread_count)),
+                            )
+                        })
                         .child(
                             div()
                                 .px_2()
                                 .py(px(2.0))
                                 .rounded_full()
                                 .bg(rgb(0x0c1116))
-                                .border_1()
-                                .border_color(if attention_summary.unread_count > 0 {
-                                    attention_tint
-                                } else {
-                                    rgb(0x24313b).into()
-                                })
                                 .text_xs()
-                                .text_color(if attention_summary.unread_count > 0 {
-                                    attention_tint
-                                } else {
-                                    rgb(0x9da8b1).into()
-                                })
-                                .child(format!("{}", attention_summary.unread_count)),
+                                .text_color(rgb(0x9da8b1))
+                                .child(live_label),
                         )
                         .child(
                             div()
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .w(px(24.0))
-                                .h(px(24.0))
+                                .w(px(22.0))
+                                .h(px(22.0))
                                 .bg(if is_menu_open {
                                     rgb(0x1c2730)
                                 } else {
@@ -6052,32 +8197,34 @@ fn workdesk_card(
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })
-                                        .on_mouse_up(MouseButton::Left, menu_button_listener)
+                                .on_mouse_up(MouseButton::Left, menu_button_listener)
                                 .child(div().text_xs().text_color(rgb(0x9da8b1)).child("•••")),
                         ),
                 ),
         )
-        .child(div().text_sm().child(desk.name.clone()))
-        .child(
-            div()
-                .text_xs()
-                .text_color(accent)
-                .child(intent_label),
-        )
+        .child(div().text_xs().text_color(accent).child(intent_label))
         .child(
             div()
                 .text_xs()
                 .text_color(rgb(0x9aa6af))
-                .child(preview),
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(preview_label),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x6f7c86))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(meta_line),
         )
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap_1()
-                .flex_wrap()
-                .child(context_pill(cwd_label, rgb(0x7f8a94).into()))
-                .child(context_pill(branch_label, rgb(0x7cc7ff).into()))
+                .justify_between()
+                .gap_2()
                 .when_some(progress_label, |row, progress| {
                     row.child(context_pill(progress, rgb(0x77d19a).into()))
                 })
@@ -6086,44 +8233,73 @@ fn workdesk_card(
                 }),
         )
         .child(
+            div().flex().items_center().justify_between().gap_2().child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(attention_indicator(focus_attention, false))
+                    .child(div().text_xs().text_color(rgb(0x7f8a94)).child(focus_label)),
+            ),
+        )
+}
+
+fn workdesk_compact_chip(
+    index: usize,
+    desk: &WorkdeskState,
+    is_active: bool,
+    accent: gpui::Hsla,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    context_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let attention_summary = desk.workdesk_attention_summary();
+    let border = if is_active {
+        accent
+    } else if attention_summary.unread_count > 0 {
+        attention_summary.highest.tint()
+    } else {
+        rgb(0x24313b).into()
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .w(px(52.0))
+        .min_h(px(56.0))
+        .p_2()
+        .bg(if is_active {
+            rgb(0x141c23)
+        } else {
+            rgb(0x0f151b)
+        })
+        .border_1()
+        .border_color(border)
+        .rounded_lg()
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_down(MouseButton::Right, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, listener)
+        .on_mouse_up(MouseButton::Right, context_listener)
+        .child(attention_indicator(
+            attention_summary.highest,
+            attention_summary.unread_count > 0,
+        ))
+        .child(
             div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(attention_indicator(focus_attention, false))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x7f8a94))
-                                .child(focus_label),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x6f7c86))
-                                .child(format!("{}", desk.panes.len())),
-                        )
-                        .when(attention_summary.unread_count > 0, |row| {
-                            row.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(attention_tint)
-                                    .child(format!("{} unread", attention_summary.unread_count)),
-                            )
-                        }),
-                ),
+                .text_xs()
+                .text_color(if is_active {
+                    accent
+                } else {
+                    rgb(0x9da8b1).into()
+                })
+                .child(format!("{:02}", index + 1)),
         )
 }
 
@@ -6133,8 +8309,16 @@ fn workdesk_template_card(
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let accent = template.accent();
-    let border = if selected { accent } else { rgb(0x293742).into() };
-    let background = if selected { rgb(0x17212a) } else { rgb(0x121920) };
+    let border = if selected {
+        accent
+    } else {
+        rgb(0x293742).into()
+    };
+    let background = if selected {
+        rgb(0x17212a)
+    } else {
+        rgb(0x121920)
+    };
 
     div()
         .flex()
@@ -6254,10 +8438,10 @@ fn shortcut_binding_button(
 
     div()
         .flex()
-        .items_center()
+        .items_start()
         .justify_center()
-        .min_w(px(134.0))
-        .px_3()
+        .min_w(px(104.0))
+        .px_2()
         .py_2()
         .cursor_pointer()
         .bg(background)
@@ -6293,9 +8477,9 @@ fn shortcut_row(
 
     div()
         .flex()
-        .justify_between()
-        .items_center()
-        .gap_4()
+        .flex_col()
+        .items_start()
+        .gap_3()
         .p_3()
         .bg(background)
         .border_1()
@@ -6317,6 +8501,9 @@ fn shortcut_row(
         .child(
             div()
                 .flex()
+                .items_center()
+                .justify_between()
+                .flex_wrap()
                 .items_center()
                 .gap_2()
                 .child(shortcut_binding_button(
@@ -6389,6 +8576,66 @@ fn compact_dock_button(
         .child(div().text_xs().text_color(accent).child(label))
 }
 
+fn chrome_button(
+    label: &str,
+    accent: gpui::Hsla,
+    active: bool,
+    badge: Option<usize>,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let label = label.to_string();
+    let background = if active { rgb(0x1b2730) } else { rgb(0x161d24) };
+    let border = if active { accent } else { rgb(0x2b3641).into() };
+    let badge_label = badge.and_then(|value| {
+        if value == 0 {
+            None
+        } else if value > 9 {
+            Some("9+".to_string())
+        } else {
+            Some(value.to_string())
+        }
+    });
+
+    div()
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .min_w(px(28.0))
+        .h(px(24.0))
+        .px_2()
+        .cursor_pointer()
+        .bg(background)
+        .border_1()
+        .border_color(border)
+        .rounded_md()
+        .font_family(".ZedMono")
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, listener)
+        .child(div().text_xs().text_color(accent).child(label))
+        .when_some(badge_label, |button, badge| {
+            button.child(
+                div()
+                    .absolute()
+                    .right(px(-6.0))
+                    .top(px(-6.0))
+                    .min_w(px(16.0))
+                    .h(px(16.0))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(rgb(0x7cc7ff))
+                    .border_1()
+                    .border_color(rgb(0x0d1217))
+                    .child(div().text_xs().text_color(rgb(0x071015)).child(badge)),
+            )
+        })
+}
+
 fn compact_toggle_button(
     label: &str,
     accent: gpui::Hsla,
@@ -6420,6 +8667,38 @@ fn compact_toggle_button(
 
 fn dock_divider() -> impl IntoElement {
     div().w(px(1.0)).h(px(24.0)).bg(rgb(0x2b3641))
+}
+
+fn notification_item(
+    title: &str,
+    detail: &str,
+    accent: gpui::Hsla,
+    unread: bool,
+) -> impl IntoElement {
+    let title = title.to_string();
+    let detail = detail.to_string();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_3()
+        .bg(if unread { rgb(0x131c25) } else { rgb(0x10171d) })
+        .border_1()
+        .border_color(if unread { accent } else { rgb(0x24313b).into() })
+        .rounded_lg()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(div().text_sm().text_color(accent).child(title))
+                .when(unread, |row| {
+                    row.child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(accent))
+                }),
+        )
+        .child(div().text_xs().text_color(rgb(0x95a3ad)).child(detail))
 }
 
 fn status_chip(label: &str, value: String) -> impl IntoElement {
@@ -6478,7 +8757,11 @@ fn signal_dot(color: gpui::Hsla, filled: bool) -> impl IntoElement {
         .w(px(8.0))
         .h(px(8.0))
         .rounded_full()
-        .bg(if filled { color } else { rgba(0x00000000).into() })
+        .bg(if filled {
+            color
+        } else {
+            rgba(0x00000000).into()
+        })
         .border_1()
         .border_color(color)
 }
@@ -6520,6 +8803,8 @@ fn pane_accent(kind: &PaneKind) -> gpui::Hsla {
     match kind {
         PaneKind::Shell => rgb(0xe59a49).into(),
         PaneKind::Agent => rgb(0x7cc7ff).into(),
+        PaneKind::Browser => rgb(0x77d19a).into(),
+        PaneKind::Editor => rgb(0xb4a4ff).into(),
     }
 }
 
@@ -6527,6 +8812,8 @@ fn pane_kind_label(kind: &PaneKind) -> &'static str {
     match kind {
         PaneKind::Shell => "Shell pane",
         PaneKind::Agent => "Agent pane",
+        PaneKind::Browser => "Browser pane",
+        PaneKind::Editor => "Editor pane",
     }
 }
 
@@ -6536,12 +8823,13 @@ fn grid_hint_card(
     pane: &PaneRecord,
     viewport_width: f32,
     viewport_height: f32,
+    sidebar_width: f32,
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let accent = pane_accent(&pane.kind);
     let (left, top) = match direction {
         GridDirection::Left => (
-            SIDEBAR_WIDTH + 18.0,
+            sidebar_width + 18.0,
             (viewport_height - GRID_HINT_HEIGHT) * 0.5,
         ),
         GridDirection::Right => (
@@ -6549,11 +8837,11 @@ fn grid_hint_card(
             (viewport_height - GRID_HINT_HEIGHT) * 0.5,
         ),
         GridDirection::Up => (
-            SIDEBAR_WIDTH + (viewport_width - SIDEBAR_WIDTH - GRID_HINT_WIDTH) * 0.5,
+            sidebar_width + (viewport_width - sidebar_width - GRID_HINT_WIDTH) * 0.5,
             18.0,
         ),
         GridDirection::Down => (
-            SIDEBAR_WIDTH + (viewport_width - SIDEBAR_WIDTH - GRID_HINT_WIDTH) * 0.5,
+            sidebar_width + (viewport_width - sidebar_width - GRID_HINT_WIDTH) * 0.5,
             viewport_height - GRID_HINT_HEIGHT - 18.0,
         ),
     };
@@ -6612,6 +8900,7 @@ fn expose_layout_frame(
     panes: &[PaneRecord],
     viewport_width: f32,
     viewport_height: f32,
+    sidebar_width: f32,
 ) -> Option<ExposeLayoutFrame> {
     let first = panes.first()?;
     let mut min_x = first.position.x;
@@ -6626,7 +8915,7 @@ fn expose_layout_frame(
         max_y = max_y.max(pane.position.y + pane.size.height);
     }
 
-    let available_width = (viewport_width - SIDEBAR_WIDTH - EXPOSE_MARGIN_X * 2.0).max(1.0);
+    let available_width = (viewport_width - sidebar_width - EXPOSE_MARGIN_X * 2.0).max(1.0);
     let available_height = (viewport_height - EXPOSE_MARGIN_TOP - EXPOSE_MARGIN_BOTTOM).max(1.0);
     let content_width = (max_x - min_x).max(1.0);
     let content_height = (max_y - min_y).max(1.0);
@@ -6903,6 +9192,7 @@ fn split_layout_frames(
     _active_pane: Option<PaneId>,
     viewport_width: f32,
     viewport_height: f32,
+    sidebar_width: f32,
 ) -> Vec<(PaneId, PaneViewportFrame)> {
     if panes.is_empty() {
         return Vec::new();
@@ -6931,9 +9221,9 @@ fn split_layout_frames(
     });
 
     let rect = SplitRect {
-        x: SIDEBAR_WIDTH + SPLIT_MARGIN_X,
+        x: sidebar_width + SPLIT_MARGIN_X,
         y: SPLIT_MARGIN_TOP,
-        width: (viewport_width - SIDEBAR_WIDTH - SPLIT_MARGIN_X * 2.0).max(MIN_PANE_WIDTH),
+        width: (viewport_width - sidebar_width - SPLIT_MARGIN_X * 2.0).max(MIN_PANE_WIDTH),
         height: (viewport_height - SPLIT_MARGIN_TOP - SPLIT_MARGIN_BOTTOM).max(MIN_PANE_HEIGHT),
     };
 
@@ -7094,31 +9384,6 @@ fn directional_projection_for_frames(frames: &[(PaneId, PaneViewportFrame)]) -> 
     projection
 }
 
-fn terminal_footer_label(snapshot: &Option<TerminalSnapshot>) -> String {
-    let Some(snapshot) = snapshot else {
-        return "offline".to_string();
-    };
-
-    let mode = if snapshot.alternate_screen {
-        "alt"
-    } else {
-        "main"
-    };
-    let status = snapshot
-        .status
-        .clone()
-        .unwrap_or_else(|| "running".to_string());
-
-    if snapshot.scrollbar.total > snapshot.scrollbar.visible && snapshot.scrollbar.offset > 0 {
-        format!(
-            "{mode} {}x{} scroll {}/{} {status}",
-            snapshot.cols, snapshot.rows_count, snapshot.scrollbar.offset, snapshot.scrollbar.total
-        )
-    } else {
-        format!("{mode} {}x{} {status}", snapshot.cols, snapshot.rows_count)
-    }
-}
-
 fn infer_attention_state_from_snapshot(
     pane_kind: &PaneKind,
     snapshot: &TerminalSnapshot,
@@ -7143,7 +9408,7 @@ fn infer_attention_state_from_snapshot(
 
     match pane_kind {
         PaneKind::Agent => AttentionState::Working,
-        PaneKind::Shell => AttentionState::Idle,
+        PaneKind::Shell | PaneKind::Browser | PaneKind::Editor => AttentionState::Idle,
     }
 }
 
@@ -7154,7 +9419,9 @@ fn post_attention_notification(title: String, body: String) {
         let body = escape_applescript_string(&body);
         let _ = Command::new("osascript")
             .arg("-e")
-            .arg(format!("display notification \"{body}\" with title \"{title}\""))
+            .arg(format!(
+                "display notification \"{body}\" with title \"{title}\""
+            ))
             .spawn();
     }
 }
@@ -7163,16 +9430,309 @@ fn escape_applescript_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn surface_stack_chip(
+    surface: &SurfaceRecord,
+    active: bool,
+    accent: gpui::Hsla,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let border = if active { accent } else { rgb(0x2b3641).into() };
+    let background = if active { rgb(0x1c2630) } else { rgb(0x151c23) };
+    let label = if surface.dirty {
+        format!("{}*", surface.title)
+    } else {
+        surface.title.clone()
+    };
+
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .max_w(px(196.0))
+        .px_2()
+        .py_1()
+        .cursor_pointer()
+        .bg(background)
+        .border_1()
+        .border_color(border)
+        .rounded_md()
+        .overflow_hidden()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, listener)
+        .child(
+            div()
+                .text_xs()
+                .text_color(accent)
+                .child(surface_kind_slug(&surface.kind)),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0xdce2e8))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(label),
+        )
+}
+
+fn browser_preview_card(
+    url: &str,
+    accent: gpui::Hsla,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let host = browser_title(url);
+
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .justify_between()
+        .gap_4()
+        .p_4()
+        .bg(rgb(0x0f151a))
+        .border_1()
+        .border_color(rgb(0x24303a))
+        .rounded_md()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().text_xs().text_color(accent).child("Browser preview"))
+                .child(div().text_lg().child(host))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xa8b5be))
+                        .child(url.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x7f8a94))
+                        .child("URL is persisted on the surface and can be reopened externally."),
+                )
+                .child(control_button("Open external", accent, listener)),
+        )
+}
+
+fn editor_language_label(editor: &EditorBuffer) -> &'static str {
+    match editor.language() {
+        canvas_editor::LanguageKind::Plaintext => "Plaintext",
+        canvas_editor::LanguageKind::Rust => "Rust",
+        canvas_editor::LanguageKind::JavaScript => "JavaScript",
+        canvas_editor::LanguageKind::TypeScript => "TypeScript",
+        canvas_editor::LanguageKind::Tsx => "TSX",
+        canvas_editor::LanguageKind::Jsx => "JSX",
+        canvas_editor::LanguageKind::Json => "JSON",
+        canvas_editor::LanguageKind::Toml => "TOML",
+        canvas_editor::LanguageKind::Yaml => "YAML",
+        canvas_editor::LanguageKind::Markdown => "Markdown",
+    }
+}
+
+fn editor_font_for_kind(kind: HighlightKind) -> gpui::Font {
+    let mut font = font(".ZedMono");
+    match kind {
+        HighlightKind::Keyword | HighlightKind::Type => font.weight = FontWeight::BOLD,
+        HighlightKind::Comment => font.style = FontStyle::Italic,
+        HighlightKind::Plain | HighlightKind::String | HighlightKind::Number => {}
+    }
+    font
+}
+
+fn editor_text_color_for_kind(kind: HighlightKind) -> gpui::Hsla {
+    match kind {
+        HighlightKind::Plain => rgb(0xdce2e8).into(),
+        HighlightKind::Comment => rgb(0x72808a).into(),
+        HighlightKind::String => rgb(0xb8d98f).into(),
+        HighlightKind::Keyword => rgb(0xf5c07a).into(),
+        HighlightKind::Number => rgb(0x8fd0ff).into(),
+        HighlightKind::Type => rgb(0xcaa6ff).into(),
+    }
+}
+
+fn editor_line_display(
+    editor: &EditorBuffer,
+    line_index: usize,
+    is_active: bool,
+    cursor_blink_visible: bool,
+) -> StyledText {
+    let line_range = editor.line_range(line_index);
+    let line_text = editor.line_text(line_index);
+    let mut display_text = line_text.to_string();
+    let selection = editor.selection().range.clone();
+    let search_match = editor.current_search_match();
+    let cursor_offset = editor.cursor_offset();
+    let show_cursor = is_active && cursor_blink_visible && selection.is_empty();
+    let append_cursor_cell = show_cursor && cursor_offset == line_range.end;
+
+    if display_text.is_empty() || append_cursor_cell {
+        display_text.push(' ');
+    }
+
+    let highlights = editor.highlight_line(line_index);
+    let original_len = line_text.len();
+    let mut runs: Vec<TextRun> = Vec::new();
+
+    for (start, ch) in display_text.char_indices() {
+        let synthetic = start >= original_len;
+        let absolute_start = if synthetic {
+            line_range.end
+        } else {
+            line_range.start + start
+        };
+        let absolute_end = if synthetic {
+            line_range.end
+        } else {
+            (absolute_start + ch.len_utf8()).min(line_range.end)
+        };
+        let highlight = if synthetic {
+            HighlightKind::Plain
+        } else {
+            highlights
+                .iter()
+                .find(|span| span.range.start <= start && start < span.range.end)
+                .map(|span| span.kind)
+                .unwrap_or(HighlightKind::Plain)
+        };
+        let mut background = None;
+        let mut color = editor_text_color_for_kind(highlight);
+
+        if !selection.is_empty()
+            && absolute_start < selection.end
+            && absolute_end.max(absolute_start + 1) > selection.start
+        {
+            background = Some(rgb(0x2d5b88).into());
+            color = rgb(0xf4f8fb).into();
+        } else if search_match.as_ref().is_some_and(|range| {
+            absolute_start < range.end && absolute_end.max(absolute_start + 1) > range.start
+        }) {
+            background = Some(rgb(0x3b3530).into());
+        }
+
+        if show_cursor && absolute_start == cursor_offset {
+            background = Some(rgb(0xdce2e8).into());
+            color = rgb(0x10161b).into();
+        }
+
+        let font = editor_font_for_kind(highlight);
+        if let Some(last) = runs.last_mut() {
+            if last.font == font
+                && last.color == color
+                && last.background_color == background
+                && last.underline.is_none()
+                && last.strikethrough.is_none()
+            {
+                last.len += ch.len_utf8();
+                continue;
+            }
+        }
+
+        runs.push(TextRun {
+            len: ch.len_utf8(),
+            font,
+            color,
+            background_color: background,
+            underline: None,
+            strikethrough: None,
+        });
+    }
+
+    StyledText::new(display_text).with_runs(runs)
+}
+
+fn terminal_header_height_for_surface_count(surface_count: usize) -> f32 {
+    if surface_count > 1 {
+        58.0
+    } else {
+        38.0
+    }
+}
+
+fn terminal_font_size_for_zoom(zoom: f32) -> f32 {
+    TERMINAL_FONT_SIZE * zoom.clamp(0.84, 1.18)
+}
+
+fn terminal_line_height_for_zoom(zoom: f32) -> f32 {
+    TERMINAL_CELL_HEIGHT * zoom.clamp(0.88, 1.18)
+}
+
+fn terminal_cell_width_for_zoom(zoom: f32) -> f32 {
+    TERMINAL_CELL_WIDTH * zoom.clamp(0.84, 1.18)
+}
+
+fn terminal_text_metrics(window: &Window, zoom: f32) -> TerminalTextMetrics {
+    let font_size = terminal_font_size_for_zoom(zoom);
+    let fallback_line_height = terminal_line_height_for_zoom(zoom);
+    let fallback_cell_width = terminal_cell_width_for_zoom(zoom);
+    let font_id = window
+        .text_system()
+        .resolve_font(&font(TERMINAL_FONT_FAMILY));
+    let cell_width = window
+        .text_system()
+        .ch_advance(font_id, px(font_size))
+        .map(f32::from)
+        .unwrap_or(fallback_cell_width)
+        .max(1.0);
+    let text_height = f32::from(window.text_system().ascent(font_id, px(font_size)))
+        + f32::from(window.text_system().descent(font_id, px(font_size)));
+    let line_height = fallback_line_height.max(text_height.ceil() + 1.0);
+
+    TerminalTextMetrics {
+        font_size,
+        line_height,
+        cell_width,
+    }
+}
+
+fn terminal_grid_size_for_pane(size: WorkdeskSize, surface_count: usize) -> TerminalGridSize {
+    let horizontal_chrome = TERMINAL_BODY_INSET * 2.0 + 24.0;
+    let vertical_chrome =
+        terminal_header_height_for_surface_count(surface_count) + TERMINAL_BODY_INSET * 2.0 + 24.0;
+    let cols = ((size.width - horizontal_chrome) / terminal_cell_width_for_zoom(1.0))
+        .floor()
+        .max(40.0) as u16;
+    let rows = ((size.height - vertical_chrome) / terminal_line_height_for_zoom(1.0))
+        .floor()
+        .max(10.0) as u16;
+
+    TerminalGridSize::new(cols, rows)
+}
+
+fn terminal_grid_size_for_frame(
+    frame: PaneViewportFrame,
+    surface_count: usize,
+    metrics: TerminalTextMetrics,
+) -> TerminalGridSize {
+    let header_height =
+        terminal_header_height_for_surface_count(surface_count) * frame.zoom.clamp(0.78, 1.3);
+    let pane_padding = 12.0 * frame.zoom.clamp(0.85, 1.25);
+    let content_width = (frame.width - pane_padding * 2.0 - TERMINAL_BODY_INSET * 2.0).max(1.0);
+    let content_height =
+        (frame.height - header_height - pane_padding * 2.0 - TERMINAL_BODY_INSET * 2.0).max(1.0);
+    let cols = (content_width / metrics.cell_width).floor().max(40.0) as u16;
+    let rows = (content_height / metrics.line_height).floor().max(10.0) as u16;
+
+    TerminalGridSize::new(cols, rows)
+}
+
 fn terminal_body(
     snapshot: &Option<TerminalSnapshot>,
     terminal_view: &TerminalViewState,
-    zoom: f32,
+    metrics: TerminalTextMetrics,
     is_active: bool,
     cursor_blink_visible: bool,
 ) -> impl IntoElement {
-    let font_size = 12.0 * zoom.clamp(0.8, 1.2);
-    let line_height = 15.0 * zoom.clamp(0.85, 1.2);
-
     match snapshot {
         Some(snapshot) => {
             let rows = snapshot
@@ -7180,17 +9740,15 @@ fn terminal_body(
                 .iter()
                 .enumerate()
                 .map(|(row_index, row)| {
-                    div()
-                        .h(px(line_height))
-                        .whitespace_nowrap()
-                        .child(terminal_row_display(
-                            snapshot,
-                            terminal_view.selection,
-                            row_index,
-                            row,
-                            is_active,
-                            cursor_blink_visible,
-                        ))
+                    terminal_row_element(
+                        snapshot,
+                        terminal_view.selection,
+                        row_index,
+                        row,
+                        metrics,
+                        is_active,
+                        cursor_blink_visible,
+                    )
                 })
                 .collect::<Vec<_>>();
 
@@ -7202,9 +9760,9 @@ fn terminal_body(
                 .border_1()
                 .border_color(rgb(0x25303a))
                 .rounded_md()
-                .font_family(".ZedMono")
-                .text_size(px(font_size))
-                .line_height(px(line_height))
+                .font_family(TERMINAL_FONT_FAMILY)
+                .text_size(px(metrics.font_size))
+                .line_height(px(metrics.line_height))
                 .text_color(terminal_color_hsla(snapshot.theme.foreground))
                 .children(rows)
         }
@@ -7216,56 +9774,31 @@ fn terminal_body(
             .border_1()
             .border_color(rgb(0x25303a))
             .rounded_md()
-            .font_family(".ZedMono")
-            .text_size(px(font_size))
-            .line_height(px(line_height))
+            .font_family(TERMINAL_FONT_FAMILY)
+            .text_size(px(metrics.font_size))
+            .line_height(px(metrics.line_height))
             .text_color(rgb(0xffb7a6))
             .child("terminal offline"),
     }
 }
 
-fn terminal_row_display(
+fn terminal_row_element(
     snapshot: &TerminalSnapshot,
     selection: Option<TerminalSelection>,
     row_index: usize,
     row: &TerminalRow,
+    metrics: TerminalTextMetrics,
     is_active: bool,
     cursor_blink_visible: bool,
-) -> StyledText {
-    StyledText::new(terminal_row_text(row)).with_runs(terminal_row_runs(
-        snapshot,
-        selection,
-        row_index,
-        row,
-        is_active,
-        cursor_blink_visible,
-    ))
-}
-
-fn terminal_row_text(row: &TerminalRow) -> String {
-    row.runs
-        .iter()
-        .map(|run| run.text.as_str())
-        .collect::<String>()
-}
-
-fn terminal_row_runs(
-    snapshot: &TerminalSnapshot,
-    selection: Option<TerminalSelection>,
-    row_index: usize,
-    row: &TerminalRow,
-    is_active: bool,
-    cursor_blink_visible: bool,
-) -> Vec<TextRun> {
+) -> gpui::AnyElement {
     let cursor_row = usize::from(snapshot.cursor.0);
     let cursor_col = usize::from(snapshot.cursor.1);
     let show_cursor = !snapshot.closed
         && is_active
         && row_index == cursor_row
         && (cursor_blink_visible || !snapshot.cursor_blinking);
-
-    let mut runs: Vec<TextRun> = Vec::new();
     let mut cell_index = 0usize;
+    let mut cells = Vec::new();
 
     for run in &row.runs {
         for ch in run.text.chars() {
@@ -7285,65 +9818,61 @@ fn terminal_row_runs(
                 style.foreground = snapshot.theme.background;
             }
 
-            let text = ch.to_string();
-            if let Some(last) = runs.last_mut() {
-                if last.font == terminal_font(style)
-                    && last.color == terminal_text_color_from_style(style)
-                    && last.background_color == style.background.map(terminal_color_hsla)
-                    && last.underline
-                        == style.underline.then(|| UnderlineStyle {
-                            thickness: px(1.0),
-                            color: style.underline_color.map(terminal_color_hsla),
-                            wavy: false,
-                        })
-                    && last.strikethrough
-                        == style.strikethrough.then(|| StrikethroughStyle {
-                            thickness: px(1.0),
-                            color: Some(terminal_text_color_from_style(style)),
-                        })
-                {
-                    last.len += text.len();
-                } else {
-                    runs.push(text_run_from_style(style, text.len()));
-                }
-            } else {
-                runs.push(text_run_from_style(style, text.len()));
-            }
+            let display = match ch {
+                ' ' => "\u{00A0}".to_string(),
+                _ => ch.to_string(),
+            };
+            let underline_color = style.underline_color.map(terminal_color_hsla);
+            let background = style.background.map(terminal_color_hsla);
+            let color = terminal_text_color_from_style(style);
+
+            cells.push(
+                div()
+                    .w(px(metrics.cell_width))
+                    .h(px(metrics.line_height))
+                    .overflow_hidden()
+                    .font_family(TERMINAL_FONT_FAMILY)
+                    .font_weight(if style.bold {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .when(style.italic, |cell| cell.italic())
+                    .text_size(px(metrics.font_size))
+                    .line_height(px(metrics.line_height))
+                    .text_color(color)
+                    .when_some(background, |cell, background| cell.bg(background))
+                    .when(style.underline, |cell| {
+                        let cell = cell.underline().text_decoration_solid();
+                        if let Some(color) = underline_color {
+                            cell.text_decoration_color(color)
+                        } else {
+                            cell
+                        }
+                    })
+                    .when(style.strikethrough, |cell| cell.line_through())
+                    .child(display)
+                    .into_any_element(),
+            );
 
             cell_index += 1;
         }
     }
 
-    runs
+    div()
+        .h(px(metrics.line_height))
+        .flex()
+        .items_start()
+        .whitespace_nowrap()
+        .children(cells)
+        .into_any_element()
 }
 
-fn text_run_from_style(style: canvas_terminal::TerminalTextStyle, len: usize) -> TextRun {
-    TextRun {
-        len,
-        font: terminal_font(style),
-        color: terminal_text_color_from_style(style),
-        background_color: style.background.map(terminal_color_hsla),
-        underline: style.underline.then(|| UnderlineStyle {
-            thickness: px(1.0),
-            color: style.underline_color.map(terminal_color_hsla),
-            wavy: false,
-        }),
-        strikethrough: style.strikethrough.then(|| StrikethroughStyle {
-            thickness: px(1.0),
-            color: Some(terminal_text_color_from_style(style)),
-        }),
-    }
-}
-
-fn terminal_font(style: canvas_terminal::TerminalTextStyle) -> gpui::Font {
-    let mut font = font(".ZedMono");
-    if style.bold {
-        font.weight = FontWeight::BOLD;
-    }
-    if style.italic {
-        font.style = FontStyle::Italic;
-    }
-    font
+fn terminal_row_text(row: &TerminalRow) -> String {
+    row.runs
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect::<String>()
 }
 
 fn terminal_text_color_from_style(style: canvas_terminal::TerminalTextStyle) -> gpui::Hsla {
@@ -7367,22 +9896,20 @@ fn terminal_color_from_hex(hex: u32) -> TerminalColor {
 }
 
 fn terminal_frame_metrics(
-    zoom: f32,
+    metrics: TerminalTextMetrics,
     screen_x: f32,
     screen_y: f32,
+    header_height: f32,
+    pane_padding: f32,
     snapshot: &TerminalSnapshot,
 ) -> TerminalFrameMetrics {
-    let zoom_scale = zoom.clamp(0.8, 1.2);
-    let line_height = 15.0 * zoom.clamp(0.85, 1.2);
-    let header_height = 42.0 * zoom.clamp(0.75, 1.4);
-    let pane_padding = 16.0 * zoom.clamp(0.8, 1.35);
     let body_origin_x = screen_x + pane_padding + TERMINAL_BODY_INSET;
     let body_origin_y = screen_y + header_height + pane_padding + TERMINAL_BODY_INSET;
 
     TerminalFrameMetrics {
         body_origin: gpui::point(px(body_origin_x), px(body_origin_y)),
-        cell_width: (9.0 * zoom_scale).max(1.0),
-        cell_height: line_height.max(1.0),
+        cell_width: metrics.cell_width.max(1.0),
+        cell_height: metrics.line_height.max(1.0),
         cols: snapshot.cols,
         rows: snapshot.rows_count,
     }
@@ -7551,20 +10078,20 @@ mod tests {
             "Desk",
             "Summary",
             vec![
-                PaneRecord {
-                    id: PaneId::new(7),
-                    title: "Shell".to_string(),
-                    kind: PaneKind::Shell,
-                    position: WorkdeskPoint::new(48.0, 64.0),
-                    size: WorkdeskSize::new(920.0, 560.0),
-                },
-                PaneRecord {
-                    id: PaneId::new(8),
-                    title: "Agent".to_string(),
-                    kind: PaneKind::Agent,
-                    position: WorkdeskPoint::new(1024.0, 120.0),
-                    size: WorkdeskSize::new(720.0, 420.0),
-                },
+                single_surface_pane(
+                    7,
+                    "Shell",
+                    PaneKind::Shell,
+                    WorkdeskPoint::new(48.0, 64.0),
+                    WorkdeskSize::new(920.0, 560.0),
+                ),
+                single_surface_pane(
+                    8,
+                    "Agent",
+                    PaneKind::Agent,
+                    WorkdeskPoint::new(1024.0, 120.0),
+                    WorkdeskSize::new(720.0, 420.0),
+                ),
             ],
         );
         state.layout_mode = LayoutMode::ClassicSplit;
@@ -7590,13 +10117,13 @@ mod tests {
         let mut state = WorkdeskState::new(
             "Desk",
             "Summary",
-            vec![PaneRecord {
-                id: PaneId::new(9),
-                title: "Agent".to_string(),
-                kind: PaneKind::Agent,
-                position: WorkdeskPoint::new(0.0, 0.0),
-                size: WorkdeskSize::new(720.0, 420.0),
-            }],
+            vec![single_surface_pane(
+                9,
+                "Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(720.0, 420.0),
+            )],
         );
         state.attention_sequence = 14;
         state.pane_attention.insert(
@@ -7617,6 +10144,84 @@ mod tests {
         assert!(attention.unread);
         assert_eq!(attention.last_attention_sequence, 12);
         assert_eq!(attention.last_activity_sequence, 8);
+    }
+
+    #[test]
+    fn legacy_persisted_pane_migrates_to_single_surface_stack() {
+        let restored = PersistedWorkdesk {
+            name: "Desk".to_string(),
+            summary: "Summary".to_string(),
+            metadata: WorkdeskMetadata::default(),
+            panes: vec![PersistedPane {
+                id: 11,
+                title: "Shell".to_string(),
+                kind: PersistedPaneKind::Shell,
+                position: PersistedPoint { x: 24.0, y: 48.0 },
+                size: PersistedSize {
+                    width: 920.0,
+                    height: 560.0,
+                },
+                active_surface_id: None,
+                surfaces: Vec::new(),
+                stack_title: None,
+                attention: PaneAttention::default(),
+            }],
+            attention_sequence: 0,
+            layout_mode: PersistedLayoutMode::Free,
+            camera: PersistedPoint { x: 0.0, y: 0.0 },
+            zoom: 1.0,
+            active_pane: Some(11),
+        }
+        .into_state();
+
+        assert_eq!(restored.panes.len(), 1);
+        assert_eq!(restored.panes[0].surfaces.len(), 1);
+        assert_eq!(restored.panes[0].active_surface_id, SurfaceId::new(11));
+        assert_eq!(restored.panes[0].surfaces[0].kind, PaneKind::Shell);
+        assert_eq!(restored.panes[0].title, restored.panes[0].surfaces[0].title);
+    }
+
+    #[test]
+    fn persisted_editor_surface_restores_dirty_buffer_text() {
+        let path = std::env::temp_dir().join(format!(
+            "canvas-editor-test-{}-{}.rs",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::write(&path, "fn main() {}\n").expect("fixture should write");
+
+        let pane = PaneRecord::new(
+            PaneId::new(12),
+            WorkdeskPoint::new(0.0, 0.0),
+            WorkdeskSize::new(920.0, 620.0),
+            SurfaceRecord::editor(
+                SurfaceId::new(21),
+                "editor.rs",
+                path.display().to_string(),
+                true,
+            ),
+            None,
+        );
+        let mut state = WorkdeskState::new("Desk", "Summary", vec![pane]);
+        state.editors.insert(
+            SurfaceId::new(21),
+            EditorBuffer::restore(&path, "let updated = true;\n", true),
+        );
+
+        let restored = PersistedWorkdesk::from_state(&state).into_state();
+        let editor = restored
+            .editors
+            .get(&SurfaceId::new(21))
+            .expect("editor should restore");
+
+        assert_eq!(editor.text(), "let updated = true;\n");
+        assert!(editor.dirty());
+        assert_eq!(editor.path_string(), path.display().to_string());
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -7675,13 +10280,13 @@ mod tests {
         let mut left = WorkdeskState::new(
             "Left",
             "Summary",
-            vec![PaneRecord {
-                id: PaneId::new(1),
-                title: "Shell".to_string(),
-                kind: PaneKind::Shell,
-                position: WorkdeskPoint::new(0.0, 0.0),
-                size: WorkdeskSize::new(920.0, 560.0),
-            }],
+            vec![single_surface_pane(
+                1,
+                "Shell",
+                PaneKind::Shell,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(920.0, 560.0),
+            )],
         );
         left.pane_attention.insert(
             PaneId::new(1),
@@ -7696,13 +10301,13 @@ mod tests {
         let mut right = WorkdeskState::new(
             "Right",
             "Summary",
-            vec![PaneRecord {
-                id: PaneId::new(2),
-                title: "Agent".to_string(),
-                kind: PaneKind::Agent,
-                position: WorkdeskPoint::new(0.0, 0.0),
-                size: WorkdeskSize::new(720.0, 420.0),
-            }],
+            vec![single_surface_pane(
+                2,
+                "Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(720.0, 420.0),
+            )],
         );
         right.pane_attention.insert(
             PaneId::new(2),
@@ -7725,13 +10330,13 @@ mod tests {
         let mut state = WorkdeskState::new(
             "Desk",
             "Summary",
-            vec![PaneRecord {
-                id: PaneId::new(3),
-                title: "Agent".to_string(),
-                kind: PaneKind::Agent,
-                position: WorkdeskPoint::new(0.0, 0.0),
-                size: WorkdeskSize::new(720.0, 420.0),
-            }],
+            vec![single_surface_pane(
+                3,
+                "Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(720.0, 420.0),
+            )],
         );
         state.pane_attention.insert(
             PaneId::new(3),
@@ -7779,7 +10384,11 @@ mod tests {
         assert_eq!(restored.metadata.branch, "codex/phase-3");
         assert_eq!(restored.metadata.status.as_deref(), Some("Building"));
         assert_eq!(
-            restored.metadata.progress.as_ref().map(|progress| progress.value),
+            restored
+                .metadata
+                .progress
+                .as_ref()
+                .map(|progress| progress.value),
             Some(42)
         );
     }
@@ -7793,7 +10402,10 @@ mod tests {
         assert_eq!(workdesks[0].summary, WorkdeskTemplate::ShellDesk.summary());
         assert_eq!(workdesks[0].panes.len(), 1);
         assert_eq!(workdesks[0].panes[0].kind, PaneKind::Shell);
-        assert_eq!(workdesks[0].metadata.intent, WorkdeskTemplate::ShellDesk.intent());
+        assert_eq!(
+            workdesks[0].metadata.intent,
+            WorkdeskTemplate::ShellDesk.intent()
+        );
     }
 
     #[test]
@@ -7847,13 +10459,13 @@ mod tests {
         let mut desk = WorkdeskState::new(
             "Desk",
             "Summary",
-            vec![PaneRecord {
-                id: PaneId::new(7),
-                title: "Agent".to_string(),
-                kind: PaneKind::Agent,
-                position: WorkdeskPoint::new(0.0, 0.0),
-                size: WorkdeskSize::new(720.0, 420.0),
-            }],
+            vec![single_surface_pane(
+                7,
+                "Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(720.0, 420.0),
+            )],
         );
         desk.metadata = WorkdeskMetadata {
             intent: "Ship".to_string(),
@@ -7872,17 +10484,35 @@ mod tests {
             },
         );
         desk.terminal_statuses
-            .insert(PaneId::new(7), Some("Running".to_string()));
+            .insert(SurfaceId::new(7), Some("Running".to_string()));
 
         let payload = automation_workdesk_state_json(0, &desk, true);
 
-        assert_eq!(payload["workdesk"]["intent"], Value::String("Ship".to_string()));
+        assert_eq!(
+            payload["workdesk"]["intent"],
+            Value::String("Ship".to_string())
+        );
         assert_eq!(
             payload["workdesk"]["progress"]["value"],
             Value::Number(64.into())
         );
         assert_eq!(payload["panes"][0]["id"], Value::Number(7.into()));
-        assert_eq!(payload["panes"][0]["kind"], Value::String("agent".to_string()));
+        assert_eq!(
+            payload["panes"][0]["kind"],
+            Value::String("agent".to_string())
+        );
+        assert_eq!(
+            payload["panes"][0]["surface_count"],
+            Value::Number(1.into())
+        );
+        assert_eq!(
+            payload["panes"][0]["surfaces"][0]["kind"],
+            Value::String("agent".to_string())
+        );
+        assert_eq!(
+            payload["panes"][0]["surfaces"][0]["status"],
+            Value::String("Running".to_string())
+        );
         assert_eq!(
             payload["panes"][0]["attention"]["state"],
             Value::String("waiting".to_string())

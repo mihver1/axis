@@ -17,7 +17,8 @@ use ghostty_sys::{
     GhosttyTerminalScrollViewport, GhosttyTerminalScrollViewportTag, GhosttyTerminalScrollbar,
     GHOSTTY_MODE_DECCKM, GHOSTTY_SUCCESS,
 };
-use process_manager::{spawn_process, ProcessSpec, RunningProcess, TerminalGridSize};
+pub use process_manager::TerminalGridSize;
+use process_manager::{spawn_process, ProcessSpec, RunningProcess};
 use std::ffi::c_void;
 use std::io::Read;
 use std::ptr;
@@ -27,7 +28,7 @@ use std::sync::{
 };
 
 const DEFAULT_SCROLLBACK: usize = 10_000;
-const TERMINAL_CELL_WIDTH: f32 = 9.0;
+const TERMINAL_CELL_WIDTH: f32 = 7.8;
 const TERMINAL_CELL_HEIGHT: f32 = 18.0;
 const TERMINAL_HORIZONTAL_PADDING: f32 = 32.0;
 const TERMINAL_VERTICAL_CHROME: f32 = 86.0;
@@ -838,6 +839,7 @@ pub fn default_process_spec(kind: &PaneKind) -> ProcessSpec {
     match kind {
         PaneKind::Shell => ProcessSpec::login_shell(),
         PaneKind::Agent => ProcessSpec::agent_shell(),
+        PaneKind::Browser | PaneKind::Editor => ProcessSpec::login_shell(),
     }
 }
 
@@ -857,8 +859,29 @@ pub fn spawn_terminal_session(
     title: impl Into<String>,
     size: Size,
 ) -> Result<TerminalSession> {
+    if !kind.is_terminal() {
+        return Err(anyhow!(
+            "surface kind {:?} does not support terminal sessions",
+            kind
+        ));
+    }
     let title = title.into();
     TerminalSession::spawn(&default_process_spec(kind), title, grid_size_for_pane(size))
+}
+
+pub fn spawn_terminal_session_with_grid(
+    kind: &PaneKind,
+    title: impl Into<String>,
+    grid: TerminalGridSize,
+) -> Result<TerminalSession> {
+    if !kind.is_terminal() {
+        return Err(anyhow!(
+            "surface kind {:?} does not support terminal sessions",
+            kind
+        ));
+    }
+    let title = title.into();
+    TerminalSession::spawn(&default_process_spec(kind), title, grid)
 }
 
 pub fn ghostty_build_info() -> GhosttyBuildInfo {

@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 canvas-core = { path = "../../crates/canvas-core" }
+canvas-editor = { path = "../../crates/canvas-editor" }
 canvas-terminal = { path = "../../crates/canvas-terminal" }
 gpui = "0.2.2"
 serde = { version = "1", features = ["derive"] }

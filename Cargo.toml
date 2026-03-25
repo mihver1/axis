@@ -3,6 +3,7 @@ members = [
     "apps/canvas-app",
     "apps/canvas-cli",
     "crates/canvas-core",
+    "crates/canvas-editor",
     "crates/canvas-terminal",
     "crates/process-manager",
     "crates/ghostty-sys",
