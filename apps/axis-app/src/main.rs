@@ -1,3 +1,10 @@
+use attention::{
+    next_attention_pane_target, next_attention_workdesk_target, reduce_pane_attention_state,
+    should_notify_attention_transition, summarize_workdesk_attention,
+};
+use axis_agent_runtime::WorktreeService;
+use axis_core::agent::AgentSessionRecord;
+use axis_core::worktree::{ReviewSummary, WorktreeBinding, WorktreeId};
 use axis_core::{
     automation::{
         AutomationRequest as SharedAutomationRequest,
@@ -6,38 +13,30 @@ use axis_core::{
     PaneId, PaneKind, PaneRecord, Point as WorkdeskPoint, Size as WorkdeskSize, SurfaceId,
     SurfaceKind, SurfaceRecord,
 };
-use axis_agent_runtime::WorktreeService;
-use axis_core::agent::AgentSessionRecord;
-use axis_core::worktree::{ReviewSummary, WorktreeBinding, WorktreeId};
-use attention::{
-    next_attention_pane_target, next_attention_workdesk_target, reduce_pane_attention_state,
-    should_notify_attention_transition, summarize_workdesk_attention,
-};
 use review::{
     build_desk_review_summary_view, merge_changed_files, refreshed_desk_review_summary_view,
     review_changed_file_preview, review_status_label, DeskReviewSummaryView,
 };
 
-mod automation;
-mod attention;
 mod agent_sessions;
+mod attention;
+mod automation;
 mod review;
 mod worktrees;
 use automation::{AutomationEnvelope, AutomationServer};
-use worktrees::{DEFAULT_AGENT_SIZE, DEFAULT_SHELL_SIZE};
 use axis_editor::{EditorBuffer, HighlightKind};
 use axis_terminal::{
     ghostty_build_info, spawn_terminal_session_with_grid, TerminalColor, TerminalGridSize,
     TerminalRow, TerminalRun, TerminalSession, TerminalSnapshot,
 };
 use gpui::{
-    div, font, prelude::*, px, relative, rgb, rgba, size, App, Application, Bounds, ClipboardItem,
-    Context, Element, ElementId, ElementInputHandler, EntityInputHandler, FocusHandle, FontStyle,
-    FontWeight, GlobalElementId, KeyDownEvent, KeybindingKeystroke, Keystroke, LayoutId,
-    MagnifyGestureEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point as GpuiPoint, ScrollWheelEvent, SharedString, SmartMagnifyGestureEvent, Style,
-    StyledText, SwipeGestureEvent, TextRun, Timer, TitlebarOptions, TouchEvent, TouchPhase,
-    UTF16Selection, Window, WindowBounds, WindowOptions,
+    div, font, img, prelude::*, px, relative, rgb, rgba, size, App, Application, AssetSource,
+    Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, EntityInputHandler,
+    FocusHandle, FontStyle, FontWeight, GlobalElementId, KeyDownEvent, KeybindingKeystroke,
+    Keystroke, LayoutId, MagnifyGestureEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point as GpuiPoint, ScrollWheelEvent, SharedString,
+    SmartMagnifyGestureEvent, Style, StyledText, SwipeGestureEvent, TextRun, Timer,
+    TitlebarOptions, TouchEvent, TouchPhase, UTF16Selection, Window, WindowBounds, WindowOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -51,6 +50,7 @@ use std::{
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use worktrees::{DEFAULT_AGENT_SIZE, DEFAULT_SHELL_SIZE};
 
 const MIN_ZOOM: f32 = 0.5;
 const MAX_ZOOM: f32 = 2.5;
@@ -102,11 +102,47 @@ const APP_DATA_DIR: &str = ".axis";
 const LEGACY_APP_DATA_DIR: &str = ".canvas";
 const APP_DATA_DIR_ENV: &str = "AXIS_APP_DATA_DIR";
 const AUTOMATION_SOCKET_FILE: &str = "axis.sock";
+const BRAND_ICON_ASSET: &str = "assets/branding/axis-icon.svg";
 
 #[cfg(target_os = "macos")]
 const TERMINAL_FONT_FAMILY: &str = "Menlo";
 #[cfg(not(target_os = "macos"))]
 const TERMINAL_FONT_FAMILY: &str = ".ZedMono";
+
+struct AxisAppAssets {
+    base: PathBuf,
+}
+
+impl AxisAppAssets {
+    fn new() -> Self {
+        Self {
+            base: workspace_root_path(),
+        }
+    }
+}
+
+impl AssetSource for AxisAppAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        fs::read(self.base.join(path))
+            .map(|data| Some(std::borrow::Cow::Owned(data)))
+            .map_err(Into::into)
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        fs::read_dir(self.base.join(path))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| {
+                        entry
+                            .ok()
+                            .and_then(|entry| entry.file_name().into_string().ok())
+                            .map(SharedString::from)
+                    })
+                    .collect()
+            })
+            .map_err(Into::into)
+    }
+}
 
 #[derive(Clone)]
 struct WorkdeskState {
@@ -2458,9 +2494,8 @@ impl AxisShell {
         for index in 0..shell.workdesks.len() {
             if let Err(error) = shell.sync_review_summary_for_desk(index) {
                 if let Some(workdesk) = shell.workdesks.get_mut(index) {
-                    workdesk.runtime_notice = Some(SharedString::from(format!(
-                        "review summary stale: {error}"
-                    )));
+                    workdesk.runtime_notice =
+                        Some(SharedString::from(format!("review summary stale: {error}")));
                 }
             }
         }
@@ -2521,7 +2556,11 @@ impl AxisShell {
             let should_clear = desk
                 .runtime_notice
                 .as_ref()
-                .map(|notice| notice.to_string().starts_with("Agent runtime did not start:"))
+                .map(|notice| {
+                    notice
+                        .to_string()
+                        .starts_with("Agent runtime did not start:")
+                })
                 .unwrap_or(false);
             if should_clear {
                 desk.runtime_notice = None;
@@ -2535,10 +2574,8 @@ impl AxisShell {
     }
 
     fn ensure_agent_runtime_for_pane(&mut self, desk_index: usize, pane_id: PaneId) {
-        let Some((workdesk_runtime_id, surface_id)) = self
-            .workdesks
-            .get(desk_index)
-            .and_then(|desk| {
+        let Some((workdesk_runtime_id, surface_id)) =
+            self.workdesks.get(desk_index).and_then(|desk| {
                 desk.active_surface_id_for_pane(pane_id)
                     .map(|surface_id| (desk.runtime_id, surface_id))
             })
@@ -2580,8 +2617,7 @@ impl AxisShell {
         for desk in &self.workdesks {
             for pane in &desk.panes {
                 for surface in &pane.surfaces {
-                    if surface.kind == PaneKind::Agent && desk.terminals.contains_key(&surface.id)
-                    {
+                    if surface.kind == PaneKind::Agent && desk.terminals.contains_key(&surface.id) {
                         let _ = self.agent_runtime.poll_surface(desk.runtime_id, surface.id);
                     }
                 }
@@ -2888,14 +2924,7 @@ impl AxisShell {
             .unwrap_or_else(|| WorkdeskPoint::new(80.0 + cascade, 96.0 + cascade));
         let pane = PaneRecord::new(pane_id, position, size, surface.clone(), None);
         desk.panes.push(pane);
-        Self::initialize_surface_runtime(
-            desk,
-            size,
-            1,
-            &surface,
-            editor,
-            agent_bridge,
-        );
+        Self::initialize_surface_runtime(desk, size, 1, &surface, editor, agent_bridge);
         if focus {
             desk.focus_surface(pane_id, surface_id);
             *active_workdesk = desk_index;
@@ -3053,9 +3082,8 @@ impl AxisShell {
                 let idx = self.active_workdesk;
                 if let Err(error) = self.sync_review_summary_for_desk(idx) {
                     if let Some(desk) = self.workdesks.get_mut(idx) {
-                        desk.runtime_notice = Some(SharedString::from(format!(
-                            "review summary stale: {error}"
-                        )));
+                        desk.runtime_notice =
+                            Some(SharedString::from(format!("review summary stale: {error}")));
                     }
                 }
                 let bridge = &self.agent_runtime;
@@ -3084,9 +3112,8 @@ impl AxisShell {
                 );
                 if let Err(error) = self.sync_review_summary_for_desk(index) {
                     if let Some(desk) = self.workdesks.get_mut(index) {
-                        desk.runtime_notice = Some(SharedString::from(format!(
-                            "review summary stale: {error}"
-                        )));
+                        desk.runtime_notice =
+                            Some(SharedString::from(format!("review summary stale: {error}")));
                     }
                 }
             }
@@ -3168,7 +3195,10 @@ impl AxisShell {
             .ok_or_else(|| format!("workdesk `{workdesk_id}` was not found"))
     }
 
-    fn resolve_workdesk_index_by_worktree_id(&self, worktree_id: &WorktreeId) -> Result<usize, String> {
+    fn resolve_workdesk_index_by_worktree_id(
+        &self,
+        worktree_id: &WorktreeId,
+    ) -> Result<usize, String> {
         self.workdesks
             .iter()
             .position(|desk| worktree_id_from_desk(desk).as_ref() == Some(worktree_id))
@@ -3188,13 +3218,17 @@ impl AxisShell {
         })
     }
 
-    fn refresh_worktree_binding_for_desk(&mut self, desk_index: usize) -> Result<WorktreeBinding, String> {
+    fn refresh_worktree_binding_for_desk(
+        &mut self,
+        desk_index: usize,
+    ) -> Result<WorktreeBinding, String> {
         let binding = {
             let desk = &self.workdesks[desk_index];
             if let Some(binding) = desk.worktree_binding.clone() {
                 WorktreeService::refresh(&binding).map_err(|error| error.to_string())?
             } else {
-                WorktreeService::attach(&desk.metadata.cwd, None).map_err(|error| error.to_string())?
+                WorktreeService::attach(&desk.metadata.cwd, None)
+                    .map_err(|error| error.to_string())?
             }
         };
 
@@ -3206,9 +3240,8 @@ impl AxisShell {
         }
         if let Err(error) = self.sync_review_summary_for_desk(desk_index) {
             if let Some(desk) = self.workdesks.get_mut(desk_index) {
-                desk.runtime_notice = Some(SharedString::from(format!(
-                    "review summary stale: {error}"
-                )));
+                desk.runtime_notice =
+                    Some(SharedString::from(format!("review summary stale: {error}")));
             }
         }
         Ok(binding)
@@ -3240,9 +3273,8 @@ impl AxisShell {
             })
             .transpose()?
             .unwrap_or_default();
-        let uncommitted =
-            WorktreeService::uncommitted_changed_files(&binding.root_path)
-                .map_err(|error| error.to_string())?;
+        let uncommitted = WorktreeService::uncommitted_changed_files(&binding.root_path)
+            .map_err(|error| error.to_string())?;
         let changed_files = merge_changed_files(&base_changed, &uncommitted);
 
         if let Some(desk) = self.workdesks.get_mut(desk_index) {
@@ -3271,9 +3303,8 @@ impl AxisShell {
             }
             if let Err(error) = self.sync_review_summary_for_desk(index) {
                 if let Some(desk) = self.workdesks.get_mut(index) {
-                    desk.runtime_notice = Some(SharedString::from(format!(
-                        "review summary stale: {error}"
-                    )));
+                    desk.runtime_notice =
+                        Some(SharedString::from(format!("review summary stale: {error}")));
                 }
             }
             if index != self.active_workdesk {
@@ -3300,9 +3331,8 @@ impl AxisShell {
         let index = self.workdesks.len() - 1;
         if let Err(error) = self.sync_review_summary_for_desk(index) {
             if let Some(desk) = self.workdesks.get_mut(index) {
-                desk.runtime_notice = Some(SharedString::from(format!(
-                    "review summary stale: {error}"
-                )));
+                desk.runtime_notice =
+                    Some(SharedString::from(format!("review summary stale: {error}")));
             }
         }
         let bridge = &self.agent_runtime;
@@ -3373,9 +3403,9 @@ impl AxisShell {
                 } => {
                     let desk_index = self.resolve_workdesk_index_by_worktree_id(&worktree_id)?;
                     let desk_runtime_id = self.workdesks[desk_index].runtime_id;
-                    let surface_id = self
-                        .first_agent_surface_id(desk_index)
-                        .ok_or_else(|| format!("worktree `{}` has no agent surface", worktree_id.0))?;
+                    let surface_id = self.first_agent_surface_id(desk_index).ok_or_else(|| {
+                        format!("worktree `{}` has no agent surface", worktree_id.0)
+                    })?;
                     if let Some(existing) = self
                         .agent_runtime
                         .session_for_surface(desk_runtime_id, surface_id)
@@ -3451,8 +3481,11 @@ impl AxisShell {
                         .base_branch
                         .as_deref()
                         .map(|base_branch| {
-                            WorktreeService::changed_files_since_base(&binding.root_path, base_branch)
-                                .map_err(|error| error.to_string())
+                            WorktreeService::changed_files_since_base(
+                                &binding.root_path,
+                                base_branch,
+                            )
+                            .map_err(|error| error.to_string())
                         })
                         .transpose()?
                         .unwrap_or_default();
@@ -3476,7 +3509,8 @@ impl AxisShell {
                 }
                 SharedAutomationRequest::AttentionNext { workdesk_id } => {
                     let target = if let Some(workdesk_id) = workdesk_id {
-                        let desk_index = self.resolve_workdesk_index_by_automation_id(&workdesk_id)?;
+                        let desk_index =
+                            self.resolve_workdesk_index_by_automation_id(&workdesk_id)?;
                         next_attention_target_for_workdesk(&self.workdesks[desk_index])
                             .map(|pane_id| (desk_index, pane_id))
                     } else {
@@ -3501,15 +3535,15 @@ impl AxisShell {
                 }
                 SharedAutomationRequest::StateCurrent { workdesk_id } => {
                     if let Some(workdesk_id) = workdesk_id {
-                        let desk_index = self.resolve_workdesk_index_by_automation_id(&workdesk_id)?;
+                        let desk_index =
+                            self.resolve_workdesk_index_by_automation_id(&workdesk_id)?;
                         let filter_workdesk_id = self.workdesks[desk_index].runtime_id.to_string();
                         let sessions = self
                             .agent_runtime
                             .sessions_snapshot()
                             .into_iter()
                             .filter(|record| {
-                                record.workdesk_id.as_deref()
-                                    == Some(filter_workdesk_id.as_str())
+                                record.workdesk_id.as_deref() == Some(filter_workdesk_id.as_str())
                             })
                             .map(|record| agent_session_json(&record))
                             .collect::<Vec<_>>();
@@ -3588,12 +3622,7 @@ impl AxisShell {
                 unread && !(active_workdesk == desk_index && desk.active_pane == Some(pane_id));
             let previous_state = desk.pane_attention(pane_id).state;
             let changed = desk.set_pane_attention_state(pane_id, state, effective_unread);
-            (
-                changed,
-                previous_state,
-                desk.name.clone(),
-                pane_title,
-            )
+            (changed, previous_state, desk.name.clone(), pane_title)
         };
 
         if !changed {
@@ -3630,16 +3659,16 @@ impl AxisShell {
     }
 
     fn next_attention_target(&self) -> Option<(usize, PaneId)> {
-        next_attention_workdesk_target(
-            self.workdesks.iter().enumerate().map(|(desk_index, desk)| {
+        next_attention_workdesk_target(self.workdesks.iter().enumerate().map(
+            |(desk_index, desk)| {
                 (
                     desk_index,
                     desk.panes
                         .iter()
                         .map(|pane| (pane.id, desk.pane_attention(pane.id))),
                 )
-            }),
-        )
+            },
+        ))
     }
 
     fn navigate_to_workdesk_pane(
@@ -3690,9 +3719,7 @@ impl AxisShell {
             AttentionState::Idle | AttentionState::Working => {
                 self.set_pane_attention(desk_index, pane_id, next_state, false, false, cx)
             }
-            AttentionState::NeedsInput
-            | AttentionState::NeedsReview
-            | AttentionState::Error => {
+            AttentionState::NeedsInput | AttentionState::NeedsReview | AttentionState::Error => {
                 self.set_pane_attention(desk_index, pane_id, next_state, true, true, cx)
             }
         }
@@ -5553,9 +5580,8 @@ impl AxisShell {
             self.ensure_agent_runtime_for_pane(index, pane_id);
         }
         if let Err(error) = self.sync_review_summary_for_desk(index) {
-            self.active_workdesk_mut().runtime_notice = Some(SharedString::from(format!(
-                "review summary stale: {error}"
-            )));
+            self.active_workdesk_mut().runtime_notice =
+                Some(SharedString::from(format!("review summary stale: {error}")));
         }
         self.request_persist(cx);
         cx.notify();
@@ -5869,9 +5895,9 @@ impl AxisShell {
                 self.agent_runtime
                     .provider_profile(&record.provider_profile_id)
                     .and_then(|profile| {
-                        profile.capability_note.map(|note| {
-                            format!("{} · {}", record.provider_profile_id, note)
-                        })
+                        profile
+                            .capability_note
+                            .map(|note| format!("{} · {}", record.provider_profile_id, note))
                     })
                     .unwrap_or(record.provider_profile_id)
             });
@@ -7701,27 +7727,34 @@ impl Render for AxisShell {
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap_1()
-                                        .child(chrome_button(
-                                            "Bell",
-                                            rgb(0x7cc7ff).into(),
-                                            self.notifications_open,
-                                            Some(self.mock_notifications_unread),
-                                            cx.listener(|this, _, _, cx| {
-                                                this.toggle_notifications(cx);
-                                                cx.stop_propagation();
-                                            }),
-                                        ))
-                                        .child(chrome_button(
-                                            "Hide",
-                                            rgb(0x90a0aa).into(),
-                                            false,
-                                            None,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.toggle_sidebar_collapsed(cx);
-                                                cx.stop_propagation();
-                                            }),
-                                        )),
+                                        .gap_2()
+                                        .child(brand_icon_badge(false))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(chrome_button(
+                                                    "Bell",
+                                                    rgb(0x7cc7ff).into(),
+                                                    self.notifications_open,
+                                                    Some(self.mock_notifications_unread),
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.toggle_notifications(cx);
+                                                        cx.stop_propagation();
+                                                    }),
+                                                ))
+                                                .child(chrome_button(
+                                                    "Hide",
+                                                    rgb(0x90a0aa).into(),
+                                                    false,
+                                                    None,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.toggle_sidebar_collapsed(cx);
+                                                        cx.stop_propagation();
+                                                    }),
+                                                )),
+                                        ),
                                 )
                                 .child(compact_dock_button(
                                     "+",
@@ -7741,6 +7774,7 @@ impl Render for AxisShell {
                                     .flex_col()
                                     .items_center()
                                     .gap_2()
+                                    .child(brand_icon_badge(true))
                                     .child(chrome_button(
                                         "N",
                                         rgb(0x7cc7ff).into(),
@@ -8071,66 +8105,68 @@ fn main() {
         SharedString::from("temporary PTY terminal live, libghostty-vt bridge still pending")
     };
 
-    Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
-        let workdesks = workdesks.clone();
-        let active_workdesk = active_workdesk;
-        let shortcuts = shortcuts.clone();
-        let boot_notice = boot_notice.clone();
-        let automation_socket_path = automation_server.socket_path.clone();
-        let ghostty_vendor_dir = ghostty_vendor_dir.clone();
-        let ghostty_status = ghostty_status.clone();
+    Application::new()
+        .with_assets(AxisAppAssets::new())
+        .run(move |cx: &mut App| {
+            let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+            let workdesks = workdesks.clone();
+            let active_workdesk = active_workdesk;
+            let shortcuts = shortcuts.clone();
+            let boot_notice = boot_notice.clone();
+            let automation_socket_path = automation_server.socket_path.clone();
+            let ghostty_vendor_dir = ghostty_vendor_dir.clone();
+            let ghostty_status = ghostty_status.clone();
 
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from(PRODUCT_NAME)),
-                    appears_transparent: true,
-                    traffic_light_position: cfg!(target_os = "macos")
-                        .then(|| gpui::point(px(14.0), px(14.0))),
-                }),
-                ..Default::default()
-            },
-            move |window, cx| {
-                let workdesks = workdesks.clone();
-                let active_workdesk = active_workdesk;
-                let shortcuts = shortcuts.clone();
-                let boot_notice = boot_notice.clone();
-                let automation_server = AutomationServer {
-                    receiver: automation_server.receiver,
-                    socket_path: automation_socket_path,
-                };
-                let ghostty_vendor_dir = ghostty_vendor_dir.clone();
-                let ghostty_status = ghostty_status.clone();
-                let focus_handle = cx.focus_handle();
-                let window_focus_handle = focus_handle.clone();
-                let shell = cx.new(move |_| {
-                    AxisShell::new(
-                        workdesks,
-                        active_workdesk,
-                        shortcuts,
-                        boot_notice,
-                        automation_server,
-                        focus_handle.clone(),
-                        ghostty_vendor_dir,
-                        ghostty_status,
-                    )
-                });
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(SharedString::from(PRODUCT_NAME)),
+                        appears_transparent: true,
+                        traffic_light_position: cfg!(target_os = "macos")
+                            .then(|| gpui::point(px(14.0), px(14.0))),
+                    }),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    let workdesks = workdesks.clone();
+                    let active_workdesk = active_workdesk;
+                    let shortcuts = shortcuts.clone();
+                    let boot_notice = boot_notice.clone();
+                    let automation_server = AutomationServer {
+                        receiver: automation_server.receiver,
+                        socket_path: automation_socket_path,
+                    };
+                    let ghostty_vendor_dir = ghostty_vendor_dir.clone();
+                    let ghostty_status = ghostty_status.clone();
+                    let focus_handle = cx.focus_handle();
+                    let window_focus_handle = focus_handle.clone();
+                    let shell = cx.new(move |_| {
+                        AxisShell::new(
+                            workdesks,
+                            active_workdesk,
+                            shortcuts,
+                            boot_notice,
+                            automation_server,
+                            focus_handle.clone(),
+                            ghostty_vendor_dir,
+                            ghostty_status,
+                        )
+                    });
 
-                window.focus(&window_focus_handle);
-                shell.update(cx, |this, cx| {
-                    this.start_terminal_refresh_loop(cx);
-                    this.request_persist(cx);
-                });
+                    window.focus(&window_focus_handle);
+                    shell.update(cx, |this, cx| {
+                        this.start_terminal_refresh_loop(cx);
+                        this.request_persist(cx);
+                    });
 
-                shell
-            },
-        )
-        .unwrap();
+                    shell
+                },
+            )
+            .unwrap();
 
-        cx.activate(true);
-    });
+            cx.activate(true);
+        });
 }
 
 fn load_boot_state() -> (Vec<WorkdeskState>, usize, ShortcutMap, Option<SharedString>) {
@@ -8554,6 +8590,24 @@ mod path_override_tests {
     fn app_data_dir_prefers_explicit_override() {
         let override_path = PathBuf::from("/tmp/axis-smoke-data");
         assert_eq!(app_data_dir_for(Some(override_path.clone())), override_path);
+    }
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::{AxisAppAssets, BRAND_ICON_ASSET};
+    use gpui::AssetSource;
+
+    #[test]
+    fn axis_app_assets_load_brand_icon() {
+        let assets = AxisAppAssets::new();
+        let bytes = assets
+            .load(BRAND_ICON_ASSET)
+            .expect("asset load should succeed")
+            .expect("brand icon asset should exist");
+        let svg = std::str::from_utf8(bytes.as_ref()).expect("brand icon should be valid utf-8");
+
+        assert!(svg.contains("<svg"));
     }
 }
 
@@ -9541,6 +9595,18 @@ fn compact_dock_button_stateful(
                 .on_mouse_up(MouseButton::Left, listener)
         })
         .child(div().text_xs().text_color(text_color).child(label))
+}
+
+fn brand_icon_badge(compact: bool) -> impl IntoElement {
+    let badge_size = if compact { 30.0 } else { 34.0 };
+
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(badge_size))
+        .h(px(badge_size))
+        .child(img(BRAND_ICON_ASSET).size(px(badge_size)))
 }
 
 fn chrome_button(
@@ -11507,31 +11573,29 @@ mod tests {
             .cloned()
             .expect("agent terminal should be attached");
         assert!(terminal.agent_metadata().is_none());
-        assert_eq!(bridge.attention_for_surface(desk.runtime_id, surface_id), None);
+        assert_eq!(
+            bridge.attention_for_surface(desk.runtime_id, surface_id),
+            None
+        );
 
-        let started = ensure_agent_runtime_for_surface(&bridge, desk.runtime_id, &mut desk, surface_id)
-            .expect("restored agent surface should attach on demand");
+        let started =
+            ensure_agent_runtime_for_surface(&bridge, desk.runtime_id, &mut desk, surface_id)
+                .expect("restored agent surface should attach on demand");
         assert!(started);
         assert_eq!(
             bridge.attention_for_surface(desk.runtime_id, surface_id),
             Some(axis_core::agent::AgentAttention::Quiet)
         );
-        assert!(
-            terminal
-                .agent_metadata()
-                .expect("terminal should receive session metadata")
-                .session_id
-                .0
-                .starts_with("fake-session-")
-        );
+        assert!(terminal
+            .agent_metadata()
+            .expect("terminal should receive session metadata")
+            .session_id
+            .0
+            .starts_with("fake-session-"));
 
-        let started_again = ensure_agent_runtime_for_surface(
-            &bridge,
-            desk.runtime_id,
-            &mut desk,
-            surface_id,
-        )
-            .expect("second attach should be a no-op");
+        let started_again =
+            ensure_agent_runtime_for_surface(&bridge, desk.runtime_id, &mut desk, surface_id)
+                .expect("second attach should be a no-op");
         assert!(!started_again);
 
         shutdown_workdesk_terminals(&mut desk);
@@ -11599,10 +11663,13 @@ mod tests {
             ensure_agent_runtime_for_surface(&bridge, left.runtime_id, &mut left, surface_id)
                 .expect("left desk should start")
         );
-        assert!(
-            ensure_agent_runtime_for_surface(&bridge, right.runtime_id, &mut right, surface_id)
-                .expect("right desk should start independently")
-        );
+        assert!(ensure_agent_runtime_for_surface(
+            &bridge,
+            right.runtime_id,
+            &mut right,
+            surface_id
+        )
+        .expect("right desk should start independently"));
 
         let left_session = left
             .terminals

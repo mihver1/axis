@@ -1,0 +1,48 @@
+<svg width="1200" height="1200" viewBox="0 0 1200 1200" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="axis-sheet-bg" x1="0" y1="0" x2="1200" y2="1200" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F5F1E8"/>
+      <stop offset="1" stop-color="#ECE6DC"/>
+    </linearGradient>
+    <linearGradient id="axis-icon-bg-sheet" x1="284" y1="116" x2="916" y2="816" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#131A20"/>
+      <stop offset="1" stop-color="#091016"/>
+    </linearGradient>
+    <radialGradient id="axis-icon-glow-sheet" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(600 430) rotate(90) scale(352)">
+      <stop offset="0" stop-color="#16212A"/>
+      <stop offset="1" stop-color="#16212A" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="1200" fill="url(#axis-sheet-bg)"/>
+
+  <rect x="180" y="96" width="840" height="840" rx="196" fill="url(#axis-icon-bg-sheet)"/>
+  <rect x="180" y="96" width="840" height="840" rx="196" fill="url(#axis-icon-glow-sheet)"/>
+
+  <g opacity="0.92">
+    <path d="M392 184V848" stroke="#182028" stroke-width="2"/>
+    <path d="M808 184V848" stroke="#182028" stroke-width="2"/>
+    <path d="M272 392H928" stroke="#182028" stroke-width="2"/>
+    <path d="M272 808H928" stroke="#182028" stroke-width="2"/>
+  </g>
+
+  <g opacity="0.98">
+    <path d="M600 184V848" stroke="#365066" stroke-width="10" stroke-linecap="round"/>
+    <path d="M272 530H928" stroke="#365066" stroke-width="10" stroke-linecap="round"/>
+  </g>
+
+  <g>
+    <path d="M432 758L568 350" stroke="#F7EFE5" stroke-width="78" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M768 758L632 350" stroke="#F7EFE5" stroke-width="78" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M494 530H706" stroke="#F7EFE5" stroke-width="64" stroke-linecap="round"/>
+  </g>
+
+  <circle cx="600" cy="530" r="54" fill="#E59A49"/>
+  <circle cx="600" cy="530" r="22" fill="#F7EFE5"/>
+
+  <circle cx="808" cy="326" r="20" fill="#77D19A"/>
+  <path d="M760 326H856" stroke="#77D19A" stroke-width="7" stroke-linecap="round" opacity="0.35"/>
+  <path d="M808 278V374" stroke="#77D19A" stroke-width="7" stroke-linecap="round" opacity="0.35"/>
+
+  <text x="600" y="1100" text-anchor="middle" fill="#11181E" font-family="Avenir Next, SF Pro Display, Inter, Arial, sans-serif" font-size="184" font-weight="700" letter-spacing="8">axis</text>
+</svg>
