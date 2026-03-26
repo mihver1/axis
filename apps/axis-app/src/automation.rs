@@ -38,13 +38,14 @@ struct SocketAutomationRequest {
 }
 
 impl SocketAutomationRequest {
-    fn into_envelope(self) -> Result<(Option<Value>, AutomationRequest), SocketAutomationEnvelopeError> {
+    fn into_envelope(
+        self,
+    ) -> Result<(Option<Value>, AutomationRequest), SocketAutomationEnvelopeError> {
         let Self { id, method, params } = self;
         match serde_json::from_value(json!({
             "method": method,
             "params": params,
-        }))
-        {
+        })) {
             Ok(request) => Ok((id, request)),
             Err(error) => Err(SocketAutomationEnvelopeError {
                 id,
@@ -134,11 +135,12 @@ pub(crate) fn start_automation_server_at(socket_path: PathBuf) -> Result<Automat
                                 Ok(request) => match request.into_envelope() {
                                     Ok((_id, request)) => {
                                         let (response_tx, response_rx) = mpsc::channel();
-                                        if tx.send(AutomationEnvelope {
-                                            request,
-                                            response_tx,
-                                        })
-                                        .is_err()
+                                        if tx
+                                            .send(AutomationEnvelope {
+                                                request,
+                                                response_tx,
+                                            })
+                                            .is_err()
                                         {
                                             SocketAutomationResponse {
                                                 id: _id,
@@ -147,15 +149,13 @@ pub(crate) fn start_automation_server_at(socket_path: PathBuf) -> Result<Automat
                                                 ),
                                             }
                                         } else {
-                                            let response = response_rx.recv().unwrap_or_else(|_| {
-                                                AutomationResponse::failure(
-                                                    "automation response channel closed",
-                                                )
-                                            });
-                                            SocketAutomationResponse {
-                                                id: _id,
-                                                response,
-                                            }
+                                            let response =
+                                                response_rx.recv().unwrap_or_else(|_| {
+                                                    AutomationResponse::failure(
+                                                        "automation response channel closed",
+                                                    )
+                                                });
+                                            SocketAutomationResponse { id: _id, response }
                                         }
                                     }
                                     Err(error) => SocketAutomationResponse {
@@ -185,7 +185,10 @@ pub(crate) fn start_automation_server_at(socket_path: PathBuf) -> Result<Automat
         }
     });
 
-    Ok(AutomationServer { receiver: rx, socket_path })
+    Ok(AutomationServer {
+        receiver: rx,
+        socket_path,
+    })
 }
 
 #[cfg(test)]
@@ -233,7 +236,9 @@ mod tests {
         );
         envelope
             .response_tx
-            .send(AutomationResponse::success_with_result(json!({ "ok": true })))
+            .send(AutomationResponse::success_with_result(
+                json!({ "ok": true }),
+            ))
             .expect("response should send");
 
         let mut response_line = String::new();

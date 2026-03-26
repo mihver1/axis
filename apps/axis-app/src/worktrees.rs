@@ -30,7 +30,10 @@ pub fn choose_worktree_bind(path_exists: bool, prefer_new_worktree: bool) -> Wor
 }
 
 /// Seed a [`WorktreeBinding`] from desk metadata (cwd + branch); does not hit the filesystem.
-pub fn binding_from_desk_paths(cwd: impl Into<String>, branch: impl Into<String>) -> WorktreeBinding {
+pub fn binding_from_desk_paths(
+    cwd: impl Into<String>,
+    branch: impl Into<String>,
+) -> WorktreeBinding {
     WorktreeBinding {
         root_path: cwd.into(),
         branch: branch.into(),

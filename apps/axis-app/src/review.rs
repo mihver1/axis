@@ -59,7 +59,12 @@ pub(crate) fn review_changed_file_preview(
     view: &DeskReviewSummaryView,
     limit: usize,
 ) -> Vec<String> {
-    let mut preview = view.changed_files.iter().take(limit).cloned().collect::<Vec<_>>();
+    let mut preview = view
+        .changed_files
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
     let remaining = view.changed_files.len().saturating_sub(preview.len());
     if remaining > 0 {
         preview.push(format!("+{remaining} more"));
@@ -112,9 +117,8 @@ mod tests {
             &[String::from("src/lib.rs")],
         );
 
-        let refreshed =
-            refreshed_desk_review_summary_view(Some(&previous), None, None)
-                .expect("last known review summary should be retained");
+        let refreshed = refreshed_desk_review_summary_view(Some(&previous), None, None)
+            .expect("last known review summary should be retained");
 
         assert_eq!(refreshed, previous);
     }

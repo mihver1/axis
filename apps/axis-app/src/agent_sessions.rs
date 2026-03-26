@@ -78,10 +78,7 @@ impl AgentRuntimeBridge {
     }
 
     pub fn revision(&self) -> u64 {
-        self.inner
-            .lock()
-            .map(|g| g.manager.revision())
-            .unwrap_or(0)
+        self.inner.lock().map(|g| g.manager.revision()).unwrap_or(0)
     }
 
     fn key(workdesk_runtime_id: u64, surface_id: SurfaceId) -> SurfaceRuntimeKey {
@@ -114,13 +111,10 @@ impl AgentRuntimeBridge {
         workdesk_runtime_id: u64,
         surface_id: SurfaceId,
     ) -> bool {
-        self.inner
-            .lock()
-            .ok()
-            .is_some_and(|g| {
-                g.surface_to_session
-                    .contains_key(&Self::key(workdesk_runtime_id, surface_id))
-            })
+        self.inner.lock().ok().is_some_and(|g| {
+            g.surface_to_session
+                .contains_key(&Self::key(workdesk_runtime_id, surface_id))
+        })
     }
 
     fn start_agent_for_surface_inner(
@@ -268,10 +262,7 @@ impl AgentRuntimeBridge {
         else {
             return Ok(());
         };
-        guard
-            .manager
-            .poll_provider(&sid)
-            .map_err(|e| e.to_string())
+        guard.manager.poll_provider(&sid).map_err(|e| e.to_string())
     }
 
     pub(crate) fn stop_session(&self, session_id: &AgentSessionId) -> Result<(), String> {

@@ -18,14 +18,16 @@ pub(crate) fn reduce_pane_attention_state<I>(
 where
     I: IntoIterator<Item = AgentAttention>,
 {
-    session_attentions.into_iter().fold(baseline, |current, attention| {
-        let next = agent_attention_state(attention);
-        if next.summary_priority() > current.summary_priority() {
-            next
-        } else {
-            current
-        }
-    })
+    session_attentions
+        .into_iter()
+        .fold(baseline, |current, attention| {
+            let next = agent_attention_state(attention);
+            if next.summary_priority() > current.summary_priority() {
+                next
+            } else {
+                current
+            }
+        })
 }
 
 pub(crate) fn summarize_workdesk_attention<I>(pane_attentions: I) -> WorkdeskAttentionSummary
@@ -43,7 +45,8 @@ pub(crate) fn next_attention_pane_target<I>(panes: I) -> Option<PaneId>
 where
     I: IntoIterator<Item = (PaneId, PaneAttention)>,
 {
-    panes.into_iter()
+    panes
+        .into_iter()
         .filter_map(|(pane_id, attention)| {
             attention_jump_key(attention, pane_id).map(|key| (key, pane_id))
         })
@@ -60,7 +63,8 @@ where
 
     for (desk_index, panes) in workdesks {
         for (pane_id, attention) in panes {
-            let Some((priority, sequence, pane_raw)) = attention_jump_key(attention, pane_id) else {
+            let Some((priority, sequence, pane_raw)) = attention_jump_key(attention, pane_id)
+            else {
                 continue;
             };
             let candidate_key = (priority, sequence, desk_index, pane_raw);
@@ -144,7 +148,10 @@ mod tests {
         let target = next_attention_workdesk_target([
             (
                 0usize,
-                vec![(PaneId::new(1), pane_attention(AttentionState::Error, true, 1))],
+                vec![(
+                    PaneId::new(1),
+                    pane_attention(AttentionState::Error, true, 1),
+                )],
             ),
             (
                 1usize,
