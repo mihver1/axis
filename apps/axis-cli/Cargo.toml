@@ -1,15 +1,16 @@
 [package]
-name = "canvas-app"
+name = "axis-cli"
 edition.workspace = true
 license.workspace = true
 publish = false
 rust-version.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "axis"
+path = "src/main.rs"
+
 [dependencies]
-canvas-core = { path = "../../crates/canvas-core" }
-canvas-editor = { path = "../../crates/canvas-editor" }
-canvas-terminal = { path = "../../crates/canvas-terminal" }
-gpui = "0.2.2"
+axis-core = { path = "../../crates/axis-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

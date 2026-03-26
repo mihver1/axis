@@ -471,6 +471,71 @@ dependencies = [
 ]
 
 [[package]]
+name = "axis-agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axis-core",
+ "process-manager",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
+name = "axis-app"
+version = "0.1.0"
+dependencies = [
+ "axis-agent-runtime",
+ "axis-core",
+ "axis-editor",
+ "axis-terminal",
+ "gpui",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "axis-cli"
+version = "0.1.0"
+dependencies = [
+ "axis-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "axis-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "axis-editor"
+version = "0.1.0"
+dependencies = [
+ "tree-sitter 0.25.10",
+ "tree-sitter-json",
+ "tree-sitter-markdown",
+ "tree-sitter-rust",
+ "tree-sitter-toml-ng",
+ "tree-sitter-typescript",
+ "tree-sitter-yaml",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "axis-terminal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axis-core",
+ "ghostty-sys",
+ "process-manager",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -726,54 +791,6 @@ dependencies = [
  "rustix 0.38.44",
  "wayland-backend",
  "wayland-client",
-]
-
-[[package]]
-name = "canvas-app"
-version = "0.1.0"
-dependencies = [
- "canvas-core",
- "canvas-editor",
- "canvas-terminal",
- "gpui",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "canvas-cli"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "canvas-core"
-version = "0.1.0"
-
-[[package]]
-name = "canvas-editor"
-version = "0.1.0"
-dependencies = [
- "tree-sitter 0.25.10",
- "tree-sitter-json",
- "tree-sitter-markdown",
- "tree-sitter-rust",
- "tree-sitter-toml-ng",
- "tree-sitter-typescript",
- "tree-sitter-yaml",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "canvas-terminal"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "canvas-core",
- "ghostty-sys",
- "process-manager",
 ]
 
 [[package]]
@@ -3923,6 +3940,7 @@ name = "process-manager"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "portable-pty",
 ]
 

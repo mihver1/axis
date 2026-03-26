@@ -1,4 +1,4 @@
-# Canvas macOS Bootstrap Plan
+# axis macOS Bootstrap Plan
 
 ## Purpose
 
@@ -77,10 +77,10 @@ The initial repository layout should stay narrow:
 │   ├── v0-prototype-scope.md
 │   └── macos-bootstrap-plan.md
 ├── apps/
-│   └── canvas-app/
+│   └── axis-app/
 ├── crates/
-│   ├── canvas-core/
-│   ├── canvas-terminal/
+│   ├── axis-core/
+│   ├── axis-terminal/
 │   ├── process-manager/
 │   └── ghostty-sys/
 ├── vendor/
@@ -91,16 +91,16 @@ The initial repository layout should stay narrow:
 
 ## Crate Responsibilities
 
-### `apps/canvas-app`
+### `apps/axis-app`
 
 Owns the GPUI app entrypoint, window setup, global actions, and workdesk shell.
 
-### `crates/canvas-core`
+### `crates/axis-core`
 
 Owns workdesk state, pane geometry, focus state, commands, and simple domain
 types that should not depend on FFI details.
 
-### `crates/canvas-terminal`
+### `crates/axis-terminal`
 
 Owns terminal pane behavior, terminal rendering integration, and the bridge
 between PTY bytes, terminal state, and GPUI drawing.
@@ -123,7 +123,7 @@ This crate should stay small and intentionally boring.
    terminal creation, input encoding, writing bytes, resizing, and render state.
 4. Prefer checked-in generated bindings or a very small handwritten extern layer
    over an ambitious build-time binding pipeline on day one.
-5. Put all `unsafe` calls behind a narrow safe wrapper in `canvas-terminal`
+5. Put all `unsafe` calls behind a narrow safe wrapper in `axis-terminal`
    before they touch the rest of the app.
 
 ## Build and Developer UX
@@ -150,7 +150,7 @@ toolchain on macOS.
 1. Create the Cargo workspace and crate layout.
 2. Add `justfile`.
 3. Add `rust-toolchain.toml`.
-4. Add a minimal `apps/canvas-app` that opens a GPUI window.
+4. Add a minimal `apps/axis-app` that opens a GPUI window.
 
 ### Milestone 2: Static Workdesk
 
@@ -201,7 +201,7 @@ This script should help developers, not replace understanding.
 1. Whether we vendor Ghostty as a submodule or subtree.
 2. Whether bindings are checked in or generated during bootstrap.
 3. Whether we want `just` alone or `mise` plus `just` for tool pinning.
-4. Whether `canvas-terminal` should own the safe wrapper or whether that should
+4. Whether `axis-terminal` should own the safe wrapper or whether that should
    live in a dedicated higher-level crate later.
 
 ## References

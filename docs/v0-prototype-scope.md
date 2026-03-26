@@ -1,8 +1,8 @@
-# Canvas v0 Prototype Scope
+# axis v0 Prototype Scope
 
 ## Summary
 
-Canvas v0 is a native desktop prototype for spatial, agent-oriented development.
+axis v0 is a native desktop prototype for spatial, agent-oriented development under the `artel` umbrella.
 It is not an IDE and not a terminal multiplexer replacement yet.
 The goal of v0 is to prove that a `GPUI + libghostty-vt` stack can support a
 scrollable workdesk with terminal-based tools and agent sessions as first-class
@@ -11,7 +11,7 @@ surfaces.
 ## Product Thesis
 
 Traditional split panes punish parallel work by shrinking every view at once.
-Canvas should let us place shells, editors, logs, and agents on a larger
+axis should let us place shells, editors, logs, and agents on a larger
 workdesk, then navigate that space instead of continuously rebalancing splits.
 
 The prototype should answer one question:

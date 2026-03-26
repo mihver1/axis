@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use canvas_core::{PaneKind, Point, Size, Workdesk};
+use axis_core::{PaneKind, Point, Size, Workdesk};
 use ghostty_sys::{
     ghostty_build_info as ghostty_vt_build_info, ghostty_render_state_colors_get,
     ghostty_render_state_free, ghostty_render_state_get, ghostty_render_state_new,
@@ -43,6 +43,12 @@ pub struct TerminalPaneSpec {
     pub size: Size,
 }
 
+/// Optional link from a terminal pane to an `axis-agent-runtime` session (UI may ignore for now).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalAgentMetadata {
+    pub session_id: axis_core::agent::AgentSessionId,
+}
+
 impl TerminalPaneSpec {
     pub fn shell(title: impl Into<String>, position: Point, size: Size) -> Self {
         Self {
@@ -82,6 +88,7 @@ struct TerminalSessionInner {
     revision: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
     status: Arc<Mutex<Option<String>>>,
+    agent_metadata: Arc<Mutex<Option<TerminalAgentMetadata>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -569,6 +576,7 @@ impl TerminalSession {
         let revision = Arc::new(AtomicU64::new(1));
         let closed = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(Some("Running".to_string())));
+        let agent_metadata = Arc::new(Mutex::new(None));
 
         let thread_engine = Arc::clone(&engine);
         let thread_revision = Arc::clone(&revision);
@@ -578,7 +586,7 @@ impl TerminalSession {
         let mut reader = spawned.reader;
 
         std::thread::Builder::new()
-            .name(format!("canvas-terminal-{}", fallback_title))
+            .name(format!("axis-terminal-{}", fallback_title))
             .spawn(move || {
                 let mut buffer = [0u8; 8192];
 
@@ -643,8 +651,25 @@ impl TerminalSession {
                 revision,
                 closed,
                 status,
+                agent_metadata,
             }),
         })
+    }
+
+    pub fn set_agent_metadata(&self, meta: Option<TerminalAgentMetadata>) {
+        *self
+            .inner
+            .agent_metadata
+            .lock()
+            .expect("terminal agent metadata mutex poisoned") = meta;
+    }
+
+    pub fn agent_metadata(&self) -> Option<TerminalAgentMetadata> {
+        self.inner
+            .agent_metadata
+            .lock()
+            .expect("terminal agent metadata mutex poisoned")
+            .clone()
     }
 
     pub fn revision(&self) -> u64 {

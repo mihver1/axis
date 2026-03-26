@@ -1,5 +1,5 @@
 [package]
-name = "canvas-terminal"
+name = "axis-terminal"
 edition.workspace = true
 license.workspace = true
 publish = false
@@ -11,6 +11,6 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
-canvas-core = { path = "../canvas-core" }
+axis-core = { path = "../axis-core" }
 ghostty-sys = { path = "../ghostty-sys" }
 process-manager = { path = "../process-manager" }

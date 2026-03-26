@@ -2,7 +2,7 @@
 
 ## Summary
 
-Canvas should keep the freedom of a spatial workdesk without forcing every
+axis should keep the freedom of a spatial workdesk without forcing every
 session into a chaotic freeform layout.
 
 The right model is not three separate workspace types.
@@ -21,7 +21,7 @@ Only layout, camera behavior, and navigation rules should change.
 
 ## Product Principle
 
-Canvas should be:
+axis should be:
 
 1. Free for arranging.
 2. Grid for traversing.
@@ -456,7 +456,7 @@ The layout mode system is successful when:
 2. The user can navigate a multi-pane desk directionally in `grid`.
 3. `Expose` reliably surfaces every pane and returns to focused view.
 4. Switching modes preserves per-mode layout state.
-5. The system feels more ordered without losing the spatial identity of Canvas.
+5. The system feels more ordered without losing the spatial identity of axis.
 
 ## Open Questions
 

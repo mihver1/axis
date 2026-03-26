@@ -1,5 +1,5 @@
 [package]
-name = "canvas-editor"
+name = "axis-editor"
 edition.workspace = true
 license.workspace = true
 publish = false

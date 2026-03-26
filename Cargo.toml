@@ -1,10 +1,11 @@
 [workspace]
 members = [
-    "apps/canvas-app",
-    "apps/canvas-cli",
-    "crates/canvas-core",
-    "crates/canvas-editor",
-    "crates/canvas-terminal",
+    "apps/axis-app",
+    "apps/axis-cli",
+    "crates/axis-agent-runtime",
+    "crates/axis-core",
+    "crates/axis-editor",
+    "crates/axis-terminal",
     "crates/process-manager",
     "crates/ghostty-sys",
 ]

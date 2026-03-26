@@ -1,9 +1,32 @@
-use canvas_core::{
+use axis_core::{
+    automation::{
+        AutomationRequest as SharedAutomationRequest,
+        AutomationResponse as SharedAutomationResponse,
+    },
     PaneId, PaneKind, PaneRecord, Point as WorkdeskPoint, Size as WorkdeskSize, SurfaceId,
     SurfaceKind, SurfaceRecord,
 };
-use canvas_editor::{EditorBuffer, HighlightKind};
-use canvas_terminal::{
+use axis_agent_runtime::WorktreeService;
+use axis_core::agent::AgentSessionRecord;
+use axis_core::worktree::{ReviewSummary, WorktreeBinding, WorktreeId};
+use attention::{
+    next_attention_pane_target, next_attention_workdesk_target, reduce_pane_attention_state,
+    should_notify_attention_transition, summarize_workdesk_attention,
+};
+use review::{
+    build_desk_review_summary_view, merge_changed_files, refreshed_desk_review_summary_view,
+    review_changed_file_preview, review_status_label, DeskReviewSummaryView,
+};
+
+mod automation;
+mod attention;
+mod agent_sessions;
+mod review;
+mod worktrees;
+use automation::{AutomationEnvelope, AutomationServer};
+use worktrees::{DEFAULT_AGENT_SIZE, DEFAULT_SHELL_SIZE};
+use axis_editor::{EditorBuffer, HighlightKind};
+use axis_terminal::{
     ghostty_build_info, spawn_terminal_session_with_grid, TerminalColor, TerminalGridSize,
     TerminalRow, TerminalRun, TerminalSession, TerminalSnapshot,
 };
@@ -22,14 +45,11 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, Write},
     ops::Range,
-    os::unix::{fs::PermissionsExt, net::UnixListener},
     path::PathBuf,
     process::Command,
-    sync::mpsc::{self, Receiver, Sender},
-    thread,
-    time::{Duration, Instant},
+    sync::mpsc::{self, Receiver},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MIN_ZOOM: f32 = 0.5;
@@ -45,8 +65,6 @@ const THREE_FINGER_SWIPE_SUPPRESSION: Duration = Duration::from_millis(250);
 const GRID_STEP_WORLD: f32 = 160.0;
 const MIN_PANE_WIDTH: f32 = 320.0;
 const MIN_PANE_HEIGHT: f32 = 220.0;
-const DEFAULT_SHELL_SIZE: WorkdeskSize = WorkdeskSize::new(920.0, 560.0);
-const DEFAULT_AGENT_SIZE: WorkdeskSize = WorkdeskSize::new(720.0, 420.0);
 const SIDEBAR_WIDTH: f32 = 216.0;
 const SIDEBAR_COLLAPSED_WIDTH: f32 = 72.0;
 const WORKDESK_MENU_WIDTH: f32 = 208.0;
@@ -79,6 +97,11 @@ const INSPECTOR_PANEL_WIDTH: f32 = 360.0;
 const WORKDESK_EDITOR_WIDTH: f32 = 436.0;
 const SIDEBAR_WINDOW_CONTROLS_INSET: f32 = 34.0;
 const NOTIFICATION_PANEL_WIDTH: f32 = 264.0;
+const PRODUCT_NAME: &str = "axis";
+const APP_DATA_DIR: &str = ".axis";
+const LEGACY_APP_DATA_DIR: &str = ".canvas";
+const APP_DATA_DIR_ENV: &str = "AXIS_APP_DATA_DIR";
+const AUTOMATION_SOCKET_FILE: &str = "axis.sock";
 
 #[cfg(target_os = "macos")]
 const TERMINAL_FONT_FAMILY: &str = "Menlo";
@@ -90,6 +113,12 @@ struct WorkdeskState {
     name: String,
     summary: String,
     metadata: WorkdeskMetadata,
+    /// Transient unique runtime key for bridge state; assigned on boot/create, not persisted.
+    runtime_id: u64,
+    /// Transient execution binding (not persisted).
+    worktree_binding: Option<WorktreeBinding>,
+    /// Transient review summary derived from current worktree metadata.
+    review_summary: Option<DeskReviewSummaryView>,
     panes: Vec<PaneRecord>,
     pane_attention: HashMap<PaneId, PaneAttention>,
     terminals: HashMap<SurfaceId, TerminalSession>,
@@ -111,9 +140,12 @@ struct WorkdeskState {
     runtime_notice: Option<SharedString>,
 }
 
-struct CanvasShell {
+struct AxisShell {
     workdesks: Vec<WorkdeskState>,
     active_workdesk: usize,
+    next_workdesk_runtime_id: u64,
+    agent_runtime: agent_sessions::AgentRuntimeBridge,
+    last_agent_runtime_revision: u64,
     workdesk_menu: Option<WorkdeskContextMenu>,
     stack_surface_menu: Option<StackSurfaceMenu>,
     workdesk_editor: Option<WorkdeskEditorState>,
@@ -276,7 +308,9 @@ enum AttentionState {
     #[default]
     Idle,
     Working,
-    Waiting,
+    #[serde(alias = "waiting")]
+    NeedsInput,
+    NeedsReview,
     Error,
 }
 
@@ -503,40 +537,6 @@ struct PersistedSize {
     height: f32,
 }
 
-struct AutomationServer {
-    receiver: Receiver<AutomationEnvelope>,
-    socket_path: PathBuf,
-}
-
-struct AutomationEnvelope {
-    request: AutomationRequest,
-    response_tx: Sender<AutomationResponse>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct AutomationRequest {
-    #[serde(default)]
-    id: Option<Value>,
-    method: String,
-    #[serde(default = "empty_json_value")]
-    params: Value,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct AutomationResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<Value>,
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-fn empty_json_value() -> Value {
-    Value::Object(Default::default())
-}
-
 #[derive(Clone, Default)]
 struct TerminalViewState {
     selection: Option<TerminalSelection>,
@@ -645,7 +645,7 @@ impl EditorViewState {
 }
 
 struct EditorInputOverlay {
-    shell: gpui::Entity<CanvasShell>,
+    shell: gpui::Entity<AxisShell>,
     active: bool,
     surface_id: SurfaceId,
     line_height: f32,
@@ -747,7 +747,7 @@ impl Element for EditorInputOverlay {
     }
 }
 
-impl EntityInputHandler for CanvasShell {
+impl EntityInputHandler for AxisShell {
     fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -915,65 +915,52 @@ impl TerminalSelection {
 }
 
 impl AttentionState {
-    fn from_api_name(value: &str) -> Option<Self> {
-        match value {
-            "idle" => Some(Self::Idle),
-            "working" => Some(Self::Working),
-            "waiting" => Some(Self::Waiting),
-            "error" => Some(Self::Error),
-            _ => None,
-        }
-    }
-
     fn label(self) -> &'static str {
         match self {
             Self::Idle => "Idle",
             Self::Working => "Working",
-            Self::Waiting => "Waiting",
+            Self::NeedsInput => "Needs input",
+            Self::NeedsReview => "Needs review",
             Self::Error => "Error",
         }
     }
 
     fn is_attention(self) -> bool {
-        matches!(self, Self::Waiting | Self::Error)
+        matches!(self, Self::NeedsInput | Self::NeedsReview | Self::Error)
     }
 
     fn tint(self) -> gpui::Hsla {
         match self {
             Self::Idle => rgb(0x5e6c76).into(),
             Self::Working => rgb(0x7cc7ff).into(),
-            Self::Waiting => rgb(0xf0d35f).into(),
+            Self::NeedsInput => rgb(0xf0d35f).into(),
+            Self::NeedsReview => rgb(0x7cc7ff).into(),
             Self::Error => rgb(0xff9b88).into(),
         }
     }
 
-    fn priority(self) -> u8 {
+    fn summary_priority(self) -> u8 {
         match self {
             Self::Idle => 0,
             Self::Working => 1,
-            Self::Waiting => 2,
-            Self::Error => 3,
-        }
-    }
-}
-
-impl AutomationResponse {
-    fn success(id: Option<Value>, result: Value) -> Self {
-        Self {
-            id,
-            ok: true,
-            result: Some(result),
-            error: None,
+            Self::NeedsReview => 2,
+            Self::NeedsInput => 3,
+            Self::Error => 4,
         }
     }
 
-    fn error(id: Option<Value>, message: impl Into<String>) -> Self {
-        Self {
-            id,
-            ok: false,
-            result: None,
-            error: Some(message.into()),
+    fn jump_priority(self) -> u8 {
+        match self {
+            Self::NeedsInput => 0,
+            Self::NeedsReview => 1,
+            Self::Error => 2,
+            Self::Working => 3,
+            Self::Idle => 4,
         }
+    }
+
+    fn should_notify(self) -> bool {
+        matches!(self, Self::NeedsInput | Self::NeedsReview | Self::Error)
     }
 }
 
@@ -983,7 +970,7 @@ impl WorkdeskAttentionSummary {
             self.unread_count += 1;
         }
 
-        if attention.state.priority() > self.highest.priority() {
+        if attention.state.summary_priority() > self.highest.summary_priority() {
             self.highest = attention.state;
         }
     }
@@ -1042,16 +1029,6 @@ impl WorkdeskTemplate {
             Self::Debug,
             Self::Implementation,
         ]
-    }
-
-    fn from_api_name(value: &str) -> Option<Self> {
-        match value {
-            "shell-desk" | "shell" => Some(Self::ShellDesk),
-            "agent-review" | "review" => Some(Self::AgentReview),
-            "debug" => Some(Self::Debug),
-            "implementation" | "implement" => Some(Self::Implementation),
-            _ => None,
-        }
     }
 
     fn label(self) -> &'static str {
@@ -1487,7 +1464,7 @@ impl ShortcutAction {
                 "Jump to the next pane across all desks that still has unread attention."
             }
             Self::ClearActiveAttention => {
-                "Dismiss the current pane's waiting or error attention state."
+                "Dismiss the current pane's needs-input, needs-review, or error attention state."
             }
             Self::SpawnShellPane => "Create a new shell pane near the viewport center.",
             Self::SpawnAgentPane => "Create a new agent pane near the viewport center.",
@@ -1834,6 +1811,9 @@ impl WorkdeskState {
             name,
             summary: summary.clone(),
             metadata: default_workdesk_metadata(summary, None, None),
+            runtime_id: 0,
+            worktree_binding: None,
+            review_summary: None,
             panes,
             pane_attention,
             terminals: HashMap::new(),
@@ -2005,11 +1985,7 @@ impl WorkdeskState {
     }
 
     fn workdesk_attention_summary(&self) -> WorkdeskAttentionSummary {
-        let mut summary = WorkdeskAttentionSummary::default();
-        for attention in self.pane_attention.values().copied() {
-            summary.register(attention);
-        }
-        summary
+        summarize_workdesk_attention(self.pane_attention.values().copied())
     }
 
     fn attach_terminal_session(
@@ -2216,7 +2192,7 @@ impl WorkdeskState {
 }
 
 impl PersistedSession {
-    fn from_shell(shell: &CanvasShell) -> Self {
+    fn from_shell(shell: &AxisShell) -> Self {
         Self {
             active_workdesk: shell
                 .active_workdesk
@@ -2395,6 +2371,10 @@ impl PersistedWorkdesk {
 
         let mut state = WorkdeskState::new(name, summary, panes);
         state.metadata = metadata.hydrated();
+        state.worktree_binding = worktrees::refreshed_binding_from_desk_paths(
+            &state.metadata.cwd,
+            &state.metadata.branch,
+        );
         state.pane_attention = pane_attention;
         state.attention_sequence = attention_sequence;
         state.layout_mode = layout_mode.into();
@@ -2420,7 +2400,7 @@ impl PersistedWorkdesk {
     }
 }
 
-impl CanvasShell {
+impl AxisShell {
     fn new(
         workdesks: Vec<WorkdeskState>,
         active_workdesk: usize,
@@ -2439,6 +2419,9 @@ impl CanvasShell {
         let mut shell = Self {
             workdesks,
             active_workdesk: clamped_active_workdesk,
+            next_workdesk_runtime_id: 1,
+            agent_runtime: agent_sessions::AgentRuntimeBridge::new(),
+            last_agent_runtime_revision: 0,
             workdesk_menu: None,
             stack_surface_menu: None,
             workdesk_editor: None,
@@ -2460,6 +2443,7 @@ impl CanvasShell {
             touchpad_pan_state: None,
             last_touchpad_pan_end: None,
         };
+        shell.assign_runtime_ids_to_workdesks();
 
         if let Some(notice) = boot_notice {
             if let Some(workdesk) = shell.workdesks.get_mut(shell.active_workdesk) {
@@ -2471,6 +2455,16 @@ impl CanvasShell {
             boot_workdesk_terminals(workdesk);
         }
 
+        for index in 0..shell.workdesks.len() {
+            if let Err(error) = shell.sync_review_summary_for_desk(index) {
+                if let Some(workdesk) = shell.workdesks.get_mut(index) {
+                    workdesk.runtime_notice = Some(SharedString::from(format!(
+                        "review summary stale: {error}"
+                    )));
+                }
+            }
+        }
+
         shell
     }
 
@@ -2480,6 +2474,138 @@ impl CanvasShell {
 
     fn active_workdesk_mut(&mut self) -> &mut WorkdeskState {
         &mut self.workdesks[self.active_workdesk]
+    }
+
+    fn assign_runtime_ids_to_workdesks(&mut self) {
+        let mut next_id = self.next_workdesk_runtime_id;
+        for desk in &mut self.workdesks {
+            if desk.runtime_id == 0 {
+                desk.runtime_id = next_id;
+                next_id += 1;
+            } else {
+                next_id = next_id.max(desk.runtime_id.saturating_add(1));
+            }
+        }
+        self.next_workdesk_runtime_id = next_id;
+    }
+
+    fn allocate_workdesk_runtime_id(&mut self) -> u64 {
+        let id = self.next_workdesk_runtime_id;
+        self.next_workdesk_runtime_id = self.next_workdesk_runtime_id.saturating_add(1);
+        id
+    }
+
+    fn boot_agent_sessions_for_desk(
+        bridge: &agent_sessions::AgentRuntimeBridge,
+        workdesk_runtime_id: u64,
+        desk: &mut WorkdeskState,
+    ) {
+        let agent_surface_ids = desk
+            .panes
+            .iter()
+            .flat_map(|pane| pane.surfaces.iter())
+            .filter(|surface| surface.kind == PaneKind::Agent)
+            .map(|surface| surface.id)
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+
+        for surface_id in agent_surface_ids {
+            if let Err(error) =
+                ensure_agent_runtime_for_surface(bridge, workdesk_runtime_id, desk, surface_id)
+            {
+                errors.push(error);
+            }
+        }
+
+        if errors.is_empty() {
+            let should_clear = desk
+                .runtime_notice
+                .as_ref()
+                .map(|notice| notice.to_string().starts_with("Agent runtime did not start:"))
+                .unwrap_or(false);
+            if should_clear {
+                desk.runtime_notice = None;
+            }
+        } else {
+            desk.runtime_notice = Some(SharedString::from(format!(
+                "Agent runtime did not start: {}",
+                errors.join("; ")
+            )));
+        }
+    }
+
+    fn ensure_agent_runtime_for_pane(&mut self, desk_index: usize, pane_id: PaneId) {
+        let Some((workdesk_runtime_id, surface_id)) = self
+            .workdesks
+            .get(desk_index)
+            .and_then(|desk| {
+                desk.active_surface_id_for_pane(pane_id)
+                    .map(|surface_id| (desk.runtime_id, surface_id))
+            })
+        else {
+            return;
+        };
+
+        let result = {
+            let bridge = &self.agent_runtime;
+            let Some(desk) = self.workdesks.get_mut(desk_index) else {
+                return;
+            };
+            ensure_agent_runtime_for_surface(bridge, workdesk_runtime_id, desk, surface_id)
+        };
+
+        if let Err(error) = result {
+            if let Some(desk) = self.workdesks.get_mut(desk_index) {
+                desk.runtime_notice = Some(SharedString::from(format!(
+                    "Agent runtime did not start: {error}"
+                )));
+            }
+        }
+    }
+
+    fn sync_agent_desk_paths(&self) {
+        for desk in &self.workdesks {
+            let cwd = desk
+                .worktree_binding
+                .as_ref()
+                .map(|b| b.root_path.clone())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| desk.metadata.cwd.clone());
+            self.agent_runtime.set_desk_cwd(desk.runtime_id, cwd);
+        }
+    }
+
+    fn sync_agent_runtime_activity(&mut self, cx: &mut Context<Self>) -> bool {
+        self.sync_agent_desk_paths();
+        for desk in &self.workdesks {
+            for pane in &desk.panes {
+                for surface in &pane.surfaces {
+                    if surface.kind == PaneKind::Agent && desk.terminals.contains_key(&surface.id)
+                    {
+                        let _ = self.agent_runtime.poll_surface(desk.runtime_id, surface.id);
+                    }
+                }
+            }
+        }
+        let rev = self.agent_runtime.revision();
+        if rev != self.last_agent_runtime_revision {
+            self.last_agent_runtime_revision = rev;
+            let active_workdesk = self.active_workdesk;
+            let mut attention_changed = false;
+            for (desk_index, desk) in self.workdesks.iter_mut().enumerate() {
+                attention_changed |= sync_agent_runtime_attention_for_workdesk(
+                    &self.agent_runtime,
+                    desk_index,
+                    active_workdesk,
+                    desk,
+                );
+            }
+            if attention_changed {
+                self.request_persist(cx);
+            }
+            return true;
+        }
+        false
     }
 
     fn sidebar_width(&self) -> f32 {
@@ -2636,6 +2762,7 @@ impl CanvasShell {
         pane_surface_count: usize,
         surface: &SurfaceRecord,
         editor: Option<EditorBuffer>,
+        agent_bridge: &agent_sessions::AgentRuntimeBridge,
     ) {
         match surface.kind {
             PaneKind::Shell | PaneKind::Agent => {
@@ -2645,6 +2772,24 @@ impl CanvasShell {
                     &surface.title,
                     terminal_grid_size_for_pane(pane_size, pane_surface_count),
                 );
+                if surface.kind == PaneKind::Agent {
+                    let cwd = desk
+                        .worktree_binding
+                        .as_ref()
+                        .map(|b| b.root_path.as_str())
+                        .unwrap_or_else(|| desk.metadata.cwd.as_str());
+                    if let Some(terminal) = desk.terminals.get(&surface.id) {
+                        if let Err(error) = agent_bridge.start_agent_for_surface(
+                            desk.runtime_id,
+                            surface.id,
+                            cwd,
+                            terminal,
+                        ) {
+                            let msg = format!("Agent runtime did not start: {error}");
+                            desk.runtime_notice = Some(SharedString::from(msg));
+                        }
+                    }
+                }
             }
             PaneKind::Editor => {
                 if let Some(editor) = editor {
@@ -2665,6 +2810,7 @@ impl CanvasShell {
         url: Option<String>,
         file_path: Option<String>,
         focus: bool,
+        agent_bridge: &agent_sessions::AgentRuntimeBridge,
     ) -> Result<(PaneId, SurfaceId), String> {
         let editor_lookup_path = if kind == PaneKind::Editor {
             file_path.as_deref().map(canonical_path_string)
@@ -2701,7 +2847,14 @@ impl CanvasShell {
             let pane_size = pane.size;
             pane.push_surface(surface.clone(), focus);
             let pane_surface_count = pane.surfaces.len();
-            Self::initialize_surface_runtime(desk, pane_size, pane_surface_count, &surface, editor);
+            Self::initialize_surface_runtime(
+                desk,
+                pane_size,
+                pane_surface_count,
+                &surface,
+                editor,
+                agent_bridge,
+            );
             desk.resize_terminals_for_pane(pane_id);
             if focus {
                 desk.focus_surface(pane_id, surface_id);
@@ -2735,7 +2888,14 @@ impl CanvasShell {
             .unwrap_or_else(|| WorkdeskPoint::new(80.0 + cascade, 96.0 + cascade));
         let pane = PaneRecord::new(pane_id, position, size, surface.clone(), None);
         desk.panes.push(pane);
-        Self::initialize_surface_runtime(desk, size, 1, &surface, editor);
+        Self::initialize_surface_runtime(
+            desk,
+            size,
+            1,
+            &surface,
+            editor,
+            agent_bridge,
+        );
         if focus {
             desk.focus_surface(pane_id, surface_id);
             *active_workdesk = desk_index;
@@ -2754,6 +2914,7 @@ impl CanvasShell {
         file_path: Option<String>,
         focus: bool,
     ) -> Result<(PaneId, SurfaceId), String> {
+        let bridge = &self.agent_runtime;
         Self::spawn_surface_on_workdesk_state(
             &mut self.workdesks,
             &mut self.active_workdesk,
@@ -2764,6 +2925,7 @@ impl CanvasShell {
             url,
             file_path,
             focus,
+            bridge,
         )
     }
 
@@ -2778,6 +2940,9 @@ impl CanvasShell {
             return;
         }
 
+        let workdesk_runtime_id = self.active_workdesk().runtime_id;
+        self.agent_runtime
+            .stop_surface(workdesk_runtime_id, surface_id);
         let desk = self.active_workdesk_mut();
         let Some(pane) = desk.pane_mut(pane_id) else {
             return;
@@ -2806,9 +2971,13 @@ impl CanvasShell {
         else {
             return false;
         };
-        let desk = self.active_workdesk_mut();
-        desk.focus_surface(pane_id, next_surface_id);
-        desk.note_pane_activity(pane_id);
+        {
+            let desk = self.active_workdesk_mut();
+            desk.focus_surface(pane_id, next_surface_id);
+            desk.note_pane_activity(pane_id);
+        }
+        let desk_index = self.active_workdesk;
+        self.ensure_agent_runtime_for_pane(desk_index, pane_id);
         self.request_persist(cx);
         cx.notify();
         true
@@ -2877,9 +3046,21 @@ impl CanvasShell {
                 let draft =
                     normalize_workdesk_draft(editor.draft, &name, editor.template.summary());
                 let mut desk = workdesk_from_template(editor.template, draft);
+                desk.runtime_id = self.allocate_workdesk_runtime_id();
                 boot_workdesk_terminals(&mut desk);
                 self.workdesks.push(desk);
                 self.active_workdesk = self.workdesks.len() - 1;
+                let idx = self.active_workdesk;
+                if let Err(error) = self.sync_review_summary_for_desk(idx) {
+                    if let Some(desk) = self.workdesks.get_mut(idx) {
+                        desk.runtime_notice = Some(SharedString::from(format!(
+                            "review summary stale: {error}"
+                        )));
+                    }
+                }
+                let bridge = &self.agent_runtime;
+                let desk_ref = &mut self.workdesks[idx];
+                Self::boot_agent_sessions_for_desk(bridge, desk_ref.runtime_id, desk_ref);
             }
             WorkdeskEditorMode::Edit(index) => {
                 if index >= self.workdesks.len() {
@@ -2897,6 +3078,17 @@ impl CanvasShell {
                 desk.name = draft.name;
                 desk.summary = draft.summary;
                 desk.metadata = draft.metadata.hydrated();
+                desk.worktree_binding = worktrees::refreshed_binding_from_desk_paths(
+                    &desk.metadata.cwd,
+                    &desk.metadata.branch,
+                );
+                if let Err(error) = self.sync_review_summary_for_desk(index) {
+                    if let Some(desk) = self.workdesks.get_mut(index) {
+                        desk.runtime_notice = Some(SharedString::from(format!(
+                            "review summary stale: {error}"
+                        )));
+                    }
+                }
             }
         }
 
@@ -2969,396 +3161,396 @@ impl CanvasShell {
         processed
     }
 
+    fn resolve_workdesk_index_by_automation_id(&self, workdesk_id: &str) -> Result<usize, String> {
+        self.workdesks
+            .iter()
+            .position(|desk| desk.runtime_id.to_string() == workdesk_id || desk.name == workdesk_id)
+            .ok_or_else(|| format!("workdesk `{workdesk_id}` was not found"))
+    }
+
+    fn resolve_workdesk_index_by_worktree_id(&self, worktree_id: &WorktreeId) -> Result<usize, String> {
+        self.workdesks
+            .iter()
+            .position(|desk| worktree_id_from_desk(desk).as_ref() == Some(worktree_id))
+            .ok_or_else(|| format!("worktree `{}` was not found", worktree_id.0))
+    }
+
+    fn worktree_state_json(&self, desk_index: usize) -> Value {
+        let desk = &self.workdesks[desk_index];
+        json!({
+            "worktree_id": worktree_id_from_desk(desk),
+            "binding": desk.worktree_binding,
+            "workdesk": automation_workdesk_summary_json(
+                desk_index,
+                desk,
+                desk_index == self.active_workdesk,
+            ),
+        })
+    }
+
+    fn refresh_worktree_binding_for_desk(&mut self, desk_index: usize) -> Result<WorktreeBinding, String> {
+        let binding = {
+            let desk = &self.workdesks[desk_index];
+            if let Some(binding) = desk.worktree_binding.clone() {
+                WorktreeService::refresh(&binding).map_err(|error| error.to_string())?
+            } else {
+                WorktreeService::attach(&desk.metadata.cwd, None).map_err(|error| error.to_string())?
+            }
+        };
+
+        {
+            let desk = &mut self.workdesks[desk_index];
+            desk.metadata.cwd = binding.root_path.clone();
+            desk.metadata.branch = binding.branch.clone();
+            desk.worktree_binding = Some(binding.clone());
+        }
+        if let Err(error) = self.sync_review_summary_for_desk(desk_index) {
+            if let Some(desk) = self.workdesks.get_mut(desk_index) {
+                desk.runtime_notice = Some(SharedString::from(format!(
+                    "review summary stale: {error}"
+                )));
+            }
+        }
+        Ok(binding)
+    }
+
+    fn sync_review_summary_for_desk(&mut self, desk_index: usize) -> Result<(), String> {
+        let previous = self
+            .workdesks
+            .get(desk_index)
+            .and_then(|desk| desk.review_summary.clone());
+        let binding = self
+            .workdesks
+            .get(desk_index)
+            .and_then(|desk| desk.worktree_binding.clone());
+        let Some(binding) = binding else {
+            if let Some(desk) = self.workdesks.get_mut(desk_index) {
+                desk.review_summary =
+                    refreshed_desk_review_summary_view(previous.as_ref(), None, None);
+            }
+            return Ok(());
+        };
+
+        let base_changed = binding
+            .base_branch
+            .as_deref()
+            .map(|base_branch| {
+                WorktreeService::changed_files_since_base(&binding.root_path, base_branch)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let uncommitted =
+            WorktreeService::uncommitted_changed_files(&binding.root_path)
+                .map_err(|error| error.to_string())?;
+        let changed_files = merge_changed_files(&base_changed, &uncommitted);
+
+        if let Some(desk) = self.workdesks.get_mut(desk_index) {
+            desk.review_summary = Some(build_desk_review_summary_view(&binding, &changed_files));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_worktree_backed_desk(
+        &mut self,
+        binding: WorktreeBinding,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        if let Some(index) = self.workdesks.iter().position(|desk| {
+            desk.worktree_binding
+                .as_ref()
+                .map(|existing| existing.root_path == binding.root_path)
+                .unwrap_or_else(|| desk.metadata.cwd == binding.root_path)
+        }) {
+            {
+                let desk = &mut self.workdesks[index];
+                desk.metadata.cwd = binding.root_path.clone();
+                desk.metadata.branch = binding.branch.clone();
+                desk.worktree_binding = Some(binding);
+            }
+            if let Err(error) = self.sync_review_summary_for_desk(index) {
+                if let Some(desk) = self.workdesks.get_mut(index) {
+                    desk.runtime_notice = Some(SharedString::from(format!(
+                        "review summary stale: {error}"
+                    )));
+                }
+            }
+            if index != self.active_workdesk {
+                self.select_workdesk(index, cx);
+            } else {
+                self.request_persist(cx);
+            }
+            return index;
+        }
+
+        let name = self.unique_workdesk_name(&format!(
+            "{} {}",
+            WorkdeskTemplate::Implementation.base_name(),
+            binding.branch
+        ));
+        let mut draft = WorkdeskDraft::from_template(name, WorkdeskTemplate::Implementation);
+        draft.metadata.cwd = binding.root_path.clone();
+        draft.metadata.branch = binding.branch.clone();
+        let mut desk = workdesk_from_template(WorkdeskTemplate::Implementation, draft);
+        desk.runtime_id = self.allocate_workdesk_runtime_id();
+        desk.worktree_binding = Some(binding);
+        boot_workdesk_terminals(&mut desk);
+        self.workdesks.push(desk);
+        let index = self.workdesks.len() - 1;
+        if let Err(error) = self.sync_review_summary_for_desk(index) {
+            if let Some(desk) = self.workdesks.get_mut(index) {
+                desk.runtime_notice = Some(SharedString::from(format!(
+                    "review summary stale: {error}"
+                )));
+            }
+        }
+        let bridge = &self.agent_runtime;
+        let desk_ref = &mut self.workdesks[index];
+        Self::boot_agent_sessions_for_desk(bridge, desk_ref.runtime_id, desk_ref);
+        self.select_workdesk(index, cx);
+        index
+    }
+
+    fn first_agent_surface_id(&self, desk_index: usize) -> Option<SurfaceId> {
+        self.workdesks
+            .get(desk_index)?
+            .panes
+            .iter()
+            .flat_map(|pane| pane.surfaces.iter())
+            .find(|surface| surface.kind == PaneKind::Agent)
+            .map(|surface| surface.id)
+    }
+
     fn handle_automation_request(
         &mut self,
-        request: AutomationRequest,
+        request: SharedAutomationRequest,
         cx: &mut Context<Self>,
-    ) -> AutomationResponse {
-        let id = request.id.clone();
-        let response: Result<Value, String> = (|| match request.method.as_str() {
-            "workdesk.list" => Ok(Value::Array(
-                self.workdesks
-                    .iter()
-                    .enumerate()
-                    .map(|(index, desk)| {
-                        automation_workdesk_summary_json(index, desk, index == self.active_workdesk)
-                    })
-                    .collect(),
-            )),
-            "workdesk.create" => {
-                let template = json_string_at(&request.params, &["template"])
-                    .map(|value| {
-                        WorkdeskTemplate::from_api_name(&value)
-                            .ok_or_else(|| format!("unknown template `{value}`"))
-                    })
-                    .transpose()?
-                    .unwrap_or(WorkdeskTemplate::ShellDesk);
-                let default_name = self.workdesk_name_for_template(template);
-                let mut draft = WorkdeskDraft::from_template(default_name.clone(), template);
-                if let Some(name) = json_string_at(&request.params, &["name"]) {
-                    draft.name = self.unique_workdesk_name(&name);
+    ) -> SharedAutomationResponse {
+        let response = (|| -> Result<Value, String> {
+            match request {
+                SharedAutomationRequest::WorktreeCreateOrAttach {
+                    repo_root,
+                    branch,
+                    attach_path,
+                } => {
+                    let binding = match (attach_path, branch) {
+                        (Some(path), base_branch) => WorktreeService::attach(&path, base_branch)
+                            .map_err(|error| error.to_string())?,
+                        (None, Some(branch)) => {
+                            let repo_binding = WorktreeService::attach(&repo_root, None)
+                                .map_err(|error| error.to_string())?;
+                            let worktree_path = default_worktree_path(&repo_root, &branch)?;
+                            if worktree_path.exists() {
+                                WorktreeService::attach(&worktree_path, Some(repo_binding.branch))
+                                    .map_err(|error| error.to_string())?
+                            } else {
+                                WorktreeService::create_worktree(
+                                    &repo_root,
+                                    &worktree_path,
+                                    &branch,
+                                    &repo_binding.branch,
+                                )
+                                .map_err(|error| error.to_string())?
+                            }
+                        }
+                        (None, None) => WorktreeService::attach(&repo_root, None)
+                            .map_err(|error| error.to_string())?,
+                    };
+                    let desk_index = self.ensure_worktree_backed_desk(binding, cx);
+                    Ok(self.worktree_state_json(desk_index))
                 }
-                if let Some(summary) = json_string_at(&request.params, &["summary"]) {
-                    draft.summary = summary;
-                }
-                if let Some(intent) = json_string_at(&request.params, &["intent"]) {
-                    draft.metadata.intent = intent;
-                }
-                if let Some(cwd) = json_string_at(&request.params, &["cwd"]) {
-                    draft.metadata.cwd = cwd;
-                }
-                if let Some(branch) = json_string_at(&request.params, &["branch"]) {
-                    draft.metadata.branch = branch;
-                }
-                if json_has_any(&request.params, &["status"]) {
-                    draft.metadata.status = json_optional_string_at(&request.params, &["status"])?;
-                }
-                if let Some(progress) = json_value_at(&request.params, &["progress"]) {
-                    draft.metadata.progress = parse_progress_value(progress)?;
-                }
-                let select = json_bool_at(&request.params, &["select"]).unwrap_or(true);
-                let mut desk = workdesk_from_template(template, draft);
-                boot_workdesk_terminals(&mut desk);
-                self.workdesks.push(desk);
-                let index = self.workdesks.len() - 1;
-                if select {
-                    self.select_workdesk(index, cx);
-                } else {
+                SharedAutomationRequest::WorktreeStatus { worktree_id } => {
+                    let desk_index = self.resolve_workdesk_index_by_worktree_id(&worktree_id)?;
+                    self.refresh_worktree_binding_for_desk(desk_index)?;
                     self.request_persist(cx);
+                    Ok(self.worktree_state_json(desk_index))
                 }
-                Ok(automation_workdesk_summary_json(
-                    index,
-                    &self.workdesks[index],
-                    index == self.active_workdesk,
-                ))
-            }
-            "workdesk.select" => {
-                let index = if let Some(name) =
-                    json_string_at(&request.params, &["workdesk_name", "name"])
-                {
-                    self.workdesks
-                        .iter()
-                        .position(|desk| desk.name == name)
-                        .ok_or_else(|| format!("workdesk `{name}` was not found"))?
-                } else {
-                    self.resolve_automation_workdesk_index(&request.params)?
-                };
-                self.select_workdesk(index, cx);
-                Ok(automation_workdesk_summary_json(
-                    index,
-                    &self.workdesks[index],
-                    true,
-                ))
-            }
-            "workdesk.rename" => {
-                let index = self.resolve_automation_workdesk_index(&request.params)?;
-                let name = require_json_string_at(&request.params, &["name"], "name")?;
-                let name = self.unique_workdesk_name_except(index, &name);
-                self.workdesks[index].name = name;
-                self.request_persist(cx);
-                Ok(automation_workdesk_summary_json(
-                    index,
-                    &self.workdesks[index],
-                    index == self.active_workdesk,
-                ))
-            }
-            "pane.create" => {
-                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
-                let kind = json_string_at(&request.params, &["kind"])
-                    .and_then(|value| parse_pane_kind(&value))
-                    .ok_or_else(|| {
-                        "pane.create requires `kind` = `shell`, `agent`, `browser`, or `editor`"
-                            .to_string()
-                    })?;
-                let title = json_string_at(&request.params, &["title"]);
-                let url = json_string_at(&request.params, &["url"]);
-                let file_path = json_string_at(&request.params, &["file_path"]);
-                let focus = json_bool_at(&request.params, &["focus"]).unwrap_or(true);
-                let (pane_id, _) = self.spawn_surface_on_workdesk(
-                    desk_index, None, kind, title, url, file_path, focus,
-                )?;
-                self.request_persist(cx);
-                Ok(automation_pane_json(
-                    &self.workdesks[desk_index],
-                    pane_id,
-                    desk_index == self.active_workdesk,
-                ))
-            }
-            "surface.list" => {
-                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
-                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
-                let desk = &self.workdesks[desk_index];
-                let pane = desk
-                    .pane(pane_id)
-                    .ok_or_else(|| format!("pane {} was not found", pane_id.raw()))?;
-                Ok(Value::Array(
-                    pane.surfaces
-                        .iter()
-                        .map(|surface| automation_surface_json(desk, pane_id, surface))
-                        .collect(),
-                ))
-            }
-            "surface.create" => {
-                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
-                let target_pane_id = json_u64_at(&request.params, &["pane_id"]).map(PaneId::new);
-                let kind = json_string_at(&request.params, &["kind"])
-                    .and_then(|value| parse_pane_kind(&value))
-                    .ok_or_else(|| {
-                        "surface.create requires `kind` = `shell`, `agent`, `browser`, or `editor`"
-                            .to_string()
-                    })?;
-                let title = json_string_at(&request.params, &["title"]);
-                let url = json_string_at(&request.params, &["url"]);
-                let file_path = json_string_at(&request.params, &["file_path"]);
-                let focus = json_bool_at(&request.params, &["focus"]).unwrap_or(true);
-                let (pane_id, surface_id) = self.spawn_surface_on_workdesk(
-                    desk_index,
-                    target_pane_id,
-                    kind,
-                    title,
-                    url,
-                    file_path,
-                    focus,
-                )?;
-                self.request_persist(cx);
-                let desk = &self.workdesks[desk_index];
-                let pane = desk
-                    .pane(pane_id)
-                    .ok_or_else(|| format!("pane {} was not found", pane_id.raw()))?;
-                let surface = pane
-                    .surface(surface_id)
-                    .ok_or_else(|| format!("surface {} was not found", surface_id.raw()))?;
-                Ok(json!({
-                    "pane": automation_pane_json(desk, pane_id, desk_index == self.active_workdesk),
-                    "surface": automation_surface_json(desk, pane_id, surface),
-                }))
-            }
-            "surface.focus" => {
-                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
-                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
-                let surface_id =
-                    self.resolve_automation_surface_id(desk_index, pane_id, &request.params)?;
-                self.active_workdesk = desk_index;
-                self.workdesks[desk_index].focus_surface(pane_id, surface_id);
-                self.request_persist(cx);
-                Ok(automation_pane_json(
-                    &self.workdesks[desk_index],
-                    pane_id,
-                    true,
-                ))
-            }
-            "surface.close" => {
-                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
-                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
-                let surface_id =
-                    self.resolve_automation_surface_id(desk_index, pane_id, &request.params)?;
-                let pane_had_multiple = self.workdesks[desk_index]
-                    .pane(pane_id)
-                    .map(|pane| pane.surfaces.len() > 1)
-                    .unwrap_or(false);
-                self.active_workdesk = desk_index;
-                self.close_surface(pane_id, surface_id, cx);
-                self.request_persist(cx);
-                if pane_had_multiple {
-                    Ok(automation_pane_json(
-                        &self.workdesks[desk_index],
-                        pane_id,
-                        true,
-                    ))
-                } else {
+                SharedAutomationRequest::AgentStart {
+                    worktree_id,
+                    provider_profile_id,
+                    argv,
+                } => {
+                    let desk_index = self.resolve_workdesk_index_by_worktree_id(&worktree_id)?;
+                    let desk_runtime_id = self.workdesks[desk_index].runtime_id;
+                    let surface_id = self
+                        .first_agent_surface_id(desk_index)
+                        .ok_or_else(|| format!("worktree `{}` has no agent surface", worktree_id.0))?;
+                    if let Some(existing) = self
+                        .agent_runtime
+                        .session_for_surface(desk_runtime_id, surface_id)
+                    {
+                        if existing.provider_profile_id != provider_profile_id {
+                            return Err(format!(
+                                "agent surface already runs `{}`",
+                                existing.provider_profile_id
+                            ));
+                        }
+                        return Ok(agent_session_json(&existing));
+                    }
+
+                    {
+                        let bridge = &self.agent_runtime;
+                        let desk = &mut self.workdesks[desk_index];
+                        start_agent_runtime_for_surface_with_profile(
+                            bridge,
+                            desk_runtime_id,
+                            desk,
+                            surface_id,
+                            Some(&provider_profile_id),
+                            argv,
+                        )?;
+                    }
+                    let record = self
+                        .agent_runtime
+                        .session_for_surface(desk_runtime_id, surface_id)
+                        .ok_or_else(|| "agent session did not register".to_string())?;
+                    Ok(agent_session_json(&record))
+                }
+                SharedAutomationRequest::AgentStop { agent_session_id } => {
+                    self.agent_runtime.stop_session(&agent_session_id)?;
+                    for desk in &self.workdesks {
+                        for terminal in desk.terminals.values() {
+                            if terminal
+                                .agent_metadata()
+                                .as_ref()
+                                .is_some_and(|meta| meta.session_id == agent_session_id)
+                            {
+                                terminal.set_agent_metadata(None);
+                            }
+                        }
+                    }
                     Ok(json!({
-                        "pane_closed": true,
-                        "pane_id": pane_id.raw(),
-                        "surface_id": surface_id.raw(),
+                        "agent_session_id": agent_session_id,
+                        "stopped": true,
                     }))
                 }
-            }
-            "pane.focus" => {
-                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
-                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
-                if desk_index != self.active_workdesk {
-                    self.select_workdesk(desk_index, cx);
+                SharedAutomationRequest::AgentList { worktree_id } => {
+                    let filter_workdesk_id = worktree_id
+                        .as_ref()
+                        .map(|id| self.resolve_workdesk_index_by_worktree_id(id))
+                        .transpose()?
+                        .map(|index| self.workdesks[index].runtime_id.to_string());
+                    let sessions = self
+                        .agent_runtime
+                        .sessions_snapshot()
+                        .into_iter()
+                        .filter(|record| {
+                            filter_workdesk_id.as_ref().map_or(true, |workdesk_id| {
+                                record.workdesk_id.as_ref() == Some(workdesk_id)
+                            })
+                        })
+                        .map(|record| agent_session_json(&record))
+                        .collect::<Vec<_>>();
+                    Ok(Value::Array(sessions))
                 }
-                self.focus_pane(pane_id, cx);
-                Ok(automation_pane_json(
-                    &self.workdesks[desk_index],
-                    pane_id,
-                    true,
-                ))
-            }
-            "attention.set" => {
-                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
-                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
-                let state = json_string_at(&request.params, &["state"])
-                    .and_then(|value| AttentionState::from_api_name(&value))
-                    .ok_or_else(|| "attention.set requires `state`".to_string())?;
-                let unread =
-                    json_bool_at(&request.params, &["unread"]).unwrap_or(state.is_attention());
-                self.set_pane_attention(desk_index, pane_id, state, unread, true, cx);
-                Ok(automation_pane_json(
-                    &self.workdesks[desk_index],
-                    pane_id,
-                    desk_index == self.active_workdesk,
-                ))
-            }
-            "attention.clear" => {
-                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
-                let pane_id = self.resolve_automation_pane_id(desk_index, &request.params)?;
-                let baseline = self.baseline_attention_state(desk_index, pane_id);
-                self.set_pane_attention(desk_index, pane_id, baseline, false, false, cx);
-                Ok(automation_pane_json(
-                    &self.workdesks[desk_index],
-                    pane_id,
-                    desk_index == self.active_workdesk,
-                ))
-            }
-            "status.set" => {
-                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
-                self.workdesks[desk_index].metadata.status =
-                    json_optional_string_at(&request.params, &["value", "status"])?;
-                self.request_persist(cx);
-                Ok(automation_workdesk_summary_json(
-                    desk_index,
-                    &self.workdesks[desk_index],
-                    desk_index == self.active_workdesk,
-                ))
-            }
-            "progress.set" => {
-                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
-                let progress = if let Some(progress_value) =
-                    json_value_at(&request.params, &["progress", "value"])
-                {
-                    if progress_value.is_object() {
-                        parse_progress_value(progress_value)?
+                SharedAutomationRequest::DeskReviewSummary { worktree_id } => {
+                    let desk_index = self.resolve_workdesk_index_by_worktree_id(&worktree_id)?;
+                    let binding = self.refresh_worktree_binding_for_desk(desk_index)?;
+                    let changed_files = binding
+                        .base_branch
+                        .as_deref()
+                        .map(|base_branch| {
+                            WorktreeService::changed_files_since_base(&binding.root_path, base_branch)
+                                .map_err(|error| error.to_string())
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+                    let uncommitted_files =
+                        WorktreeService::uncommitted_changed_files(&binding.root_path)
+                            .map_err(|error| error.to_string())?;
+                    let summary = ReviewSummary {
+                        files_changed: changed_files.len() as u32,
+                        uncommitted_files: uncommitted_files.len() as u32,
+                        ready_for_review: !changed_files.is_empty()
+                            || !uncommitted_files.is_empty(),
+                        last_inspected_at_ms: Some(unix_time_ms()),
+                    };
+                    self.request_persist(cx);
+                    Ok(json!({
+                        "worktree_id": worktree_id,
+                        "summary": summary,
+                        "changed_files": changed_files,
+                        "uncommitted_files": uncommitted_files,
+                    }))
+                }
+                SharedAutomationRequest::AttentionNext { workdesk_id } => {
+                    let target = if let Some(workdesk_id) = workdesk_id {
+                        let desk_index = self.resolve_workdesk_index_by_automation_id(&workdesk_id)?;
+                        next_attention_target_for_workdesk(&self.workdesks[desk_index])
+                            .map(|pane_id| (desk_index, pane_id))
                     } else {
-                        let label = require_json_string_at(&request.params, &["label"], "label")?;
-                        let value = progress_value.as_u64().ok_or_else(|| {
-                            "`value` must be an integer from 0 to 100".to_string()
-                        })?;
-                        Some(WorkdeskProgress::new(label, value as u8))
-                    }
-                } else {
-                    None
-                };
-                self.workdesks[desk_index].metadata.progress = progress;
-                self.request_persist(cx);
-                Ok(automation_workdesk_summary_json(
-                    desk_index,
-                    &self.workdesks[desk_index],
-                    desk_index == self.active_workdesk,
-                ))
-            }
-            "notification.create" => {
-                let desk_index = self.resolve_automation_workdesk_index(&request.params)?;
-                let body = require_json_string_at(&request.params, &["body", "message"], "body")?;
-                let title = json_string_at(&request.params, &["title"]);
-                let message = title
-                    .as_deref()
-                    .map(|title| format!("{title} · {body}"))
-                    .unwrap_or_else(|| body.clone());
-                self.workdesks[desk_index].runtime_notice =
-                    Some(SharedString::from(message.clone()));
-                if json_bool_at(&request.params, &["desktop"]).unwrap_or(false) {
-                    post_attention_notification(
-                        title.unwrap_or_else(|| "Canvas".to_string()),
-                        body.clone(),
-                    );
+                        self.next_attention_target()
+                    };
+                    let Some((desk_index, pane_id)) = target else {
+                        return Ok(Value::Null);
+                    };
+                    let _ = self.navigate_to_workdesk_pane(desk_index, pane_id, cx);
+                    Ok(json!({
+                        "workdesk": automation_workdesk_summary_json(
+                            desk_index,
+                            &self.workdesks[desk_index],
+                            desk_index == self.active_workdesk,
+                        ),
+                        "pane": automation_pane_json(
+                            &self.workdesks[desk_index],
+                            pane_id,
+                            desk_index == self.active_workdesk,
+                        ),
+                    }))
                 }
-                Ok(json!({
-                    "desk_index": desk_index,
-                    "message": message,
-                }))
+                SharedAutomationRequest::StateCurrent { workdesk_id } => {
+                    if let Some(workdesk_id) = workdesk_id {
+                        let desk_index = self.resolve_workdesk_index_by_automation_id(&workdesk_id)?;
+                        let filter_workdesk_id = self.workdesks[desk_index].runtime_id.to_string();
+                        let sessions = self
+                            .agent_runtime
+                            .sessions_snapshot()
+                            .into_iter()
+                            .filter(|record| {
+                                record.workdesk_id.as_deref()
+                                    == Some(filter_workdesk_id.as_str())
+                            })
+                            .map(|record| agent_session_json(&record))
+                            .collect::<Vec<_>>();
+                        Ok(json!({
+                            "active_workdesk": self.active_workdesk,
+                            "socket_path": self.automation_socket_path.to_string(),
+                            "workdesk": automation_workdesk_state_json(
+                                desk_index,
+                                &self.workdesks[desk_index],
+                                desk_index == self.active_workdesk,
+                            ),
+                            "worktree_id": worktree_id_from_desk(&self.workdesks[desk_index]),
+                            "agent_sessions": sessions,
+                        }))
+                    } else {
+                        Ok(self.automation_state_json())
+                    }
+                }
             }
-            "state.current" => Ok(self.automation_state_json()),
-            other => Err(format!("unknown automation method `{other}`")),
         })();
 
         match response {
-            Ok(result) => AutomationResponse::success(id, result),
-            Err(error) => AutomationResponse::error(id, error),
+            Ok(result) => SharedAutomationResponse::success_with_result(result),
+            Err(error) => SharedAutomationResponse::failure(error),
         }
-    }
-
-    fn resolve_automation_workdesk_index(&self, params: &Value) -> Result<usize, String> {
-        if let Some(index) = json_u64_at(params, &["workdesk_index", "index"]) {
-            let index = index as usize;
-            if index < self.workdesks.len() {
-                return Ok(index);
-            }
-            return Err(format!("workdesk index {index} is out of range"));
-        }
-
-        if let Some(name) = json_string_at(params, &["workdesk_name"]) {
-            return self
-                .workdesks
-                .iter()
-                .position(|desk| desk.name == name)
-                .ok_or_else(|| format!("workdesk `{name}` was not found"));
-        }
-
-        Ok(self.active_workdesk)
-    }
-
-    fn resolve_automation_pane_id(
-        &self,
-        desk_index: usize,
-        params: &Value,
-    ) -> Result<PaneId, String> {
-        let desk = self
-            .workdesks
-            .get(desk_index)
-            .ok_or_else(|| format!("workdesk index {desk_index} is out of range"))?;
-
-        if let Some(raw_id) = json_u64_at(params, &["pane_id", "id"]) {
-            let pane_id = PaneId::new(raw_id);
-            if desk.panes.iter().any(|pane| pane.id == pane_id) {
-                return Ok(pane_id);
-            }
-            return Err(format!(
-                "pane {} was not found on workdesk `{}`",
-                raw_id, desk.name
-            ));
-        }
-
-        desk.active_pane
-            .ok_or_else(|| format!("workdesk `{}` does not have an active pane", desk.name))
-    }
-
-    fn resolve_automation_surface_id(
-        &self,
-        desk_index: usize,
-        pane_id: PaneId,
-        params: &Value,
-    ) -> Result<SurfaceId, String> {
-        let desk = self
-            .workdesks
-            .get(desk_index)
-            .ok_or_else(|| format!("workdesk index {desk_index} is out of range"))?;
-        let pane = desk
-            .pane(pane_id)
-            .ok_or_else(|| format!("pane {} was not found", pane_id.raw()))?;
-
-        if let Some(raw_id) = json_u64_at(params, &["surface_id", "id"]) {
-            let surface_id = SurfaceId::new(raw_id);
-            if pane.surface(surface_id).is_some() {
-                return Ok(surface_id);
-            }
-            return Err(format!(
-                "surface {} was not found on pane {}",
-                raw_id,
-                pane_id.raw()
-            ));
-        }
-
-        Ok(pane.active_surface_id)
     }
 
     fn automation_state_json(&self) -> Value {
         json!({
             "active_workdesk": self.active_workdesk,
             "socket_path": self.automation_socket_path.to_string(),
+            "agent_sessions": self.agent_runtime.sessions_snapshot().iter().map(agent_session_json).collect::<Vec<_>>(),
             "workdesks": self.workdesks.iter().enumerate().map(|(index, desk)| {
-                automation_workdesk_state_json(index, desk, index == self.active_workdesk)
+                let mut state = automation_workdesk_state_json(index, desk, index == self.active_workdesk);
+                if let Some(object) = state.as_object_mut() {
+                    object.insert(
+                        "worktree_id".to_string(),
+                        serde_json::to_value(worktree_id_from_desk(desk)).unwrap_or(Value::Null),
+                    );
+                }
+                state
             }).collect::<Vec<_>>(),
         })
     }
@@ -3367,19 +3559,7 @@ impl CanvasShell {
         let Some(desk) = self.workdesks.get(desk_index) else {
             return AttentionState::Idle;
         };
-        let Some(pane) = desk.panes.iter().find(|pane| pane.id == pane_id) else {
-            return AttentionState::Idle;
-        };
-
-        match pane.kind {
-            PaneKind::Agent => desk
-                .active_terminal_session_for_pane(pane_id)
-                .map(|terminal| terminal.snapshot())
-                .filter(|snapshot| !snapshot.closed)
-                .map(|_| AttentionState::Working)
-                .unwrap_or(AttentionState::Idle),
-            PaneKind::Shell | PaneKind::Browser | PaneKind::Editor => AttentionState::Idle,
-        }
+        agent_runtime_baseline_attention_state(&self.agent_runtime, desk, pane_id)
     }
 
     fn set_pane_attention(
@@ -3392,7 +3572,7 @@ impl CanvasShell {
         cx: &mut Context<Self>,
     ) -> bool {
         let active_workdesk = self.active_workdesk;
-        let (changed, desk_name, pane_title, is_visible) = {
+        let (changed, previous_state, desk_name, pane_title) = {
             let Some(desk) = self.workdesks.get_mut(desk_index) else {
                 return false;
             };
@@ -3406,12 +3586,13 @@ impl CanvasShell {
             };
             let effective_unread =
                 unread && !(active_workdesk == desk_index && desk.active_pane == Some(pane_id));
+            let previous_state = desk.pane_attention(pane_id).state;
             let changed = desk.set_pane_attention_state(pane_id, state, effective_unread);
             (
                 changed,
+                previous_state,
                 desk.name.clone(),
                 pane_title,
-                active_workdesk == desk_index && desk.active_pane == Some(pane_id),
             )
         };
 
@@ -3419,14 +3600,8 @@ impl CanvasShell {
             return false;
         }
 
-        if announce && state.is_attention() {
+        if announce && should_notify_attention_transition(previous_state, state) {
             self.set_runtime_notice(format!("{pane_title} on {desk_name} is {}", state.label()));
-            if !is_visible {
-                post_attention_notification(
-                    format!("Canvas · {desk_name}"),
-                    format!("{pane_title} is {}", state.label().to_lowercase()),
-                );
-            }
         }
 
         self.request_persist(cx);
@@ -3446,15 +3621,25 @@ impl CanvasShell {
         let desk_index = self.active_workdesk;
         let current = self.active_workdesk().pane_attention(pane_id).state;
         let next = match current {
-            AttentionState::Idle | AttentionState::Working => AttentionState::Waiting,
-            AttentionState::Waiting => AttentionState::Error,
+            AttentionState::Idle | AttentionState::Working => AttentionState::NeedsInput,
+            AttentionState::NeedsInput => AttentionState::NeedsReview,
+            AttentionState::NeedsReview => AttentionState::Error,
             AttentionState::Error => self.baseline_attention_state(desk_index, pane_id),
         };
         self.set_pane_attention(desk_index, pane_id, next, next.is_attention(), true, cx)
     }
 
     fn next_attention_target(&self) -> Option<(usize, PaneId)> {
-        next_attention_target_for_workdesks(&self.workdesks)
+        next_attention_workdesk_target(
+            self.workdesks.iter().enumerate().map(|(desk_index, desk)| {
+                (
+                    desk_index,
+                    desk.panes
+                        .iter()
+                        .map(|pane| (pane.id, desk.pane_attention(pane.id))),
+                )
+            }),
+        )
     }
 
     fn navigate_to_workdesk_pane(
@@ -3505,7 +3690,9 @@ impl CanvasShell {
             AttentionState::Idle | AttentionState::Working => {
                 self.set_pane_attention(desk_index, pane_id, next_state, false, false, cx)
             }
-            AttentionState::Waiting | AttentionState::Error => {
+            AttentionState::NeedsInput
+            | AttentionState::NeedsReview
+            | AttentionState::Error => {
                 self.set_pane_attention(desk_index, pane_id, next_state, true, true, cx)
             }
         }
@@ -3719,11 +3906,15 @@ impl CanvasShell {
     }
 
     fn activate_grid_pane(&mut self, pane_id: PaneId, close_expose: bool, cx: &mut Context<Self>) {
-        let desk = self.active_workdesk_mut();
-        desk.focus_pane(pane_id);
-        if close_expose {
-            desk.grid_layout.expose_open = false;
+        {
+            let desk = self.active_workdesk_mut();
+            desk.focus_pane(pane_id);
+            if close_expose {
+                desk.grid_layout.expose_open = false;
+            }
         }
+        let desk_index = self.active_workdesk;
+        self.ensure_agent_runtime_for_pane(desk_index, pane_id);
         self.cursor_blink_visible = true;
         self.last_cursor_blink_at = Instant::now();
         self.request_persist(cx);
@@ -3970,7 +4161,12 @@ impl CanvasShell {
                 .update(cx, |this, cx| {
                     let automation_changed = this.process_automation_commands(cx);
                     let blink_changed = this.tick_cursor_blink();
-                    if automation_changed || this.sync_terminal_revisions(cx) || blink_changed {
+                    let agent_changed = this.sync_agent_runtime_activity(cx);
+                    if automation_changed
+                        || this.sync_terminal_revisions(cx)
+                        || agent_changed
+                        || blink_changed
+                    {
                         cx.notify();
                     }
                 })
@@ -4310,7 +4506,7 @@ impl CanvasShell {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Open file in Canvas".into()),
+            prompt: Some(format!("Open file in {PRODUCT_NAME}").into()),
         });
         let desk_index = self.active_workdesk;
         cx.spawn(async move |this, cx| {
@@ -4356,11 +4552,19 @@ impl CanvasShell {
         ) {
             self.dismiss_stack_surface_menu();
         }
-        let desk = self.active_workdesk_mut();
-        let removed_surfaces = desk
+        let removed_surfaces = self
+            .active_workdesk()
             .pane(pane_id)
             .map(|pane| pane.surfaces.clone())
             .unwrap_or_default();
+        let workdesk_runtime_id = self.active_workdesk().runtime_id;
+        for surface in &removed_surfaces {
+            if surface.kind == PaneKind::Agent {
+                self.agent_runtime
+                    .stop_surface(workdesk_runtime_id, surface.id);
+            }
+        }
+        let desk = self.active_workdesk_mut();
         desk.panes.retain(|pane| pane.id != pane_id);
 
         for surface in removed_surfaces {
@@ -4806,9 +5010,13 @@ impl CanvasShell {
     }
 
     fn focus_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
-        let desk = self.active_workdesk_mut();
-        desk.focus_pane(pane_id);
-        desk.note_pane_activity(pane_id);
+        {
+            let desk = self.active_workdesk_mut();
+            desk.focus_pane(pane_id);
+            desk.note_pane_activity(pane_id);
+        }
+        let desk_index = self.active_workdesk;
+        self.ensure_agent_runtime_for_pane(desk_index, pane_id);
         self.request_persist(cx);
         cx.notify();
     }
@@ -4819,19 +5027,25 @@ impl CanvasShell {
         position: gpui::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let desk = self.active_workdesk_mut();
-        if desk.layout_mode != LayoutMode::Free {
+        let free_layout = self.active_workdesk().layout_mode == LayoutMode::Free;
+        {
+            let desk = self.active_workdesk_mut();
             desk.focus_pane(pane_id);
+            if free_layout {
+                desk.clear_selection(pane_id);
+                desk.drag_state = DragState::MovingPane {
+                    pane_id,
+                    last_mouse: position,
+                };
+            }
+        }
+        let desk_index = self.active_workdesk;
+        self.ensure_agent_runtime_for_pane(desk_index, pane_id);
+        if !free_layout {
             self.request_persist(cx);
             cx.notify();
             return;
         }
-        desk.focus_pane(pane_id);
-        desk.clear_selection(pane_id);
-        desk.drag_state = DragState::MovingPane {
-            pane_id,
-            last_mouse: position,
-        };
         cx.notify();
     }
 
@@ -4841,19 +5055,25 @@ impl CanvasShell {
         position: gpui::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let desk = self.active_workdesk_mut();
-        if desk.layout_mode != LayoutMode::Free {
+        let free_layout = self.active_workdesk().layout_mode == LayoutMode::Free;
+        {
+            let desk = self.active_workdesk_mut();
             desk.focus_pane(pane_id);
+            if free_layout {
+                desk.clear_selection(pane_id);
+                desk.drag_state = DragState::ResizingPane {
+                    pane_id,
+                    last_mouse: position,
+                };
+            }
+        }
+        let desk_index = self.active_workdesk;
+        self.ensure_agent_runtime_for_pane(desk_index, pane_id);
+        if !free_layout {
             self.request_persist(cx);
             cx.notify();
             return;
         }
-        desk.focus_pane(pane_id);
-        desk.clear_selection(pane_id);
-        desk.drag_state = DragState::ResizingPane {
-            pane_id,
-            last_mouse: position,
-        };
         cx.notify();
     }
 
@@ -4864,13 +5084,19 @@ impl CanvasShell {
         metrics: TerminalFrameMetrics,
         cx: &mut Context<Self>,
     ) {
-        let desk = self.active_workdesk_mut();
-        desk.focus_pane(pane_id);
-        let Some(surface_id) = desk.active_terminal_surface_id_for_pane(pane_id) else {
-            return;
+        let surface_id = {
+            let desk = self.active_workdesk_mut();
+            desk.focus_pane(pane_id);
+            let Some(surface_id) = desk.active_terminal_surface_id_for_pane(pane_id) else {
+                return;
+            };
+            desk.begin_selection(surface_id, metrics.cell_at(position));
+            desk.drag_state = DragState::SelectingTerminal { pane_id, metrics };
+            surface_id
         };
-        desk.begin_selection(surface_id, metrics.cell_at(position));
-        desk.drag_state = DragState::SelectingTerminal { pane_id, metrics };
+        let desk_index = self.active_workdesk;
+        self.ensure_agent_runtime_for_pane(desk_index, pane_id);
+        let _ = surface_id;
         self.cursor_blink_visible = true;
         self.last_cursor_blink_at = Instant::now();
         self.request_persist(cx);
@@ -5324,6 +5550,12 @@ impl CanvasShell {
         }
         if let Some(pane_id) = self.active_workdesk().active_pane {
             self.active_workdesk_mut().mark_pane_attention_seen(pane_id);
+            self.ensure_agent_runtime_for_pane(index, pane_id);
+        }
+        if let Err(error) = self.sync_review_summary_for_desk(index) {
+            self.active_workdesk_mut().runtime_notice = Some(SharedString::from(format!(
+                "review summary stale: {error}"
+            )));
         }
         self.request_persist(cx);
         cx.notify();
@@ -5405,6 +5637,8 @@ impl CanvasShell {
         self.dismiss_notifications();
         self.active_workdesk_mut().focus_pane(pane_id);
         self.active_workdesk_mut().note_pane_activity(pane_id);
+        let desk_index = self.active_workdesk;
+        self.ensure_agent_runtime_for_pane(desk_index, pane_id);
         self.stack_surface_menu = Some(StackSurfaceMenu {
             desk_index: self.active_workdesk,
             pane_id,
@@ -5481,6 +5715,7 @@ impl CanvasShell {
                 WorkdeskTemplate::ShellDesk,
             ),
         );
+        desk.runtime_id = self.allocate_workdesk_runtime_id();
         boot_workdesk_terminals(&mut desk);
         self.workdesks.push(desk);
         self.active_workdesk = self.workdesks.len() - 1;
@@ -5496,10 +5731,14 @@ impl CanvasShell {
         let mut duplicated = PersistedWorkdesk::from_state(source).into_state();
         duplicated.name = self.unique_workdesk_name(&format!("{} Copy", source.name));
         duplicated.summary = source.summary.clone();
-        boot_workdesk_terminals(&mut duplicated);
+        duplicated.runtime_id = self.allocate_workdesk_runtime_id();
 
         let insert_at = index + 1;
         self.workdesks.insert(insert_at, duplicated);
+        let bridge = &self.agent_runtime;
+        let desk_ref = &mut self.workdesks[insert_at];
+        boot_workdesk_terminals(desk_ref);
+        Self::boot_agent_sessions_for_desk(bridge, desk_ref.runtime_id, desk_ref);
         self.active_workdesk = insert_at;
         self.dismiss_workdesk_menu();
         self.request_persist(cx);
@@ -5523,6 +5762,7 @@ impl CanvasShell {
         }
 
         let mut removed = self.workdesks.remove(index);
+        stop_agent_runtime_for_desk(&self.agent_runtime, &mut removed);
         shutdown_workdesk_terminals(&mut removed);
 
         if self.active_workdesk > index {
@@ -5619,6 +5859,22 @@ impl CanvasShell {
             .cloned()
             .unwrap_or(None)
             .filter(|status| !status.trim().is_empty());
+        let agent_provider_badge = matches!(active_surface_kind, PaneKind::Agent)
+            .then(|| {
+                self.agent_runtime
+                    .session_for_surface(workdesk.runtime_id, active_surface_id)
+            })
+            .flatten()
+            .map(|record| {
+                self.agent_runtime
+                    .provider_profile(&record.provider_profile_id)
+                    .and_then(|profile| {
+                        profile.capability_note.map(|note| {
+                            format!("{} · {}", record.provider_profile_id, note)
+                        })
+                    })
+                    .unwrap_or(record.provider_profile_id)
+            });
         let status_tint = if pane_attention.state == AttentionState::Idle {
             match &active_surface_kind {
                 PaneKind::Shell | PaneKind::Agent => terminal_snapshot
@@ -5755,6 +6011,9 @@ impl CanvasShell {
                         .gap_2()
                         .when_some(surface_status_label.clone(), |row, status| {
                             row.child(context_pill(status, surface_status_tint))
+                        })
+                        .when_some(agent_provider_badge.clone(), |row, badge| {
+                            row.child(context_pill(badge, rgb(0x7f8a94).into()))
                         })
                         .when(pane.surfaces.len() > 1, |row| {
                             row.child(context_pill(stack_count_label.clone(), accent))
@@ -6115,6 +6374,8 @@ impl CanvasShell {
                                     this.active_workdesk_mut()
                                         .focus_surface(pane_id, surface_id);
                                     this.active_workdesk_mut().note_pane_activity(pane_id);
+                                    let desk_index = this.active_workdesk;
+                                    this.ensure_agent_runtime_for_pane(desk_index, pane_id);
                                     this.cursor_blink_visible = true;
                                     this.last_cursor_blink_at = Instant::now();
                                     this.request_persist(cx);
@@ -6208,7 +6469,7 @@ impl CanvasShell {
     }
 }
 
-impl Render for CanvasShell {
+impl Render for AxisShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let viewport = window.window_bounds().get_bounds();
@@ -6719,7 +6980,7 @@ impl Render for CanvasShell {
                 )
                 .child(notification_item(
                     "Agent ready",
-                    "Implement Agent finished a response and left the pane waiting.",
+                    "Implement Agent finished a response and marked the pane for review.",
                     rgb(0x7cc7ff).into(),
                     true,
                 ))
@@ -6731,7 +6992,7 @@ impl Render for CanvasShell {
                 ))
                 .child(notification_item(
                     "Review pending",
-                    "Shell Desk has a waiting pane that has not been revisited yet.",
+                    "Shell Desk has a pane that still needs follow-up attention.",
                     rgb(0xe59a49).into(),
                     false,
                 ))
@@ -7781,14 +8042,14 @@ impl Render for CanvasShell {
 
 fn main() {
     let (workdesks, active_workdesk, shortcuts, boot_notice) = load_boot_state();
-    let (automation_server, automation_notice) = match start_automation_server() {
+    let (automation_server, automation_notice) = match automation::start_automation_server() {
         Ok(server) => (server, None),
         Err(error) => {
             let (_sender, receiver) = mpsc::channel();
             (
                 AutomationServer {
                     receiver,
-                    socket_path: automation_socket_path(),
+                    socket_path: automation::automation_socket_path(),
                 },
                 Some(SharedString::from(format!(
                     "automation socket disabled: {error}"
@@ -7824,7 +8085,7 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from("Canvas")),
+                    title: Some(SharedString::from(PRODUCT_NAME)),
                     appears_transparent: true,
                     traffic_light_position: cfg!(target_os = "macos")
                         .then(|| gpui::point(px(14.0), px(14.0))),
@@ -7845,7 +8106,7 @@ fn main() {
                 let focus_handle = cx.focus_handle();
                 let window_focus_handle = focus_handle.clone();
                 let shell = cx.new(move |_| {
-                    CanvasShell::new(
+                    AxisShell::new(
                         workdesks,
                         active_workdesk,
                         shortcuts,
@@ -7909,7 +8170,7 @@ fn load_boot_state() -> (Vec<WorkdeskState>, usize, ShortcutMap, Option<SharedSt
 }
 
 fn load_persisted_session() -> Result<Option<(Vec<WorkdeskState>, usize)>, String> {
-    let session_path = session_file_path();
+    let session_path = load_session_file_path();
     let payload = match fs::read(&session_path) {
         Ok(payload) => payload,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -7928,13 +8189,15 @@ fn load_persisted_session() -> Result<Option<(Vec<WorkdeskState>, usize)>, Strin
 }
 
 fn session_file_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.canvas")
-        .join("session.json")
+    app_data_dir().join("session.json")
+}
+
+fn load_session_file_path() -> PathBuf {
+    existing_data_file_path("session.json")
 }
 
 fn load_persisted_shortcuts() -> Result<(ShortcutMap, Option<String>), String> {
-    let shortcut_path = shortcut_file_path();
+    let shortcut_path = load_shortcut_file_path();
     let payload = match fs::read(&shortcut_path) {
         Ok(payload) => payload,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -7959,108 +8222,52 @@ fn load_persisted_shortcuts() -> Result<(ShortcutMap, Option<String>), String> {
 }
 
 fn shortcut_file_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.canvas")
-        .join("shortcuts.json")
+    app_data_dir().join("shortcuts.json")
 }
 
-fn automation_socket_path() -> PathBuf {
-    workspace_root_path().join(".canvas").join("canvas.sock")
+fn load_shortcut_file_path() -> PathBuf {
+    existing_data_file_path("shortcuts.json")
 }
 
-fn start_automation_server() -> Result<AutomationServer, String> {
-    start_automation_server_at(automation_socket_path())
+fn app_data_dir() -> PathBuf {
+    app_data_dir_for(app_data_dir_override())
 }
 
-fn start_automation_server_at(socket_path: PathBuf) -> Result<AutomationServer, String> {
-    let Some(socket_dir) = socket_path.parent() else {
-        return Err("invalid automation socket path".to_string());
-    };
-    fs::create_dir_all(socket_dir)
-        .map_err(|error| format!("create {}: {error}", socket_dir.display()))?;
-    if socket_path.exists() {
-        fs::remove_file(&socket_path)
-            .map_err(|error| format!("remove stale {}: {error}", socket_path.display()))?;
+fn app_data_dir_for(explicit_override: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = explicit_override {
+        return path;
+    }
+    workspace_root_path().join(APP_DATA_DIR)
+}
+
+fn existing_data_file_path(file_name: &str) -> PathBuf {
+    let preferred = app_data_dir().join(file_name);
+    if preferred.exists() {
+        return preferred;
+    }
+    if app_data_dir_override().is_some() {
+        return preferred;
     }
 
-    let listener = UnixListener::bind(&socket_path)
-        .map_err(|error| format!("bind {}: {error}", socket_path.display()))?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("chmod {}: {error}", socket_path.display()))?;
-    let (sender, receiver) = mpsc::channel();
-
-    thread::spawn(move || automation_listener_loop(listener, sender));
-
-    Ok(AutomationServer {
-        receiver,
-        socket_path,
-    })
-}
-
-fn automation_listener_loop(listener: UnixListener, sender: Sender<AutomationEnvelope>) {
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else {
-            break;
-        };
-        let sender = sender.clone();
-        thread::spawn(move || {
-            let reader = match stream.try_clone() {
-                Ok(reader) => reader,
-                Err(_) => return,
-            };
-            let mut writer = stream;
-            for line in BufReader::new(reader).lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                let response = match serde_json::from_str::<AutomationRequest>(trimmed) {
-                    Ok(request) => {
-                        let (response_tx, response_rx) = mpsc::channel();
-                        let id = request.id.clone();
-                        if sender
-                            .send(AutomationEnvelope {
-                                request,
-                                response_tx,
-                            })
-                            .is_err()
-                        {
-                            AutomationResponse::error(id, "automation command queue is closed")
-                        } else {
-                            response_rx.recv().unwrap_or_else(|_| {
-                                AutomationResponse::error(
-                                    id,
-                                    "automation command dropped before completion",
-                                )
-                            })
-                        }
-                    }
-                    Err(error) => {
-                        AutomationResponse::error(None, format!("invalid request: {error}"))
-                    }
-                };
-
-                let Ok(payload) = serde_json::to_vec(&response) else {
-                    break;
-                };
-                if writer.write_all(&payload).is_err()
-                    || writer.write_all(b"\n").is_err()
-                    || writer.flush().is_err()
-                {
-                    break;
-                }
-            }
-        });
+    let legacy = workspace_root_path()
+        .join(LEGACY_APP_DATA_DIR)
+        .join(file_name);
+    if legacy.exists() {
+        legacy
+    } else {
+        preferred
     }
 }
 
 fn workspace_root_path() -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     root.canonicalize().unwrap_or(root)
+}
+
+fn app_data_dir_override() -> Option<PathBuf> {
+    std::env::var_os(APP_DATA_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn workspace_defaults() -> (String, String) {
@@ -8125,67 +8332,203 @@ fn normalize_workdesk_draft(
 
 fn workdesk_from_template(template: WorkdeskTemplate, draft: WorkdeskDraft) -> WorkdeskState {
     let draft = normalize_workdesk_draft(draft, template.base_name(), template.summary());
-    let panes = match template {
-        WorkdeskTemplate::ShellDesk => vec![single_surface_pane(
-            1,
-            "Shell 1",
-            PaneKind::Shell,
-            WorkdeskPoint::new(120.0, 96.0),
-            DEFAULT_SHELL_SIZE,
-        )],
-        WorkdeskTemplate::AgentReview => vec![
-            single_surface_pane(
-                1,
-                "Review Shell",
-                PaneKind::Shell,
-                WorkdeskPoint::new(80.0, 96.0),
-                DEFAULT_SHELL_SIZE,
-            ),
-            single_surface_pane(
-                2,
-                "Review Agent",
-                PaneKind::Agent,
-                WorkdeskPoint::new(1048.0, 132.0),
-                DEFAULT_AGENT_SIZE,
-            ),
-        ],
-        WorkdeskTemplate::Debug => vec![
-            single_surface_pane(
-                1,
-                "Repro Shell",
-                PaneKind::Shell,
-                WorkdeskPoint::new(80.0, 96.0),
-                DEFAULT_SHELL_SIZE,
-            ),
-            single_surface_pane(
-                2,
-                "Debug Agent",
-                PaneKind::Agent,
-                WorkdeskPoint::new(1048.0, 120.0),
-                DEFAULT_AGENT_SIZE,
-            ),
-        ],
-        WorkdeskTemplate::Implementation => vec![
-            single_surface_pane(
-                1,
-                "Build Shell",
-                PaneKind::Shell,
-                WorkdeskPoint::new(80.0, 96.0),
-                DEFAULT_SHELL_SIZE,
-            ),
-            single_surface_pane(
-                2,
-                "Implement Agent",
-                PaneKind::Agent,
-                WorkdeskPoint::new(1048.0, 132.0),
-                DEFAULT_AGENT_SIZE,
-            ),
-        ],
+    worktrees::create_desk_from_template(draft.name, draft.summary, template, draft.metadata)
+}
+
+fn ensure_agent_runtime_for_surface(
+    bridge: &agent_sessions::AgentRuntimeBridge,
+    workdesk_runtime_id: u64,
+    desk: &mut WorkdeskState,
+    surface_id: SurfaceId,
+) -> Result<bool, String> {
+    start_agent_runtime_for_surface_with_profile(
+        bridge,
+        workdesk_runtime_id,
+        desk,
+        surface_id,
+        None,
+        vec![],
+    )
+}
+
+fn start_agent_runtime_for_surface_with_profile(
+    bridge: &agent_sessions::AgentRuntimeBridge,
+    workdesk_runtime_id: u64,
+    desk: &mut WorkdeskState,
+    surface_id: SurfaceId,
+    provider_profile_id: Option<&str>,
+    argv_suffix: Vec<String>,
+) -> Result<bool, String> {
+    let Some(surface_kind) = desk
+        .panes
+        .iter()
+        .find_map(|pane| pane.surface(surface_id).map(|surface| surface.kind.clone()))
+    else {
+        return Ok(false);
+    };
+    if surface_kind != PaneKind::Agent
+        || bridge.has_session_for_surface(workdesk_runtime_id, surface_id)
+    {
+        return Ok(false);
+    }
+
+    let Some(terminal) = desk.terminals.get(&surface_id).cloned() else {
+        return Ok(false);
+    };
+    let cwd = desk
+        .worktree_binding
+        .as_ref()
+        .map(|binding| binding.root_path.as_str())
+        .unwrap_or_else(|| desk.metadata.cwd.as_str());
+    match provider_profile_id {
+        Some(profile_id) => bridge
+            .start_agent_for_surface_with_profile(
+                workdesk_runtime_id,
+                surface_id,
+                cwd,
+                &terminal,
+                profile_id,
+                argv_suffix,
+            )
+            .map(|_| true),
+        None => bridge
+            .start_agent_for_surface(workdesk_runtime_id, surface_id, cwd, &terminal)
+            .map(|_| true),
+    }
+}
+
+fn stop_agent_runtime_for_desk(
+    bridge: &agent_sessions::AgentRuntimeBridge,
+    desk: &mut WorkdeskState,
+) {
+    let agent_surface_ids = desk
+        .panes
+        .iter()
+        .flat_map(|pane| pane.surfaces.iter())
+        .filter(|surface| surface.kind == PaneKind::Agent)
+        .map(|surface| surface.id)
+        .collect::<Vec<_>>();
+
+    for surface_id in agent_surface_ids {
+        bridge.stop_surface(desk.runtime_id, surface_id);
+        if let Some(terminal) = desk.terminals.get(&surface_id) {
+            terminal.set_agent_metadata(None);
+        }
+    }
+}
+
+fn agent_runtime_baseline_attention_state(
+    bridge: &agent_sessions::AgentRuntimeBridge,
+    desk: &WorkdeskState,
+    pane_id: PaneId,
+) -> AttentionState {
+    let Some(pane) = desk.panes.iter().find(|pane| pane.id == pane_id) else {
+        return AttentionState::Idle;
     };
 
-    let mut desk = WorkdeskState::new(draft.name, draft.summary, panes);
-    desk.metadata = draft.metadata;
-    desk
+    match pane.kind {
+        PaneKind::Agent => {
+            let baseline = desk
+                .active_terminal_session_for_pane(pane_id)
+                .map(|terminal| terminal.snapshot())
+                .filter(|snapshot| !snapshot.closed)
+                .map(|_| AttentionState::Working)
+                .unwrap_or(AttentionState::Idle);
+            let session_attentions = desk
+                .active_terminal_surface_id_for_pane(pane_id)
+                .and_then(|surface_id| bridge.attention_for_surface(desk.runtime_id, surface_id))
+                .into_iter();
+            reduce_pane_attention_state(baseline, session_attentions)
+        }
+        PaneKind::Shell | PaneKind::Browser | PaneKind::Editor => AttentionState::Idle,
+    }
+}
+
+fn sync_agent_runtime_attention_for_workdesk(
+    bridge: &agent_sessions::AgentRuntimeBridge,
+    desk_index: usize,
+    active_workdesk: usize,
+    desk: &mut WorkdeskState,
+) -> bool {
+    let agent_pane_ids = desk
+        .panes
+        .iter()
+        .filter(|pane| pane.kind == PaneKind::Agent)
+        .map(|pane| pane.id)
+        .collect::<Vec<_>>();
+    let mut changed = false;
+
+    for pane_id in agent_pane_ids {
+        let next_state = agent_runtime_baseline_attention_state(bridge, desk, pane_id);
+        let unread = next_state.is_attention()
+            && !(active_workdesk == desk_index && desk.active_pane == Some(pane_id));
+        changed |= desk.set_pane_attention_state(pane_id, next_state, unread);
+    }
+
+    changed
+}
+
+fn worktree_id_from_desk(desk: &WorkdeskState) -> Option<WorktreeId> {
+    desk.worktree_binding
+        .as_ref()
+        .map(|binding| binding.root_path.clone())
+        .or_else(|| {
+            let cwd = desk.metadata.cwd.trim();
+            (!cwd.is_empty()).then_some(cwd.to_string())
+        })
+        .map(WorktreeId::new)
+}
+
+fn agent_session_json(record: &AgentSessionRecord) -> Value {
+    json!({
+        "id": record.id,
+        "provider_profile_id": record.provider_profile_id,
+        "transport": record.transport,
+        "workdesk_id": record.workdesk_id,
+        "surface_id": record.surface_id,
+        "cwd": record.cwd,
+        "lifecycle": record.lifecycle,
+        "attention": record.attention,
+        "status_message": record.status_message,
+    })
+}
+
+fn sanitize_branch_slug(branch: &str) -> String {
+    let slug = branch
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "worktree".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn default_worktree_path(repo_root: &str, branch: &str) -> Result<PathBuf, String> {
+    let repo_root = PathBuf::from(repo_root);
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid repo root `{}`", repo_root.display()))?;
+    let parent = repo_root
+        .parent()
+        .ok_or_else(|| format!("repo root `{}` has no parent", repo_root.display()))?;
+    Ok(parent.join(format!("{repo_name}-{}", sanitize_branch_slug(branch))))
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn compact_cwd_label(path: &str) -> String {
@@ -8202,6 +8545,19 @@ fn compact_cwd_label(path: &str) -> String {
     format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
 }
 
+#[cfg(test)]
+mod path_override_tests {
+    use super::app_data_dir_for;
+    use std::path::PathBuf;
+
+    #[test]
+    fn app_data_dir_prefers_explicit_override() {
+        let override_path = PathBuf::from("/tmp/axis-smoke-data");
+        assert_eq!(app_data_dir_for(Some(override_path.clone())), override_path);
+    }
+}
+
+#[cfg(test)]
 fn single_surface_pane(
     raw_id: u64,
     title: impl Into<String>,
@@ -8219,6 +8575,7 @@ fn single_surface_pane(
     )
 }
 
+#[cfg(test)]
 fn single_surface_pane_with_ids(
     pane_id: PaneId,
     surface_id: SurfaceId,
@@ -8324,77 +8681,6 @@ fn editable_keystroke_text(keystroke: &Keystroke) -> Option<String> {
             .clone()
             .or_else(|| (!keystroke.modifiers.modified()).then(|| keystroke.key.clone())),
     }
-}
-
-fn json_value_at<'a>(params: &'a Value, keys: &[&str]) -> Option<&'a Value> {
-    keys.iter().find_map(|key| params.get(*key))
-}
-
-fn json_has_any(params: &Value, keys: &[&str]) -> bool {
-    json_value_at(params, keys).is_some()
-}
-
-fn json_string_at(params: &Value, keys: &[&str]) -> Option<String> {
-    json_value_at(params, keys)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn json_optional_string_at(params: &Value, keys: &[&str]) -> Result<Option<String>, String> {
-    match json_value_at(params, keys) {
-        None => Ok(None),
-        Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => {
-            Ok((!value.trim().is_empty()).then(|| value.trim().to_string()))
-        }
-        Some(_) => Err(format!("expected string or null for `{}`", keys[0])),
-    }
-}
-
-fn json_u64_at(params: &Value, keys: &[&str]) -> Option<u64> {
-    json_value_at(params, keys).and_then(Value::as_u64)
-}
-
-fn json_bool_at(params: &Value, keys: &[&str]) -> Option<bool> {
-    json_value_at(params, keys).and_then(Value::as_bool)
-}
-
-fn require_json_string_at(params: &Value, keys: &[&str], label: &str) -> Result<String, String> {
-    json_string_at(params, keys).ok_or_else(|| format!("missing required `{label}`"))
-}
-
-fn parse_pane_kind(value: &str) -> Option<PaneKind> {
-    match value {
-        "shell" => Some(PaneKind::Shell),
-        "agent" => Some(PaneKind::Agent),
-        "browser" => Some(PaneKind::Browser),
-        "editor" => Some(PaneKind::Editor),
-        _ => None,
-    }
-}
-
-fn parse_progress_value(value: &Value) -> Result<Option<WorkdeskProgress>, String> {
-    if value.is_null() {
-        return Ok(None);
-    }
-
-    let Some(object) = value.as_object() else {
-        return Err("progress must be an object with `label` and `value`".to_string());
-    };
-    let label = object
-        .get("label")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-        .ok_or_else(|| "progress.label is required".to_string())?;
-    let value = object
-        .get("value")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "progress.value is required".to_string())?;
-
-    Ok(Some(WorkdeskProgress::new(label, value as u8)))
 }
 
 fn automation_pane_json(desk: &WorkdeskState, pane_id: PaneId, desk_active: bool) -> Value {
@@ -8581,16 +8867,26 @@ fn workdesk_card(
         format!("live {}", desk.terminals.len())
     };
     let intent_label = desk.intent_label();
-    let cwd_label = compact_cwd_label(&desk.metadata.cwd);
-    let branch_label = desk
-        .metadata
-        .branch
-        .trim()
-        .is_empty()
-        .then_some("no-branch".to_string())
-        .unwrap_or_else(|| desk.metadata.branch.clone());
+    let meta_line = if let Some(ref w) = desk.worktree_binding {
+        format!(
+            "{} · {} panes",
+            worktrees::format_compact_worktree_line(w),
+            desk.panes.len()
+        )
+    } else {
+        let cwd_label = compact_cwd_label(&desk.metadata.cwd);
+        let branch_label = desk
+            .metadata
+            .branch
+            .trim()
+            .is_empty()
+            .then_some("no-branch".to_string())
+            .unwrap_or_else(|| desk.metadata.branch.clone());
+        format!("{cwd_label} · {branch_label} · {} panes", desk.panes.len())
+    };
     let status_label = desk.status_label();
     let progress_label = desk.progress_label();
+    let review_summary = desk.review_summary.clone();
     let deck_label = if is_active {
         "ACTIVE".to_string()
     } else {
@@ -8601,7 +8897,6 @@ fn workdesk_card(
     } else {
         preview
     };
-    let meta_line = format!("{cwd_label} · {branch_label} · {} panes", desk.panes.len());
     let has_navigation_target = navigation_target.is_some();
     let navigation_label = navigation_target.as_ref().map(|target| {
         if target.mode == WorkdeskNavigationMode::Attention {
@@ -8773,6 +9068,56 @@ fn workdesk_card(
                     row.child(context_pill(status, attention_tint))
                 }),
         )
+        .when_some(review_summary, |card, review| {
+            let review_tint = if review.ready_for_review {
+                rgb(0x77d19a).into()
+            } else if review.dirty {
+                rgb(0xf0d35f).into()
+            } else {
+                rgb(0x7f8a94).into()
+            };
+            let review_files = review_changed_file_preview(&review, 3);
+            let file_count_label = if review.changed_files.len() == 1 {
+                "1 file".to_string()
+            } else {
+                format!("{} files", review.changed_files.len())
+            };
+            card.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(context_pill(review_status_label(&review), review_tint))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(context_pill(file_count_label, rgb(0x7f8a94).into()))
+                                    .when(review.ahead > 0 || review.behind > 0, |row| {
+                                        row.child(context_pill(
+                                            format!("↑{} ↓{}", review.ahead, review.behind),
+                                            rgb(0x7f8a94).into(),
+                                        ))
+                                    }),
+                            ),
+                    )
+                    .children(review_files.into_iter().map(|path| {
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x9aa6af))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(path)
+                    })),
+            )
+        })
         .when_some(navigation_target.clone(), |card, target| {
             card.child(
                 div()
@@ -9781,53 +10126,24 @@ fn grid_projection(panes: &[PaneRecord]) -> GridProjection {
     projection
 }
 
+#[cfg(test)]
 fn next_attention_target_for_workdesks(workdesks: &[WorkdeskState]) -> Option<(usize, PaneId)> {
-    let mut best: Option<((u64, usize, u64), PaneId)> = None;
-
-    for (desk_index, desk) in workdesks.iter().enumerate() {
-        for pane in &desk.panes {
-            let attention = desk.pane_attention(pane.id);
-            if !attention.unread || !attention.state.is_attention() {
-                continue;
-            }
-
-            let candidate_key = (
-                attention.last_attention_sequence.max(1),
-                desk_index,
-                pane.id.raw(),
-            );
-
-            if best
-                .as_ref()
-                .map_or(true, |(best_key, _)| candidate_key < *best_key)
-            {
-                best = Some((candidate_key, pane.id));
-            }
-        }
-    }
-
-    best.map(|((_, desk_index, _), pane_id)| (desk_index, pane_id))
+    next_attention_workdesk_target(workdesks.iter().enumerate().map(|(desk_index, desk)| {
+        (
+            desk_index,
+            desk.panes
+                .iter()
+                .map(|pane| (pane.id, desk.pane_attention(pane.id))),
+        )
+    }))
 }
 
 fn next_attention_target_for_workdesk(desk: &WorkdeskState) -> Option<PaneId> {
-    let mut best: Option<(u64, PaneId)> = None;
-
-    for pane in &desk.panes {
-        let attention = desk.pane_attention(pane.id);
-        if !attention.unread || !attention.state.is_attention() {
-            continue;
-        }
-
-        let candidate_key = attention.last_attention_sequence.max(1);
-        if best
-            .as_ref()
-            .map_or(true, |(best_key, _)| candidate_key < *best_key)
-        {
-            best = Some((candidate_key, pane.id));
-        }
-    }
-
-    best.map(|(_, pane_id)| pane_id)
+    next_attention_pane_target(
+        desk.panes
+            .iter()
+            .map(|pane| (pane.id, desk.pane_attention(pane.id))),
+    )
 }
 
 fn workdesk_navigation_target(desk: &WorkdeskState) -> Option<WorkdeskNavigationTarget> {
@@ -10086,32 +10402,21 @@ fn infer_attention_state_from_terminal_status(
         return AttentionState::Error;
     }
 
+    if normalized.contains("needs input")
+        || normalized.contains("awaiting input")
+        || normalized.contains("user input")
+    {
+        return AttentionState::NeedsInput;
+    }
+
     if closed || normalized.contains("exited with code 0") || normalized.contains("terminated") {
-        return AttentionState::Waiting;
+        return AttentionState::NeedsReview;
     }
 
     match pane_kind {
         PaneKind::Agent => AttentionState::Working,
         PaneKind::Shell | PaneKind::Browser | PaneKind::Editor => AttentionState::Idle,
     }
-}
-
-fn post_attention_notification(title: String, body: String) {
-    #[cfg(target_os = "macos")]
-    {
-        let title = escape_applescript_string(&title);
-        let body = escape_applescript_string(&body);
-        let _ = Command::new("osascript")
-            .arg("-e")
-            .arg(format!(
-                "display notification \"{body}\" with title \"{title}\""
-            ))
-            .spawn();
-    }
-}
-
-fn escape_applescript_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn pane_frame_intersects_viewport(
@@ -10253,16 +10558,16 @@ fn browser_preview_card(
 
 fn editor_language_label(editor: &EditorBuffer) -> &'static str {
     match editor.language() {
-        canvas_editor::LanguageKind::Plaintext => "Plaintext",
-        canvas_editor::LanguageKind::Rust => "Rust",
-        canvas_editor::LanguageKind::JavaScript => "JavaScript",
-        canvas_editor::LanguageKind::TypeScript => "TypeScript",
-        canvas_editor::LanguageKind::Tsx => "TSX",
-        canvas_editor::LanguageKind::Jsx => "JSX",
-        canvas_editor::LanguageKind::Json => "JSON",
-        canvas_editor::LanguageKind::Toml => "TOML",
-        canvas_editor::LanguageKind::Yaml => "YAML",
-        canvas_editor::LanguageKind::Markdown => "Markdown",
+        axis_editor::LanguageKind::Plaintext => "Plaintext",
+        axis_editor::LanguageKind::Rust => "Rust",
+        axis_editor::LanguageKind::JavaScript => "JavaScript",
+        axis_editor::LanguageKind::TypeScript => "TypeScript",
+        axis_editor::LanguageKind::Tsx => "TSX",
+        axis_editor::LanguageKind::Jsx => "JSX",
+        axis_editor::LanguageKind::Json => "JSON",
+        axis_editor::LanguageKind::Toml => "TOML",
+        axis_editor::LanguageKind::Yaml => "YAML",
+        axis_editor::LanguageKind::Markdown => "Markdown",
     }
 }
 
@@ -10370,7 +10675,7 @@ fn editor_line_display(
 
 fn editor_static_line_display(
     line_text: &str,
-    highlights: &[canvas_editor::HighlightSpan],
+    highlights: &[axis_editor::HighlightSpan],
 ) -> StyledText {
     if line_text.is_empty() {
         let mut runs = Vec::new();
@@ -10768,7 +11073,7 @@ fn terminal_row_text(row: &TerminalRow) -> String {
         .collect::<String>()
 }
 
-fn terminal_text_color_from_style(style: canvas_terminal::TerminalTextStyle) -> gpui::Hsla {
+fn terminal_text_color_from_style(style: axis_terminal::TerminalTextStyle) -> gpui::Hsla {
     let mut color = terminal_color_hsla(style.foreground);
     if style.faint {
         color.a *= 0.65;
@@ -10965,6 +11270,8 @@ fn control_input_bytes(key: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axis_agent_runtime::adapters::fake::FakeProvider;
+    use axis_agent_runtime::ProviderRegistry;
 
     #[test]
     fn persisted_workdesk_round_trips_layout_state() {
@@ -11078,7 +11385,7 @@ mod tests {
     #[test]
     fn persisted_editor_surface_restores_dirty_buffer_text() {
         let path = std::env::temp_dir().join(format!(
-            "canvas-editor-test-{}-{}.rs",
+            "axis-editor-test-{}-{}.rs",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -11119,6 +11426,314 @@ mod tests {
     }
 
     #[test]
+    fn persisted_workdesk_rehydrates_worktree_binding_from_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "axis-worktree-binding-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).expect("fixture directory should exist");
+        let path_string = path.display().to_string();
+
+        let mut state = WorkdeskState::new(
+            "Desk",
+            "Summary",
+            vec![single_surface_pane(
+                13,
+                "Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(720.0, 420.0),
+            )],
+        );
+        state.metadata = WorkdeskMetadata {
+            intent: "Ship it".to_string(),
+            cwd: path_string.clone(),
+            branch: "topic".to_string(),
+            status: None,
+            progress: None,
+        };
+
+        let restored = PersistedWorkdesk::from_state(&state).into_state();
+
+        assert_eq!(
+            restored.worktree_binding,
+            Some(worktrees::binding_from_desk_paths(path_string, "topic"))
+        );
+
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn ensure_agent_runtime_for_surface_starts_lazily_and_tags_terminal() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            "fake",
+            std::sync::Arc::new(FakeProvider::with_standard_script()),
+        );
+        let bridge = agent_sessions::AgentRuntimeBridge::with_registry("fake", registry);
+
+        let surface_id = SurfaceId::new(41);
+        let mut desk = WorkdeskState::new(
+            "Desk",
+            "Summary",
+            vec![single_surface_pane_with_ids(
+                PaneId::new(1),
+                surface_id,
+                "Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(720.0, 420.0),
+            )],
+        );
+        desk.runtime_id = 7;
+        desk.metadata.cwd = std::env::current_dir()
+            .expect("cwd should resolve")
+            .display()
+            .to_string();
+        desk.attach_terminal_session(
+            surface_id,
+            &PaneKind::Agent,
+            "Agent",
+            terminal_grid_size_for_pane(WorkdeskSize::new(720.0, 420.0), 1),
+        );
+
+        let terminal = desk
+            .terminals
+            .get(&surface_id)
+            .cloned()
+            .expect("agent terminal should be attached");
+        assert!(terminal.agent_metadata().is_none());
+        assert_eq!(bridge.attention_for_surface(desk.runtime_id, surface_id), None);
+
+        let started = ensure_agent_runtime_for_surface(&bridge, desk.runtime_id, &mut desk, surface_id)
+            .expect("restored agent surface should attach on demand");
+        assert!(started);
+        assert_eq!(
+            bridge.attention_for_surface(desk.runtime_id, surface_id),
+            Some(axis_core::agent::AgentAttention::Quiet)
+        );
+        assert!(
+            terminal
+                .agent_metadata()
+                .expect("terminal should receive session metadata")
+                .session_id
+                .0
+                .starts_with("fake-session-")
+        );
+
+        let started_again = ensure_agent_runtime_for_surface(
+            &bridge,
+            desk.runtime_id,
+            &mut desk,
+            surface_id,
+        )
+            .expect("second attach should be a no-op");
+        assert!(!started_again);
+
+        shutdown_workdesk_terminals(&mut desk);
+    }
+
+    #[test]
+    fn ensure_agent_runtime_for_surface_scopes_sessions_per_workdesk() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            "fake",
+            std::sync::Arc::new(FakeProvider::with_standard_script()),
+        );
+        let bridge = agent_sessions::AgentRuntimeBridge::with_registry("fake", registry);
+
+        let surface_id = SurfaceId::new(41);
+        let mut left = WorkdeskState::new(
+            "Left",
+            "Summary",
+            vec![single_surface_pane_with_ids(
+                PaneId::new(1),
+                surface_id,
+                "Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(720.0, 420.0),
+            )],
+        );
+        left.runtime_id = 11;
+        left.metadata.cwd = std::env::current_dir()
+            .expect("cwd should resolve")
+            .display()
+            .to_string();
+        left.attach_terminal_session(
+            surface_id,
+            &PaneKind::Agent,
+            "Agent",
+            terminal_grid_size_for_pane(WorkdeskSize::new(720.0, 420.0), 1),
+        );
+
+        let mut right = WorkdeskState::new(
+            "Right",
+            "Summary",
+            vec![single_surface_pane_with_ids(
+                PaneId::new(1),
+                surface_id,
+                "Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(960.0, 0.0),
+                WorkdeskSize::new(720.0, 420.0),
+            )],
+        );
+        right.runtime_id = 12;
+        right.metadata.cwd = std::env::current_dir()
+            .expect("cwd should resolve")
+            .display()
+            .to_string();
+        right.attach_terminal_session(
+            surface_id,
+            &PaneKind::Agent,
+            "Agent",
+            terminal_grid_size_for_pane(WorkdeskSize::new(720.0, 420.0), 1),
+        );
+
+        assert!(
+            ensure_agent_runtime_for_surface(&bridge, left.runtime_id, &mut left, surface_id)
+                .expect("left desk should start")
+        );
+        assert!(
+            ensure_agent_runtime_for_surface(&bridge, right.runtime_id, &mut right, surface_id)
+                .expect("right desk should start independently")
+        );
+
+        let left_session = left
+            .terminals
+            .get(&surface_id)
+            .and_then(|terminal| terminal.agent_metadata())
+            .expect("left terminal should tag its session")
+            .session_id;
+        let right_session = right
+            .terminals
+            .get(&surface_id)
+            .and_then(|terminal| terminal.agent_metadata())
+            .expect("right terminal should tag its session")
+            .session_id;
+        assert_ne!(left_session, right_session);
+
+        shutdown_workdesk_terminals(&mut left);
+        shutdown_workdesk_terminals(&mut right);
+    }
+
+    #[test]
+    fn stop_agent_runtime_for_desk_clears_bridge_sessions() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            "fake",
+            std::sync::Arc::new(FakeProvider::with_standard_script()),
+        );
+        let bridge = agent_sessions::AgentRuntimeBridge::with_registry("fake", registry);
+
+        let surface_id = SurfaceId::new(51);
+        let mut desk = WorkdeskState::new(
+            "Desk",
+            "Summary",
+            vec![single_surface_pane_with_ids(
+                PaneId::new(1),
+                surface_id,
+                "Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(720.0, 420.0),
+            )],
+        );
+        desk.runtime_id = 21;
+        desk.metadata.cwd = std::env::current_dir()
+            .expect("cwd should resolve")
+            .display()
+            .to_string();
+        desk.attach_terminal_session(
+            surface_id,
+            &PaneKind::Agent,
+            "Agent",
+            terminal_grid_size_for_pane(WorkdeskSize::new(720.0, 420.0), 1),
+        );
+
+        assert!(
+            ensure_agent_runtime_for_surface(&bridge, desk.runtime_id, &mut desk, surface_id)
+                .expect("desk should start")
+        );
+        assert!(bridge.has_session_for_surface(desk.runtime_id, surface_id));
+
+        stop_agent_runtime_for_desk(&bridge, &mut desk);
+
+        assert!(!bridge.has_session_for_surface(desk.runtime_id, surface_id));
+        shutdown_workdesk_terminals(&mut desk);
+    }
+
+    #[test]
+    fn agent_runtime_attention_sync_marks_unfocused_agent_pane_unread() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            "fake",
+            std::sync::Arc::new(FakeProvider::with_standard_script()),
+        );
+        let bridge = agent_sessions::AgentRuntimeBridge::with_registry("fake", registry);
+
+        let pane_id = PaneId::new(1);
+        let surface_id = SurfaceId::new(61);
+        let mut desk = WorkdeskState::new(
+            "Desk",
+            "Summary",
+            vec![single_surface_pane_with_ids(
+                pane_id,
+                surface_id,
+                "Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(720.0, 420.0),
+            )],
+        );
+        desk.runtime_id = 31;
+        desk.metadata.cwd = std::env::current_dir()
+            .expect("cwd should resolve")
+            .display()
+            .to_string();
+        desk.active_pane = Some(pane_id);
+        desk.attach_terminal_session(
+            surface_id,
+            &PaneKind::Agent,
+            "Agent",
+            terminal_grid_size_for_pane(WorkdeskSize::new(720.0, 420.0), 1),
+        );
+
+        assert!(
+            ensure_agent_runtime_for_surface(&bridge, desk.runtime_id, &mut desk, surface_id)
+                .expect("desk should start")
+        );
+        bridge
+            .poll_surface(desk.runtime_id, surface_id)
+            .expect("starting poll should succeed");
+        bridge
+            .poll_surface(desk.runtime_id, surface_id)
+            .expect("running poll should succeed");
+        bridge
+            .poll_surface(desk.runtime_id, surface_id)
+            .expect("attention poll should succeed");
+        assert_eq!(
+            bridge.attention_for_surface(desk.runtime_id, surface_id),
+            Some(axis_core::agent::AgentAttention::NeedsReview)
+        );
+
+        assert!(sync_agent_runtime_attention_for_workdesk(
+            &bridge, 1, 0, &mut desk
+        ));
+        let attention = desk.pane_attention(pane_id);
+        assert_eq!(attention.state, AttentionState::NeedsReview);
+        assert!(attention.unread);
+        assert_eq!(next_attention_target_for_workdesk(&desk), Some(pane_id));
+
+        shutdown_workdesk_terminals(&mut desk);
+    }
+
+    #[test]
     fn stacking_surface_on_existing_pane_preserves_stack_identity_and_persistence() {
         let mut workdesks = vec![WorkdeskState::new(
             "Desk",
@@ -11133,7 +11748,8 @@ mod tests {
         )];
         let mut active_workdesk = 0;
 
-        let (pane_id, surface_id) = CanvasShell::spawn_surface_on_workdesk_state(
+        let bridge = agent_sessions::AgentRuntimeBridge::new();
+        let (pane_id, surface_id) = AxisShell::spawn_surface_on_workdesk_state(
             &mut workdesks,
             &mut active_workdesk,
             0,
@@ -11143,6 +11759,7 @@ mod tests {
             Some("https://example.com/preview".to_string()),
             None,
             true,
+            &bridge,
         )
         .expect("stacking into the active pane should succeed");
 
@@ -11235,7 +11852,7 @@ mod tests {
         left.pane_attention.insert(
             PaneId::new(1),
             PaneAttention {
-                state: AttentionState::Waiting,
+                state: AttentionState::NeedsInput,
                 unread: true,
                 last_attention_sequence: 7,
                 last_activity_sequence: 7,
@@ -11303,7 +11920,7 @@ mod tests {
         desk.pane_attention.insert(
             PaneId::new(2),
             PaneAttention {
-                state: AttentionState::Waiting,
+                state: AttentionState::NeedsReview,
                 unread: true,
                 last_attention_sequence: 6,
                 last_activity_sequence: 5,
@@ -11433,52 +12050,6 @@ mod tests {
     }
 
     #[test]
-    fn automation_server_round_trips_request_lines() {
-        let socket_path = std::env::temp_dir().join(format!(
-            "canvas-automation-test-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time should be after epoch")
-                .as_nanos()
-        ));
-        let server = start_automation_server_at(socket_path.clone())
-            .expect("automation server should start");
-        let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
-            .expect("socket should accept clients");
-
-        stream
-            .write_all(br#"{"id":1,"method":"state.current","params":{}}"#)
-            .expect("request should write");
-        stream.write_all(b"\n").expect("newline should write");
-
-        let envelope = server
-            .receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("automation envelope should be received");
-        assert_eq!(envelope.request.method, "state.current");
-        envelope
-            .response_tx
-            .send(AutomationResponse::success(
-                envelope.request.id.clone(),
-                json!({ "ok": true }),
-            ))
-            .expect("response should send");
-
-        let mut response_line = String::new();
-        BufReader::new(stream)
-            .read_line(&mut response_line)
-            .expect("response line should read");
-        let response: Value =
-            serde_json::from_str(response_line.trim()).expect("response should be valid json");
-
-        assert_eq!(response["ok"], Value::Bool(true));
-        assert_eq!(response["result"]["ok"], Value::Bool(true));
-
-        let _ = fs::remove_file(socket_path);
-    }
-
-    #[test]
     fn automation_state_json_includes_metadata_and_panes() {
         let mut desk = WorkdeskState::new(
             "Desk",
@@ -11501,7 +12072,7 @@ mod tests {
         desk.pane_attention.insert(
             PaneId::new(7),
             PaneAttention {
-                state: AttentionState::Waiting,
+                state: AttentionState::NeedsInput,
                 unread: true,
                 last_attention_sequence: 9,
                 last_activity_sequence: 6,
@@ -11539,7 +12110,7 @@ mod tests {
         );
         assert_eq!(
             payload["panes"][0]["attention"]["state"],
-            Value::String("waiting".to_string())
+            Value::String("needs-input".to_string())
         );
     }
 }

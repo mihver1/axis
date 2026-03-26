@@ -115,7 +115,7 @@ main() {
       ;;
     *)
       cat <<'EOF'
-Canvas bootstrap helper
+axis bootstrap helper
 
 Usage:
   bash scripts/bootstrap-macos.sh --doctor

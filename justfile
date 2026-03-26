@@ -8,8 +8,10 @@ check:
     cargo check --workspace
 
 run:
-    cargo run -p canvas-app
+    cargo run -p axis-app
+
+smoke-acp:
+    bash scripts/smoke-acp-demo.sh
 
 fmt:
     cargo fmt --all
-

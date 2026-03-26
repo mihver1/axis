@@ -1,3 +1,7 @@
+pub mod agent;
+pub mod automation;
+pub mod worktree;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
     pub x: f32,
@@ -35,7 +39,9 @@ impl PaneId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// Identifies a surface within a pane stack in the spatial UI; agent sessions may attach to one.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct SurfaceId(u64);
 
 impl SurfaceId {
