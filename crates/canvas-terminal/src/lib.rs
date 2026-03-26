@@ -651,6 +651,18 @@ impl TerminalSession {
         self.inner.revision.load(Ordering::SeqCst)
     }
 
+    pub fn status(&self) -> Option<String> {
+        self.inner
+            .status
+            .lock()
+            .expect("terminal status mutex poisoned")
+            .clone()
+    }
+
+    pub fn closed(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
+    }
+
     pub fn snapshot(&self) -> TerminalSnapshot {
         let mut snapshot = match self.inner.engine.lock() {
             Ok(mut engine) => engine

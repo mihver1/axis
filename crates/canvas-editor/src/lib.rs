@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::{
     fs,
     ops::Range,
@@ -8,6 +9,8 @@ use std::{
 use unicode_segmentation::UnicodeSegmentation;
 
 const TAB_TEXT: &str = "    ";
+const MAX_HISTORY_SNAPSHOTS: usize = 64;
+const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
@@ -20,6 +23,7 @@ pub struct SearchState {
     pub open: bool,
     pub query: String,
     pub active_match: Option<usize>,
+    matches: Vec<Range<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +65,12 @@ struct EditorSnapshot {
     scroll_top_line: usize,
 }
 
+impl EditorSnapshot {
+    fn byte_size(&self) -> usize {
+        self.text.len()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EditorBuffer {
     path: PathBuf,
@@ -73,6 +83,7 @@ pub struct EditorBuffer {
     scroll_top_line: usize,
     search: SearchState,
     line_starts: Vec<usize>,
+    line_highlight_cache: RefCell<Vec<Option<Vec<HighlightSpan>>>>,
     language: LanguageKind,
     undo_stack: Vec<EditorSnapshot>,
     redo_stack: Vec<EditorSnapshot>,
@@ -108,6 +119,7 @@ impl EditorBuffer {
             scroll_top_line: 0,
             search: SearchState::default(),
             line_starts: vec![0],
+            line_highlight_cache: RefCell::new(Vec::new()),
             language,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -387,6 +399,7 @@ impl EditorBuffer {
             return false;
         };
         self.redo_stack.push(self.snapshot());
+        Self::prune_history(&mut self.redo_stack);
         self.restore_snapshot(snapshot);
         true
     }
@@ -396,6 +409,7 @@ impl EditorBuffer {
             return false;
         };
         self.undo_stack.push(self.snapshot());
+        Self::prune_history(&mut self.undo_stack);
         self.restore_snapshot(snapshot);
         true
     }
@@ -452,6 +466,7 @@ impl EditorBuffer {
         self.search.open = false;
         self.search.query.clear();
         self.search.active_match = None;
+        self.search.matches.clear();
     }
 
     pub fn append_search_text(&mut self, text: &str) {
@@ -465,22 +480,20 @@ impl EditorBuffer {
     }
 
     pub fn next_search_match(&mut self) -> bool {
-        let matches = self.search_matches();
-        if matches.is_empty() {
+        if self.search.matches.is_empty() {
             return false;
         }
         let next = self
             .search
             .active_match
-            .map(|index| (index + 1) % matches.len())
+            .map(|index| (index + 1) % self.search.matches.len())
             .unwrap_or(0);
         self.activate_search_match(next);
         true
     }
 
     pub fn previous_search_match(&mut self) -> bool {
-        let matches = self.search_matches();
-        if matches.is_empty() {
+        if self.search.matches.is_empty() {
             return false;
         }
         let previous = self
@@ -488,43 +501,47 @@ impl EditorBuffer {
             .active_match
             .map(|index| {
                 if index == 0 {
-                    matches.len() - 1
+                    self.search.matches.len() - 1
                 } else {
                     index - 1
                 }
             })
-            .unwrap_or(matches.len() - 1);
+            .unwrap_or(self.search.matches.len() - 1);
         self.activate_search_match(previous);
         true
     }
 
     pub fn search_matches(&self) -> Vec<Range<usize>> {
-        if self.search.query.is_empty() {
-            return Vec::new();
-        }
-        let query = self.search.query.to_ascii_lowercase();
-        let haystack = self.text.to_ascii_lowercase();
-        let mut matches = Vec::new();
-        let mut start = 0usize;
-        while let Some(found) = haystack[start..].find(&query) {
-            let begin = start + found;
-            let end = begin + query.len();
-            matches.push(begin..end);
-            start = end.max(begin + 1);
-        }
-        matches
+        self.search.matches.clone()
+    }
+
+    pub fn search_match_count(&self) -> usize {
+        self.search.matches.len()
     }
 
     pub fn current_search_match(&self) -> Option<Range<usize>> {
-        let matches = self.search_matches();
         self.search
             .active_match
-            .and_then(|index| matches.get(index).cloned())
+            .and_then(|index| self.search.matches.get(index).cloned())
     }
 
     pub fn highlight_line(&self, line_index: usize) -> Vec<HighlightSpan> {
+        let line_index = line_index.min(self.line_count().saturating_sub(1));
+        {
+            let cache = self.line_highlight_cache.borrow();
+            if let Some(Some(spans)) = cache.get(line_index) {
+                return spans.clone();
+            }
+        }
+
         let text = self.line_text(line_index);
-        lexical_highlight_line(self.language, text)
+        let spans = lexical_highlight_line(self.language, text);
+        let mut cache = self.line_highlight_cache.borrow_mut();
+        if cache.len() < self.line_count() {
+            cache.resize(self.line_count(), None);
+        }
+        cache[line_index] = Some(spans.clone());
+        spans
     }
 
     pub fn move_to_offset(&mut self, offset: usize, selecting: bool) {
@@ -582,8 +599,7 @@ impl EditorBuffer {
     }
 
     fn activate_search_match(&mut self, index: usize) {
-        let matches = self.search_matches();
-        let Some(range) = matches.get(index).cloned() else {
+        let Some(range) = self.search.matches.get(index).cloned() else {
             self.search.active_match = None;
             return;
         };
@@ -593,21 +609,23 @@ impl EditorBuffer {
     }
 
     fn recompute_search_matches(&mut self, snap_to_first: bool) {
-        let matches = self.search_matches();
-        if matches.is_empty() {
+        self.search.matches = compute_search_matches(&self.text, &self.search.query);
+        if self.search.matches.is_empty() {
             self.search.active_match = None;
             return;
         }
         if snap_to_first {
             let cursor = self.cursor_offset();
-            let index = matches
+            let index = self
+                .search
+                .matches
                 .iter()
                 .position(|range| range.start >= cursor)
                 .unwrap_or(0);
             self.activate_search_match(index);
         } else if let Some(index) = self.search.active_match {
-            if index >= matches.len() {
-                self.search.active_match = Some(matches.len() - 1);
+            if index >= self.search.matches.len() {
+                self.search.active_match = Some(self.search.matches.len() - 1);
             }
         }
     }
@@ -666,9 +684,7 @@ impl EditorBuffer {
 
     fn record_undo_state(&mut self) {
         self.undo_stack.push(self.snapshot());
-        if self.undo_stack.len() > 200 {
-            self.undo_stack.remove(0);
-        }
+        Self::prune_history(&mut self.undo_stack);
     }
 
     fn snapshot(&self) -> EditorSnapshot {
@@ -678,6 +694,17 @@ impl EditorBuffer {
             marked_range: self.marked_range.clone(),
             dirty: self.dirty,
             scroll_top_line: self.scroll_top_line,
+        }
+    }
+
+    fn prune_history(history: &mut Vec<EditorSnapshot>) {
+        while history.len() > MAX_HISTORY_SNAPSHOTS
+            || history.iter().map(EditorSnapshot::byte_size).sum::<usize>() > MAX_HISTORY_BYTES
+        {
+            if history.is_empty() {
+                break;
+            }
+            history.remove(0);
         }
     }
 
@@ -703,10 +730,29 @@ impl EditorBuffer {
         if self.line_starts.is_empty() {
             self.line_starts.push(0);
         }
+        self.line_highlight_cache
+            .replace(vec![None; self.line_count().max(1)]);
         self.scroll_top_line = self
             .scroll_top_line
             .min(self.line_count().saturating_sub(1));
     }
+}
+
+fn compute_search_matches(text: &str, query: &str) -> Vec<Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query = query.to_ascii_lowercase();
+    let haystack = text.to_ascii_lowercase();
+    let mut matches = Vec::new();
+    let mut start = 0usize;
+    while let Some(found) = haystack[start..].find(&query) {
+        let begin = start + found;
+        let end = begin + query.len();
+        matches.push(begin..end);
+        start = end.max(begin + 1);
+    }
+    matches
 }
 
 fn detect_language(path: &Path) -> LanguageKind {
@@ -998,5 +1044,25 @@ mod tests {
         assert_eq!(editor.current_search_match(), Some(0..5));
         assert!(editor.next_search_match());
         assert_eq!(editor.current_search_match(), Some(11..16));
+        editor.close_search();
+        assert_eq!(editor.search_match_count(), 0);
+        assert_eq!(editor.current_search_match(), None);
+    }
+
+    #[test]
+    fn history_is_pruned_by_count_and_bytes() {
+        let history_entry = EditorSnapshot {
+            text: "x".repeat((MAX_HISTORY_BYTES / 10).max(32)),
+            selection: Selection::default(),
+            marked_range: None,
+            dirty: true,
+            scroll_top_line: 0,
+        };
+        let mut history = vec![history_entry; MAX_HISTORY_SNAPSHOTS + 12];
+        EditorBuffer::prune_history(&mut history);
+
+        assert!(history.len() <= MAX_HISTORY_SNAPSHOTS);
+        let retained_bytes = history.iter().map(EditorSnapshot::byte_size).sum::<usize>();
+        assert!(retained_bytes <= MAX_HISTORY_BYTES);
     }
 }

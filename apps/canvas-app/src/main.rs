@@ -5,7 +5,7 @@ use canvas_core::{
 use canvas_editor::{EditorBuffer, HighlightKind};
 use canvas_terminal::{
     ghostty_build_info, spawn_terminal_session_with_grid, TerminalColor, TerminalGridSize,
-    TerminalRow, TerminalSession, TerminalSnapshot,
+    TerminalRow, TerminalRun, TerminalSession, TerminalSnapshot,
 };
 use gpui::{
     div, font, prelude::*, px, relative, rgb, rgba, size, App, Application, Bounds, ClipboardItem,
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Write},
     ops::Range,
@@ -50,6 +50,7 @@ const DEFAULT_AGENT_SIZE: WorkdeskSize = WorkdeskSize::new(720.0, 420.0);
 const SIDEBAR_WIDTH: f32 = 216.0;
 const SIDEBAR_COLLAPSED_WIDTH: f32 = 72.0;
 const WORKDESK_MENU_WIDTH: f32 = 208.0;
+const STACK_SURFACE_MENU_WIDTH: f32 = 188.0;
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const TERMINAL_SELECTION_BG: u32 = 0x2d5b88;
 const TERMINAL_SELECTION_FG: u32 = 0xf4f8fb;
@@ -114,6 +115,7 @@ struct CanvasShell {
     workdesks: Vec<WorkdeskState>,
     active_workdesk: usize,
     workdesk_menu: Option<WorkdeskContextMenu>,
+    stack_surface_menu: Option<StackSurfaceMenu>,
     workdesk_editor: Option<WorkdeskEditorState>,
     automation_rx: Receiver<AutomationEnvelope>,
     focus_handle: FocusHandle,
@@ -126,6 +128,7 @@ struct CanvasShell {
     sidebar_collapsed: bool,
     notifications_open: bool,
     mock_notifications_unread: usize,
+    visible_terminal_surfaces: HashSet<SurfaceId>,
     cursor_blink_visible: bool,
     last_cursor_blink_at: Instant,
     persist_generation: u64,
@@ -148,6 +151,13 @@ struct ShortcutEditorState {
 #[derive(Clone, Copy, Debug)]
 struct WorkdeskContextMenu {
     index: usize,
+    position: gpui::Point<Pixels>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StackSurfaceMenu {
+    desk_index: usize,
+    pane_id: PaneId,
     position: gpui::Point<Pixels>,
 }
 
@@ -286,6 +296,22 @@ struct PaneAttention {
 struct WorkdeskAttentionSummary {
     highest: AttentionState,
     unread_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkdeskNavigationMode {
+    Attention,
+    Resume,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkdeskNavigationTarget {
+    pane_id: PaneId,
+    state: AttentionState,
+    unread: bool,
+    mode: WorkdeskNavigationMode,
+    label: String,
+    detail: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -563,6 +589,20 @@ impl TerminalFrameMetrics {
 }
 
 impl EditorViewState {
+    fn matches_layout(
+        &self,
+        bounds: Bounds<Pixels>,
+        line_height: f32,
+        char_width: f32,
+        viewport_lines: usize,
+    ) -> bool {
+        self.text_bounds
+            .is_some_and(|current| bounds_approx_eq(current, bounds))
+            && approx_eq_f32(self.line_height, line_height)
+            && approx_eq_f32(self.char_width, char_width)
+            && self.viewport_lines == viewport_lines.max(1)
+    }
+
     fn offset_for_point(
         &self,
         editor: &EditorBuffer,
@@ -671,24 +711,30 @@ impl Element for EditorInputOverlay {
         let line_height = self.line_height;
         let char_width = self.char_width;
         let viewport_lines = self.viewport_lines;
-        self.shell.update(cx, |shell, _cx| {
-            shell
-                .active_workdesk_mut()
+        let needs_layout_sync = {
+            let shell = self.shell.read(cx);
+            !shell
+                .active_workdesk()
                 .editor_views
-                .entry(surface_id)
-                .or_default()
-                .text_bounds = Some(bounds);
-            if let Some(view) = shell
-                .active_workdesk_mut()
-                .editor_views
-                .get_mut(&surface_id)
-            {
+                .get(&surface_id)
+                .is_some_and(|view| {
+                    view.matches_layout(bounds, line_height, char_width, viewport_lines)
+                })
+        };
+        if needs_layout_sync {
+            self.shell.update(cx, |shell, _cx| {
+                let view = shell
+                    .active_workdesk_mut()
+                    .editor_views
+                    .entry(surface_id)
+                    .or_default();
+                view.text_bounds = Some(bounds);
                 view.line_height = line_height;
                 view.char_width = char_width;
                 view.gutter_width = 0.0;
                 view.viewport_lines = viewport_lines.max(1);
-            }
-        });
+            });
+        }
         if !self.active {
             return;
         }
@@ -860,6 +906,11 @@ impl TerminalSelection {
     fn contains(self, cell: TerminalCell) -> bool {
         let (start, end) = self.ordered();
         cell.compare(start).is_ge() && cell.compare(end).is_le()
+    }
+
+    fn affects_row(self, row: usize) -> bool {
+        let (start, end) = self.ordered();
+        row >= start.row && row <= end.row
     }
 }
 
@@ -2389,6 +2440,7 @@ impl CanvasShell {
             workdesks,
             active_workdesk: clamped_active_workdesk,
             workdesk_menu: None,
+            stack_surface_menu: None,
             workdesk_editor: None,
             automation_rx: receiver,
             focus_handle,
@@ -2401,6 +2453,7 @@ impl CanvasShell {
             sidebar_collapsed: false,
             notifications_open: false,
             mock_notifications_unread: 3,
+            visible_terminal_surfaces: HashSet::new(),
             cursor_blink_visible: true,
             last_cursor_blink_at: Instant::now(),
             persist_generation: 0,
@@ -2468,6 +2521,40 @@ impl CanvasShell {
         self.active_workdesk().editor_views.get(&surface_id)
     }
 
+    fn active_surface_kind(&self) -> Option<PaneKind> {
+        let pane_id = self.active_workdesk().active_pane?;
+        self.active_workdesk()
+            .active_surface_for_pane(pane_id)
+            .map(|surface| surface.kind.clone())
+    }
+
+    fn refresh_loop_interval(&self) -> Duration {
+        match self.active_surface_kind() {
+            Some(PaneKind::Shell) | Some(PaneKind::Agent) => Duration::from_millis(33),
+            Some(PaneKind::Editor) => {
+                if self.visible_terminal_surfaces.is_empty() {
+                    Duration::from_millis(220)
+                } else {
+                    Duration::from_millis(90)
+                }
+            }
+            Some(PaneKind::Browser) | None => {
+                if self.visible_terminal_surfaces.is_empty() {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_millis(110)
+                }
+            }
+        }
+    }
+
+    fn cursor_blink_target_active(&self) -> bool {
+        matches!(
+            self.active_surface_kind(),
+            Some(PaneKind::Shell) | Some(PaneKind::Agent) | Some(PaneKind::Editor)
+        )
+    }
+
     fn sync_editor_surface_metadata(&mut self, pane_id: PaneId, surface_id: SurfaceId) {
         let Some(editor) = self
             .workdesks
@@ -2490,11 +2577,11 @@ impl CanvasShell {
     }
 
     fn find_editor_surface_by_path(
-        &self,
+        workdesks: &[WorkdeskState],
         desk_index: usize,
         canonical_path: &str,
     ) -> Option<(PaneId, SurfaceId)> {
-        let desk = self.workdesks.get(desk_index)?;
+        let desk = workdesks.get(desk_index)?;
         desk.panes.iter().find_map(|pane| {
             pane.surfaces.iter().find_map(|surface| {
                 (surface.kind == PaneKind::Editor
@@ -2568,8 +2655,9 @@ impl CanvasShell {
         }
     }
 
-    fn spawn_surface_on_workdesk(
-        &mut self,
+    fn spawn_surface_on_workdesk_state(
+        workdesks: &mut [WorkdeskState],
+        active_workdesk: &mut usize,
         desk_index: usize,
         target_pane_id: Option<PaneId>,
         kind: PaneKind,
@@ -2586,18 +2674,20 @@ impl CanvasShell {
         if let Some(canonical_path) = editor_lookup_path.as_deref() {
             if target_pane_id.is_none() {
                 if let Some((pane_id, surface_id)) =
-                    self.find_editor_surface_by_path(desk_index, canonical_path)
+                    Self::find_editor_surface_by_path(workdesks, desk_index, canonical_path)
                 {
                     if focus {
-                        self.workdesks[desk_index].focus_surface(pane_id, surface_id);
-                        self.active_workdesk = desk_index;
+                        workdesks[desk_index].focus_surface(pane_id, surface_id);
+                        *active_workdesk = desk_index;
                     }
                     return Ok((pane_id, surface_id));
                 }
             }
         }
 
-        let desk = &mut self.workdesks[desk_index];
+        let Some(desk) = workdesks.get_mut(desk_index) else {
+            return Err(format!("workdesk {desk_index} was not found"));
+        };
         let surface_id = SurfaceId::new(desk.next_surface_serial);
         desk.next_surface_serial += 1;
         let requested_file_path = file_path.or(editor_lookup_path);
@@ -2615,7 +2705,7 @@ impl CanvasShell {
             desk.resize_terminals_for_pane(pane_id);
             if focus {
                 desk.focus_surface(pane_id, surface_id);
-                self.active_workdesk = desk_index;
+                *active_workdesk = desk_index;
             }
             return Ok((pane_id, surface_id));
         }
@@ -2648,10 +2738,33 @@ impl CanvasShell {
         Self::initialize_surface_runtime(desk, size, 1, &surface, editor);
         if focus {
             desk.focus_surface(pane_id, surface_id);
-            self.active_workdesk = desk_index;
+            *active_workdesk = desk_index;
         }
         desk.drag_state = DragState::Idle;
         Ok((pane_id, surface_id))
+    }
+
+    fn spawn_surface_on_workdesk(
+        &mut self,
+        desk_index: usize,
+        target_pane_id: Option<PaneId>,
+        kind: PaneKind,
+        title: Option<String>,
+        url: Option<String>,
+        file_path: Option<String>,
+        focus: bool,
+    ) -> Result<(PaneId, SurfaceId), String> {
+        Self::spawn_surface_on_workdesk_state(
+            &mut self.workdesks,
+            &mut self.active_workdesk,
+            desk_index,
+            target_pane_id,
+            kind,
+            title,
+            url,
+            file_path,
+            focus,
+        )
     }
 
     fn close_surface(&mut self, pane_id: PaneId, surface_id: SurfaceId, cx: &mut Context<Self>) {
@@ -2707,6 +2820,7 @@ impl CanvasShell {
 
     fn open_workdesk_creator(&mut self, cx: &mut Context<Self>) {
         self.dismiss_workdesk_menu();
+        self.dismiss_stack_surface_menu();
         self.workdesk_editor = Some(WorkdeskEditorState::new_create(
             WorkdeskTemplate::ShellDesk,
             self.workdesk_name_for_template(WorkdeskTemplate::ShellDesk),
@@ -2719,6 +2833,14 @@ impl CanvasShell {
             return;
         };
         self.dismiss_workdesk_menu();
+        self.dismiss_stack_surface_menu();
+        self.dismiss_notifications();
+        self.active_workdesk = index;
+        self.active_workdesk_mut().drag_state = DragState::Idle;
+        if self.active_workdesk().active_pane.is_none() {
+            self.active_workdesk_mut().active_pane =
+                self.active_workdesk().panes.last().map(|pane| pane.id);
+        }
         self.workdesk_editor = Some(WorkdeskEditorState::new_edit(index, &desk));
         cx.notify();
     }
@@ -3335,10 +3457,18 @@ impl CanvasShell {
         next_attention_target_for_workdesks(&self.workdesks)
     }
 
-    fn navigate_next_attention(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some((desk_index, pane_id)) = self.next_attention_target() else {
+    fn navigate_to_workdesk_pane(
+        &mut self,
+        desk_index: usize,
+        pane_id: PaneId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(desk) = self.workdesks.get(desk_index) else {
             return false;
         };
+        if desk.pane(pane_id).is_none() {
+            return false;
+        }
 
         if desk_index != self.active_workdesk {
             self.select_workdesk(desk_index, cx);
@@ -3347,11 +3477,20 @@ impl CanvasShell {
         true
     }
 
+    fn navigate_next_attention(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((desk_index, pane_id)) = self.next_attention_target() else {
+            return false;
+        };
+
+        self.navigate_to_workdesk_pane(desk_index, pane_id, cx)
+    }
+
     fn handle_terminal_attention_transition(
         &mut self,
         desk_index: usize,
         pane_id: PaneId,
-        snapshot: &TerminalSnapshot,
+        status: Option<&str>,
+        closed: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(desk) = self.workdesks.get(desk_index) else {
@@ -3361,7 +3500,7 @@ impl CanvasShell {
             return false;
         };
 
-        let next_state = infer_attention_state_from_snapshot(&pane.kind, snapshot);
+        let next_state = infer_attention_state_from_terminal_status(&pane.kind, status, closed);
         match next_state {
             AttentionState::Idle | AttentionState::Working => {
                 self.set_pane_attention(desk_index, pane_id, next_state, false, false, cx)
@@ -3406,6 +3545,7 @@ impl CanvasShell {
             return;
         }
 
+        self.dismiss_stack_surface_menu();
         self.shortcut_editor.open = true;
         self.shortcut_editor.recording = None;
         cx.notify();
@@ -3821,7 +3961,10 @@ impl CanvasShell {
 
     fn start_terminal_refresh_loop(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
-            Timer::after(Duration::from_millis(33)).await;
+            let refresh_interval = this
+                .update(cx, |this, _| this.refresh_loop_interval())
+                .unwrap_or(Duration::from_millis(150));
+            Timer::after(refresh_interval).await;
 
             if this
                 .update(cx, |this, cx| {
@@ -3847,20 +3990,19 @@ impl CanvasShell {
                 let desk = &mut self.workdesks[desk_index];
                 desk.sync_terminal_revisions()
             };
-            if !changed_panes.is_empty() {
-                changed = true;
-            }
 
             for (pane_id, surface_id) in changed_panes {
-                let snapshot = {
+                let (status, closed) = {
                     let Some(desk) = self.workdesks.get(desk_index) else {
                         continue;
                     };
                     let Some(terminal) = desk.terminals.get(&surface_id) else {
                         continue;
                     };
-                    terminal.snapshot()
+                    (terminal.status(), terminal.closed())
                 };
+                let render_visible = desk_index == self.active_workdesk
+                    && self.visible_terminal_surfaces.contains(&surface_id);
 
                 let previous_status = self.workdesks[desk_index]
                     .terminal_statuses
@@ -3869,13 +4011,20 @@ impl CanvasShell {
                     .unwrap_or(None);
                 self.workdesks[desk_index]
                     .terminal_statuses
-                    .insert(surface_id, snapshot.status.clone());
-                self.workdesks[desk_index].note_pane_activity(pane_id);
+                    .insert(surface_id, status.clone());
+                if render_visible {
+                    self.workdesks[desk_index].note_pane_activity(pane_id);
+                    changed = true;
+                }
 
-                if previous_status != snapshot.status {
-                    changed = self
-                        .handle_terminal_attention_transition(desk_index, pane_id, &snapshot, cx)
-                        || changed;
+                if previous_status != status {
+                    changed = self.handle_terminal_attention_transition(
+                        desk_index,
+                        pane_id,
+                        status.as_deref(),
+                        closed,
+                        cx,
+                    ) || changed;
                 }
             }
         }
@@ -3884,6 +4033,13 @@ impl CanvasShell {
     }
 
     fn tick_cursor_blink(&mut self) -> bool {
+        if !self.cursor_blink_target_active() {
+            let changed = !self.cursor_blink_visible;
+            self.cursor_blink_visible = true;
+            self.last_cursor_blink_at = Instant::now();
+            return changed;
+        }
+
         if self.last_cursor_blink_at.elapsed() < CURSOR_BLINK_INTERVAL {
             return false;
         }
@@ -4040,10 +4196,23 @@ impl CanvasShell {
             }
         };
 
+        let mut visible_terminal_surfaces = HashSet::new();
         let grid_updates = pane_frames
             .into_iter()
             .filter_map(|(pane_id, frame)| {
                 let pane = panes.iter().find(|pane| pane.id == pane_id)?;
+                if pane_frame_intersects_viewport(
+                    frame,
+                    sidebar_width,
+                    viewport_width,
+                    viewport_height,
+                ) {
+                    if let Some(surface) = pane.active_surface() {
+                        if surface.kind.is_terminal() {
+                            visible_terminal_surfaces.insert(surface.id);
+                        }
+                    }
+                }
                 pane.surfaces
                     .iter()
                     .any(|surface| surface.kind.is_terminal())
@@ -4058,6 +4227,7 @@ impl CanvasShell {
             })
             .collect::<Vec<_>>();
 
+        self.visible_terminal_surfaces = visible_terminal_surfaces;
         let desk = self.active_workdesk_mut();
         for (pane_id, grid) in grid_updates {
             desk.resize_terminals_for_pane_to_grid(pane_id, grid);
@@ -4102,7 +4272,40 @@ impl CanvasShell {
         cx.notify();
     }
 
-    fn open_editor_picker(&mut self, cx: &mut Context<Self>) {
+    fn stack_surface_in_pane(
+        &mut self,
+        pane_id: PaneId,
+        kind: PaneKind,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let desk_index = self.active_workdesk;
+        match self.spawn_surface_on_workdesk(
+            desk_index,
+            Some(pane_id),
+            kind,
+            None,
+            None,
+            None,
+            true,
+        ) {
+            Ok(_) => {
+                self.request_persist(cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.set_runtime_notice(error);
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn open_editor_picker_for_target_pane(
+        &mut self,
+        target_pane_id: Option<PaneId>,
+        cx: &mut Context<Self>,
+    ) {
         let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
@@ -4124,7 +4327,7 @@ impl CanvasShell {
             let _ = this.update(cx, |this, cx| {
                 match this.spawn_surface_on_workdesk(
                     desk_index,
-                    None,
+                    target_pane_id,
                     PaneKind::Editor,
                     None,
                     None,
@@ -4142,7 +4345,17 @@ impl CanvasShell {
         .detach();
     }
 
+    fn open_editor_picker(&mut self, cx: &mut Context<Self>) {
+        self.open_editor_picker_for_target_pane(None, cx);
+    }
+
     fn close_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if matches!(
+            self.stack_surface_menu,
+            Some(menu) if menu.desk_index == self.active_workdesk && menu.pane_id == pane_id
+        ) {
+            self.dismiss_stack_surface_menu();
+        }
         let desk = self.active_workdesk_mut();
         let removed_surfaces = desk
             .pane(pane_id)
@@ -5100,6 +5313,7 @@ impl CanvasShell {
         }
 
         self.dismiss_workdesk_menu();
+        self.dismiss_stack_surface_menu();
         self.dismiss_notifications();
         self.active_workdesk_mut().drag_state = DragState::Idle;
         self.active_workdesk = index;
@@ -5119,6 +5333,10 @@ impl CanvasShell {
         self.workdesk_menu.take().is_some()
     }
 
+    fn dismiss_stack_surface_menu(&mut self) -> bool {
+        self.stack_surface_menu.take().is_some()
+    }
+
     fn dismiss_notifications(&mut self) -> bool {
         let was_open = self.notifications_open;
         self.notifications_open = false;
@@ -5130,6 +5348,7 @@ impl CanvasShell {
         if self.notifications_open {
             self.mock_notifications_unread = 0;
             self.dismiss_workdesk_menu();
+            self.dismiss_stack_surface_menu();
         }
         cx.notify();
     }
@@ -5137,6 +5356,7 @@ impl CanvasShell {
     fn toggle_sidebar_collapsed(&mut self, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
         self.dismiss_workdesk_menu();
+        self.dismiss_stack_surface_menu();
         self.dismiss_notifications();
         cx.notify();
     }
@@ -5151,6 +5371,7 @@ impl CanvasShell {
             return;
         }
 
+        self.dismiss_stack_surface_menu();
         self.workdesk_menu = Some(WorkdeskContextMenu { index, position });
         cx.notify();
     }
@@ -5168,6 +5389,47 @@ impl CanvasShell {
         }
 
         self.open_workdesk_menu(index, position, cx);
+    }
+
+    fn open_stack_surface_menu(
+        &mut self,
+        pane_id: PaneId,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_workdesk().pane(pane_id).is_none() {
+            return;
+        }
+
+        self.dismiss_workdesk_menu();
+        self.dismiss_notifications();
+        self.active_workdesk_mut().focus_pane(pane_id);
+        self.active_workdesk_mut().note_pane_activity(pane_id);
+        self.stack_surface_menu = Some(StackSurfaceMenu {
+            desk_index: self.active_workdesk,
+            pane_id,
+            position,
+        });
+        self.request_persist(cx);
+        cx.notify();
+    }
+
+    fn toggle_stack_surface_menu(
+        &mut self,
+        pane_id: PaneId,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(
+            self.stack_surface_menu,
+            Some(menu) if menu.desk_index == self.active_workdesk && menu.pane_id == pane_id
+        ) {
+            self.dismiss_stack_surface_menu();
+            cx.notify();
+            return;
+        }
+
+        self.open_stack_surface_menu(pane_id, position, cx);
     }
 
     fn unique_workdesk_name(&self, base: &str) -> String {
@@ -5311,9 +5573,14 @@ impl CanvasShell {
             rgb(0x2f3a44).into()
         };
         let header_bg = if is_active {
-            rgb(0x1a242c)
+            rgb(0x131a20)
         } else {
-            rgb(0x151d24)
+            rgb(0x10161c)
+        };
+        let header_divider = if pane_attention.state.is_attention() {
+            attention_tint
+        } else {
+            rgb(0x24303a).into()
         };
         let screen_x = frame.x;
         let screen_y = frame.y;
@@ -5322,6 +5589,8 @@ impl CanvasShell {
         let header_height = terminal_header_height_for_surface_count(pane.surfaces.len())
             * frame.zoom.clamp(0.78, 1.3);
         let pane_padding = 12.0 * frame.zoom.clamp(0.85, 1.25);
+        let stack_rail_width =
+            pane_stack_rail_width(pane.surfaces.len()) * frame.zoom.clamp(0.82, 1.2);
         let resize_handle_size = 14.0 * frame.zoom.clamp(0.85, 1.3);
         let terminal_metrics = terminal_text_metrics(window, frame.zoom);
         let terminal_snapshot = active_surface_kind
@@ -5342,8 +5611,16 @@ impl CanvasShell {
             .as_ref()
             .map(|snapshot| snapshot.title.clone())
             .unwrap_or_else(|| active_surface_title.clone());
+        let stack_label = pane.stack_display_title().to_string();
+        let stack_count_label = surface_count_label(pane.surfaces.len());
+        let active_terminal_status = workdesk
+            .terminal_statuses
+            .get(&active_surface_id)
+            .cloned()
+            .unwrap_or(None)
+            .filter(|status| !status.trim().is_empty());
         let status_tint = if pane_attention.state == AttentionState::Idle {
-            match active_surface_kind {
+            match &active_surface_kind {
                 PaneKind::Shell | PaneKind::Agent => terminal_snapshot
                     .as_ref()
                     .map(|snapshot| {
@@ -5376,129 +5653,143 @@ impl CanvasShell {
         } else {
             attention_tint
         };
+        let (surface_status_label, surface_status_tint) = match &active_surface_kind {
+            PaneKind::Shell | PaneKind::Agent => {
+                let label = active_terminal_status.or_else(|| {
+                    terminal_snapshot
+                        .as_ref()
+                        .filter(|snapshot| snapshot.closed)
+                        .map(|_| "Closed".to_string())
+                });
+                let tint = terminal_snapshot
+                    .as_ref()
+                    .filter(|snapshot| snapshot.closed)
+                    .map(|_| rgb(0xff9b88).into())
+                    .unwrap_or(status_tint);
+                (label, tint)
+            }
+            PaneKind::Editor => {
+                let editor_state = workdesk.editors.get(&active_surface_id);
+                if editor_state.is_some_and(EditorBuffer::external_modified) {
+                    (Some("Externally changed".to_string()), rgb(0xff9b88).into())
+                } else if active_surface_dirty {
+                    (Some("Dirty".to_string()), rgb(0xf0d35f).into())
+                } else {
+                    (None, status_tint)
+                }
+            }
+            PaneKind::Browser => (None, status_tint),
+        };
         let entity = cx.entity();
+        let stack_menu_open = matches!(
+            self.stack_surface_menu,
+            Some(menu) if menu.desk_index == self.active_workdesk && menu.pane_id == pane_id
+        );
 
         let header = {
             let close_surface_id = active_surface_id;
             let close_surface_count = pane.surfaces.len();
             let header = div()
                 .flex()
-                .flex_col()
-                .justify_center()
-                .gap_1()
+                .items_center()
+                .justify_between()
+                .gap_2()
                 .h(px(header_height))
                 .px(px(pane_padding))
-                .py(px(6.0 * frame.zoom.clamp(0.9, 1.2)))
                 .bg(header_bg)
                 .border_b_1()
-                .border_color(border)
+                .border_color(header_divider)
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.cycle_manual_pane_attention(pane_id, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .child(attention_indicator(
+                                    pane_attention.state,
+                                    pane_attention.unread,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(accent)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(stack_label.clone()),
+                        )
+                        .child(div().text_xs().text_color(rgb(0x53606a)).child("·"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(status_tint)
+                                .child(surface_kind_slug(&active_surface_kind)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0xc8d1d8))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(runtime_title.clone()),
+                        ),
+                )
                 .child(
                     div()
                         .flex()
-                        .justify_between()
                         .items_center()
                         .gap_2()
+                        .when_some(surface_status_label.clone(), |row, status| {
+                            row.child(context_pill(status, surface_status_tint))
+                        })
+                        .when(pane.surfaces.len() > 1, |row| {
+                            row.child(context_pill(stack_count_label.clone(), accent))
+                        })
                         .child(
                             div()
-                                .flex_1()
+                                .cursor_pointer()
+                                .w(px(20.0))
+                                .h(px(20.0))
                                 .flex()
                                 .items_center()
-                                .gap_2()
-                                .overflow_hidden()
-                                .child(
-                                    div()
-                                        .cursor_pointer()
-                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.cycle_manual_pane_attention(pane_id, cx);
-                                                cx.stop_propagation();
-                                            }),
-                                        )
-                                        .child(attention_indicator(
-                                            pane_attention.state,
-                                            pane_attention.unread,
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(status_tint)
-                                        .child(surface_kind_slug(&active_surface_kind)),
-                                )
-                                .child(div().text_sm().child(runtime_title.clone())),
-                        )
-                        .child(
-                            div().flex().items_center().gap_1().child(
-                                div()
-                                    .cursor_pointer()
-                                    .w(px(24.0))
-                                    .h(px(24.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .bg(rgb(0x23171a))
-                                    .text_xs()
-                                    .text_color(rgb(0xffc4b5))
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                .justify_center()
+                                .rounded_sm()
+                                .bg(rgb(0x171d24))
+                                .border_1()
+                                .border_color(rgb(0x293742))
+                                .text_xs()
+                                .text_color(rgb(0xaeb8bf))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        if close_surface_count > 1 {
+                                            this.close_surface(pane_id, close_surface_id, cx);
+                                        } else {
+                                            this.close_pane(pane_id, cx);
+                                        }
                                         cx.stop_propagation();
-                                    })
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            if close_surface_count > 1 {
-                                                this.close_surface(pane_id, close_surface_id, cx);
-                                            } else {
-                                                this.close_pane(pane_id, cx);
-                                            }
-                                            cx.stop_propagation();
-                                        }),
-                                    )
-                                    .child("X"),
-                            ),
+                                    }),
+                                )
+                                .child("x"),
                         ),
                 );
-
-            let header = if pane.surfaces.len() > 1 {
-                header.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .overflow_hidden()
-                        .children(
-                            pane.surfaces
-                                .iter()
-                                .map(|surface| {
-                                    let surface_id = surface.id;
-                                    let active = surface_id == active_surface_id;
-                                    surface_stack_chip(
-                                        surface,
-                                        active,
-                                        pane_accent(&surface.kind),
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.active_workdesk_mut()
-                                                .focus_surface(pane_id, surface_id);
-                                            this.active_workdesk_mut().note_pane_activity(pane_id);
-                                            this.cursor_blink_visible = true;
-                                            this.last_cursor_blink_at = Instant::now();
-                                            this.request_persist(cx);
-                                            window.focus(&this.focus_handle);
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        }),
-                                    )
-                                })
-                                .collect::<Vec<_>>(),
-                        ),
-                )
-            } else {
-                header
-            };
 
             if frame.allow_layout_drag {
                 header.cursor_move().on_mouse_down(
@@ -5514,7 +5805,7 @@ impl CanvasShell {
             }
         };
 
-        let body = match active_surface_kind {
+        let body_content = match active_surface_kind {
             PaneKind::Shell | PaneKind::Agent => {
                 let terminal_body_metrics = terminal_snapshot.as_ref().map(|snapshot| {
                     terminal_frame_metrics(
@@ -5523,6 +5814,7 @@ impl CanvasShell {
                         screen_y,
                         header_height,
                         pane_padding,
+                        stack_rail_width,
                         snapshot,
                     )
                 });
@@ -5559,7 +5851,7 @@ impl CanvasShell {
                 let line_height = 16.0 * frame.zoom.clamp(0.85, 1.18);
                 let char_width = 7.4 * frame.zoom.clamp(0.85, 1.18);
                 if let Some(editor) = workdesk.editors.get(&active_surface_id) {
-                    let search_matches = editor.search_matches();
+                    let search_match_count = editor.search_match_count();
                     let search_height = if editor.search_state().open {
                         34.0
                     } else {
@@ -5608,8 +5900,8 @@ impl CanvasShell {
                     let search_label = editor
                         .search_state()
                         .active_match
-                        .map(|index| format!("{}/{}", index + 1, search_matches.len()))
-                        .unwrap_or_else(|| format!("0/{}", search_matches.len()));
+                        .map(|index| format!("{}/{}", index + 1, search_match_count))
+                        .unwrap_or_else(|| format!("0/{}", search_match_count));
                     let path_label = editor.path_string();
                     let language_label = editor_language_label(editor);
                     let dirty = editor.dirty();
@@ -5794,6 +6086,64 @@ impl CanvasShell {
             }
         };
 
+        let stack_rail = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .w(px(stack_rail_width))
+            .py(px(pane_padding.max(8.0)))
+            .bg(rgb(0x11171d))
+            .border_r_1()
+            .border_color(rgb(0x22303a))
+            .child(
+                div().flex().flex_col().items_center().gap_1().children(
+                    pane.surfaces
+                        .iter()
+                        .enumerate()
+                        .map(|(index, surface)| {
+                            let surface_id = surface.id;
+                            let active = surface_id == active_surface_id;
+                            surface_stack_rail_button(
+                                surface,
+                                index,
+                                active,
+                                pane_accent(&surface.kind),
+                                cx.listener(move |this, _, window, cx| {
+                                    this.dismiss_stack_surface_menu();
+                                    this.active_workdesk_mut()
+                                        .focus_surface(pane_id, surface_id);
+                                    this.active_workdesk_mut().note_pane_activity(pane_id);
+                                    this.cursor_blink_visible = true;
+                                    this.last_cursor_blink_at = Instant::now();
+                                    this.request_persist(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .child(surface_stack_rail_action_button(
+                "+",
+                rgb(0x77d19a).into(),
+                stack_menu_open,
+                cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                    this.toggle_stack_surface_menu(pane_id, event.position, cx);
+                    cx.stop_propagation();
+                }),
+            ));
+
+        let body = div()
+            .flex()
+            .flex_1()
+            .overflow_hidden()
+            .child(stack_rail)
+            .child(body_content);
+
         let surface = div()
             .absolute()
             .left(px(screen_x))
@@ -5803,11 +6153,11 @@ impl CanvasShell {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(rgb(0x182028))
+            .bg(rgb(0x161d24))
             .border_1()
             .border_color(border)
-            .rounded_lg()
-            .shadow_lg()
+            .rounded_md()
+            .shadow_md()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
@@ -5867,9 +6217,25 @@ impl Render for CanvasShell {
         self.sync_visible_terminal_grids(window, viewport_width, viewport_height);
         let sidebar_width = self.sidebar_width();
         let open_workdesk_menu = self.workdesk_menu;
+        let open_stack_surface_menu = self.stack_surface_menu;
         let workdesk = self.active_workdesk();
         let layout_mode = workdesk.layout_mode;
         let grid_expose_open = layout_mode == LayoutMode::Grid && workdesk.grid_layout.expose_open;
+        let active_stack = workdesk
+            .active_pane
+            .and_then(|pane_id| workdesk.pane(pane_id))
+            .map(|pane| {
+                (
+                    pane.id,
+                    pane.stack_display_title().to_string(),
+                    surface_count_label(pane.surfaces.len()),
+                )
+            });
+        let stack_controls_enabled = active_stack.is_some();
+        let active_stack_summary = active_stack
+            .as_ref()
+            .map(|(_, label, count_label)| format!("{label} · {count_label}"))
+            .unwrap_or_else(|| "No active pane".to_string());
         let grid_projection = matches!(layout_mode, LayoutMode::Grid)
             .then(|| grid_projection(&workdesk.panes))
             .unwrap_or_default();
@@ -6250,6 +6616,7 @@ impl Render for CanvasShell {
                         index == self.active_workdesk,
                         is_menu_open,
                         preview,
+                        workdesk_navigation_target(desk),
                         accent,
                         cx.listener(move |this, _, _, cx| {
                             this.dismiss_workdesk_menu();
@@ -6258,6 +6625,19 @@ impl Render for CanvasShell {
                         }),
                         cx.listener(move |this, event: &MouseUpEvent, _, cx| {
                             this.open_workdesk_menu(index, event.position, cx);
+                            cx.stop_propagation();
+                        }),
+                        cx.listener(move |this, _, _, cx| {
+                            let Some(target) = workdesk_navigation_target(&this.workdesks[index])
+                            else {
+                                return;
+                            };
+                            this.dismiss_workdesk_menu();
+                            this.navigate_to_workdesk_pane(index, target.pane_id, cx);
+                            cx.stop_propagation();
+                        }),
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_workdesk_editor_panel(index, cx);
                             cx.stop_propagation();
                         }),
                         cx.listener(move |this, event: &MouseUpEvent, _, cx| {
@@ -6661,6 +7041,112 @@ impl Render for CanvasShell {
                     }),
             )
         });
+        let stack_surface_context_menu = open_stack_surface_menu.and_then(|menu| {
+            if menu.desk_index != self.active_workdesk {
+                return None;
+            }
+            let pane = self.active_workdesk().pane(menu.pane_id)?;
+            let accent = pane
+                .active_surface()
+                .map(|surface| pane_accent(&surface.kind))
+                .unwrap_or_else(|| rgb(0x77d19a).into());
+            let menu_height = 222.0;
+            let min_left = sidebar_width + 10.0;
+            let max_left = (viewport_width - STACK_SURFACE_MENU_WIDTH - 12.0).max(min_left);
+            let max_top = (viewport_height - menu_height - 12.0).max(12.0);
+            let left = (f32::from(menu.position.x) + 10.0).clamp(min_left, max_left);
+            let top = (f32::from(menu.position.y) - menu_height + 18.0).clamp(12.0, max_top);
+            let pane_id = menu.pane_id;
+
+            Some(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(STACK_SURFACE_MENU_WIDTH))
+                    .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .bg(rgb(0x11181e))
+                    .border_1()
+                    .border_color(rgb(0x2c3944))
+                    .rounded_lg()
+                    .shadow_lg()
+                    .on_any_mouse_down(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        if this.dismiss_stack_surface_menu() {
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .on_scroll_wheel(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(accent).child("Add to stack"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(pane.stack_display_title().to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x90a0aa))
+                                    .child(surface_count_label(pane.surfaces.len())),
+                            ),
+                    )
+                    .child(workdesk_menu_item(
+                        "Shell",
+                        "Stack a shell in this pane",
+                        rgb(0xe59a49).into(),
+                        cx.listener(move |this, _, _, cx| {
+                            this.dismiss_stack_surface_menu();
+                            this.stack_surface_in_pane(pane_id, PaneKind::Shell, cx);
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .child(workdesk_menu_item(
+                        "Agent",
+                        "Stack an agent beside this flow",
+                        rgb(0x7cc7ff).into(),
+                        cx.listener(move |this, _, _, cx| {
+                            this.dismiss_stack_surface_menu();
+                            this.stack_surface_in_pane(pane_id, PaneKind::Agent, cx);
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .child(workdesk_menu_item(
+                        "Browser",
+                        "Stack a browser in this pane",
+                        rgb(0x77d19a).into(),
+                        cx.listener(move |this, _, _, cx| {
+                            this.dismiss_stack_surface_menu();
+                            this.stack_surface_in_pane(pane_id, PaneKind::Browser, cx);
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .child(workdesk_menu_item(
+                        "Editor",
+                        "Open a file into this pane",
+                        rgb(0xb4a4ff).into(),
+                        cx.listener(move |this, _, _, cx| {
+                            this.dismiss_stack_surface_menu();
+                            this.open_editor_picker_for_target_pane(Some(pane_id), cx);
+                            cx.stop_propagation();
+                        }),
+                    )),
+            )
+        });
         let workdesk_editor_overlay = self.workdesk_editor.as_ref().map(|editor| {
             let accent = match editor.mode {
                 WorkdeskEditorMode::Create => editor.template.accent(),
@@ -6709,6 +7195,11 @@ impl Render for CanvasShell {
             };
 
             div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(viewport_width))
+                .h(px(viewport_height))
                 .child(
                     div()
                         .absolute()
@@ -6941,12 +7432,6 @@ impl Render for CanvasShell {
                     .when(!self.sidebar_collapsed, |sidebar| {
                         sidebar.child(
                             div()
-                                .absolute()
-                                .left(px(10.0))
-                                .top(px(10.0))
-                                .w(px((sidebar_width - 20.0)
-                                    .max(178.0)
-                                    .min((viewport_width - 20.0).max(120.0))))
                                 .flex()
                                 .items_center()
                                 .justify_between()
@@ -6956,9 +7441,6 @@ impl Render for CanvasShell {
                                         .flex()
                                         .items_center()
                                         .gap_1()
-                                        .when(cfg!(target_os = "macos"), |row| {
-                                            row.child(div().w(px(56.0)))
-                                        })
                                         .child(chrome_button(
                                             "Bell",
                                             rgb(0x7cc7ff).into(),
@@ -6990,34 +7472,13 @@ impl Render for CanvasShell {
                                 )),
                         )
                     })
-                    .when(!self.sidebar_collapsed, |sidebar| {
-                        sidebar.child(
-                            div().flex().items_center().justify_between().gap_2().child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .child(
-                                        div().text_xs().text_color(rgb(0x7f8a94)).child("Canvas"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(0xdce2e8))
-                                            .child("Workdesks"),
-                                    ),
-                            ),
-                        )
-                    })
                     .when(self.sidebar_collapsed, |sidebar| {
                         sidebar
                             .child(
                                 div()
-                                    .absolute()
-                                    .left(px(10.0))
-                                    .top(px(14.0 + sidebar_header_inset))
                                     .flex()
                                     .flex_col()
+                                    .items_center()
                                     .gap_2()
                                     .child(chrome_button(
                                         "N",
@@ -7070,9 +7531,9 @@ impl Render for CanvasShell {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap_4()
-                    .px_4()
-                    .py_2()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
                     .bg(rgba(0x0d1217f0))
                     .border_t_1()
                     .border_color(rgb(0x25303a))
@@ -7086,47 +7547,66 @@ impl Render for CanvasShell {
                         div()
                             .flex()
                             .items_center()
-                            .gap_1()
-                            .child(div().text_xs().text_color(rgb(0x7f8a94)).child("Create"))
-                            .child(compact_dock_button(
-                                "Shell",
-                                rgb(0xe59a49).into(),
-                                cx.listener(|this, _, window, cx| {
-                                    this.spawn_pane(PaneKind::Shell, window, cx);
-                                    cx.stop_propagation();
-                                }),
-                            ))
-                            .child(compact_dock_button(
-                                "Agent",
-                                rgb(0x7cc7ff).into(),
-                                cx.listener(|this, _, window, cx| {
-                                    this.spawn_pane(PaneKind::Agent, window, cx);
-                                    cx.stop_propagation();
-                                }),
-                            ))
-                            .child(compact_dock_button(
-                                "Browser",
-                                rgb(0x77d19a).into(),
-                                cx.listener(|this, _, window, cx| {
-                                    this.spawn_pane(PaneKind::Browser, window, cx);
-                                    cx.stop_propagation();
-                                }),
-                            ))
-                            .child(compact_dock_button(
-                                "Editor",
-                                rgb(0xb4a4ff).into(),
-                                cx.listener(|this, _, _, cx| {
-                                    this.open_editor_picker(cx);
-                                    cx.stop_propagation();
-                                }),
-                            )),
+                            .gap_2()
+                            .child(
+                                div()
+                                    .max_w(px(260.0))
+                                    .text_xs()
+                                    .text_color(if stack_controls_enabled {
+                                        rgb(0x97a4ad)
+                                    } else {
+                                        rgb(0x697680)
+                                    })
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .child(active_stack_summary),
+                            )
+                            .child(dock_divider())
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(div().text_xs().text_color(rgb(0x63707a)).child("New"))
+                                    .child(compact_dock_button(
+                                        "+Sh",
+                                        rgb(0xe59a49).into(),
+                                        cx.listener(|this, _, window, cx| {
+                                            this.spawn_pane(PaneKind::Shell, window, cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ))
+                                    .child(compact_dock_button(
+                                        "+Ag",
+                                        rgb(0x7cc7ff).into(),
+                                        cx.listener(|this, _, window, cx| {
+                                            this.spawn_pane(PaneKind::Agent, window, cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ))
+                                    .child(compact_dock_button(
+                                        "+Web",
+                                        rgb(0x77d19a).into(),
+                                        cx.listener(|this, _, window, cx| {
+                                            this.spawn_pane(PaneKind::Browser, window, cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ))
+                                    .child(compact_dock_button(
+                                        "+Ed",
+                                        rgb(0xb4a4ff).into(),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.open_editor_picker(cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    )),
+                            ),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(div().text_xs().text_color(rgb(0x7f8a94)).child("Layout"))
                             .child(compact_toggle_button(
                                 "Free",
                                 rgb(0x77d19a).into(),
@@ -7275,6 +7755,7 @@ impl Render for CanvasShell {
             .children(shortcut_overlay)
             .when_some(workdesk_editor_overlay, |root, overlay| root.child(overlay))
             .when_some(notification_overlay, |root, overlay| root.child(overlay))
+            .when_some(stack_surface_context_menu, |root, menu| root.child(menu))
             .when_some(workdesk.runtime_notice.clone(), |root, notice| {
                 root.child(
                     div()
@@ -7772,6 +8253,23 @@ fn surface_kind_slug(kind: &SurfaceKind) -> &'static str {
     }
 }
 
+fn surface_kind_rail_code(kind: &SurfaceKind) -> &'static str {
+    match kind {
+        SurfaceKind::Shell => "S",
+        SurfaceKind::Agent => "A",
+        SurfaceKind::Browser => "B",
+        SurfaceKind::Editor => "E",
+    }
+}
+
+fn surface_count_label(surface_count: usize) -> String {
+    if surface_count == 1 {
+        "1 surface".to_string()
+    } else {
+        format!("{surface_count} surfaces")
+    }
+}
+
 fn default_size_for_kind(kind: &PaneKind) -> WorkdeskSize {
     match kind {
         PaneKind::Shell => DEFAULT_SHELL_SIZE,
@@ -8042,9 +8540,12 @@ fn workdesk_card(
     is_active: bool,
     is_menu_open: bool,
     preview: String,
+    navigation_target: Option<WorkdeskNavigationTarget>,
     accent: gpui::Hsla,
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     context_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    navigation_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    edit_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     menu_button_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let attention_summary = desk.workdesk_attention_summary();
@@ -8101,6 +8602,30 @@ fn workdesk_card(
         preview
     };
     let meta_line = format!("{cwd_label} · {branch_label} · {} panes", desk.panes.len());
+    let has_navigation_target = navigation_target.is_some();
+    let navigation_label = navigation_target.as_ref().map(|target| {
+        if target.mode == WorkdeskNavigationMode::Attention {
+            "Next up"
+        } else if is_active {
+            "Now"
+        } else {
+            "Resume"
+        }
+    });
+    let navigation_button_label = navigation_target.as_ref().map(|target| match target.mode {
+        WorkdeskNavigationMode::Attention => "Open",
+        WorkdeskNavigationMode::Resume => "Resume",
+    });
+    let navigation_tint = navigation_target
+        .as_ref()
+        .map(|target| {
+            if target.mode == WorkdeskNavigationMode::Attention {
+                target.state.tint()
+            } else {
+                accent
+            }
+        })
+        .unwrap_or(accent);
 
     div()
         .flex()
@@ -8180,6 +8705,22 @@ fn workdesk_card(
                                 .flex()
                                 .items_center()
                                 .justify_center()
+                                .min_w(px(40.0))
+                                .h(px(22.0))
+                                .px_2()
+                                .cursor_pointer()
+                                .bg(rgb(0x171d24))
+                                .border_1()
+                                .border_color(rgb(0x2b3641))
+                                .rounded_md()
+                                .on_mouse_down(MouseButton::Left, edit_listener)
+                                .child(div().text_xs().text_color(rgb(0x9da8b1)).child("Edit")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .w(px(22.0))
                                 .h(px(22.0))
                                 .bg(if is_menu_open {
@@ -8232,16 +8773,70 @@ fn workdesk_card(
                     row.child(context_pill(status, attention_tint))
                 }),
         )
-        .child(
-            div().flex().items_center().justify_between().gap_2().child(
+        .when_some(navigation_target.clone(), |card, target| {
+            card.child(
                 div()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .gap_2()
-                    .child(attention_indicator(focus_attention, false))
-                    .child(div().text_xs().text_color(rgb(0x7f8a94)).child(focus_label)),
-            ),
-        )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(navigation_tint)
+                                    .child(navigation_label.unwrap_or("Resume")),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .overflow_hidden()
+                                    .child(attention_indicator(target.state, target.unread))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0xd5dde3))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .child(target.label),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x7f8a94))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .child(target.detail),
+                            ),
+                    )
+                    .child(control_button(
+                        navigation_button_label.unwrap_or("Open"),
+                        navigation_tint,
+                        navigation_listener,
+                    )),
+            )
+        })
+        .when(!has_navigation_target, |card| {
+            card.child(
+                div().flex().items_center().justify_between().gap_2().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(attention_indicator(focus_attention, false))
+                        .child(div().text_xs().text_color(rgb(0x7f8a94)).child(focus_label)),
+                ),
+            )
+        })
 }
 
 fn workdesk_compact_chip(
@@ -8555,7 +9150,31 @@ fn compact_dock_button(
     accent: gpui::Hsla,
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    compact_dock_button_stateful(label, accent, true, listener)
+}
+
+fn compact_dock_button_stateful(
+    label: &str,
+    accent: gpui::Hsla,
+    enabled: bool,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     let label = label.to_string();
+    let background = if enabled {
+        rgb(0x161d24)
+    } else {
+        rgb(0x12181e)
+    };
+    let border: gpui::Hsla = if enabled {
+        rgb(0x2b3641).into()
+    } else {
+        rgb(0x22303a).into()
+    };
+    let text_color = if enabled {
+        accent
+    } else {
+        rgb(0x56626c).into()
+    };
 
     div()
         .flex()
@@ -8564,16 +9183,19 @@ fn compact_dock_button(
         .min_w(px(36.0))
         .px_2()
         .py_1()
-        .cursor_pointer()
-        .bg(rgb(0x161d24))
+        .bg(background)
         .border_1()
-        .border_color(rgb(0x2b3641))
+        .border_color(border)
         .rounded_md()
-        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-            cx.stop_propagation();
+        .when(enabled, |button| {
+            button
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_mouse_up(MouseButton::Left, listener)
         })
-        .on_mouse_up(MouseButton::Left, listener)
-        .child(div().text_xs().text_color(accent).child(label))
+        .child(div().text_xs().text_color(text_color).child(label))
 }
 
 fn chrome_button(
@@ -9187,6 +9809,70 @@ fn next_attention_target_for_workdesks(workdesks: &[WorkdeskState]) -> Option<(u
     best.map(|((_, desk_index, _), pane_id)| (desk_index, pane_id))
 }
 
+fn next_attention_target_for_workdesk(desk: &WorkdeskState) -> Option<PaneId> {
+    let mut best: Option<(u64, PaneId)> = None;
+
+    for pane in &desk.panes {
+        let attention = desk.pane_attention(pane.id);
+        if !attention.unread || !attention.state.is_attention() {
+            continue;
+        }
+
+        let candidate_key = attention.last_attention_sequence.max(1);
+        if best
+            .as_ref()
+            .map_or(true, |(best_key, _)| candidate_key < *best_key)
+        {
+            best = Some((candidate_key, pane.id));
+        }
+    }
+
+    best.map(|(_, pane_id)| pane_id)
+}
+
+fn workdesk_navigation_target(desk: &WorkdeskState) -> Option<WorkdeskNavigationTarget> {
+    let (pane_id, mode) = next_attention_target_for_workdesk(desk)
+        .map(|pane_id| (pane_id, WorkdeskNavigationMode::Attention))
+        .or_else(|| {
+            desk.active_pane
+                .map(|pane_id| (pane_id, WorkdeskNavigationMode::Resume))
+        })
+        .or_else(|| {
+            desk.panes
+                .last()
+                .map(|pane| (pane.id, WorkdeskNavigationMode::Resume))
+        })?;
+    let pane = desk.pane(pane_id)?;
+    let attention = desk.pane_attention(pane_id);
+    let active_surface_kind = pane
+        .active_surface()
+        .map(|surface| surface_kind_slug(&surface.kind))
+        .unwrap_or("surface");
+    let detail = match mode {
+        WorkdeskNavigationMode::Attention => format!(
+            "{} · {} · {}",
+            attention.state.label(),
+            active_surface_kind,
+            surface_count_label(pane.surfaces.len())
+        ),
+        WorkdeskNavigationMode::Resume => {
+            format!(
+                "{active_surface_kind} · {}",
+                surface_count_label(pane.surfaces.len())
+            )
+        }
+    };
+
+    Some(WorkdeskNavigationTarget {
+        pane_id,
+        state: attention.state,
+        unread: attention.unread,
+        mode,
+        label: pane.stack_display_title().to_string(),
+        detail,
+    })
+}
+
 fn split_layout_frames(
     panes: &[PaneRecord],
     _active_pane: Option<PaneId>,
@@ -9384,11 +10070,12 @@ fn directional_projection_for_frames(frames: &[(PaneId, PaneViewportFrame)]) -> 
     projection
 }
 
-fn infer_attention_state_from_snapshot(
+fn infer_attention_state_from_terminal_status(
     pane_kind: &PaneKind,
-    snapshot: &TerminalSnapshot,
+    status: Option<&str>,
+    closed: bool,
 ) -> AttentionState {
-    let status = snapshot.status.as_deref().unwrap_or("Running");
+    let status = status.unwrap_or("Running");
     let normalized = status.to_ascii_lowercase();
 
     if normalized.contains("error")
@@ -9399,10 +10086,7 @@ fn infer_attention_state_from_snapshot(
         return AttentionState::Error;
     }
 
-    if snapshot.closed
-        || normalized.contains("exited with code 0")
-        || normalized.contains("terminated")
-    {
+    if closed || normalized.contains("exited with code 0") || normalized.contains("terminated") {
         return AttentionState::Waiting;
     }
 
@@ -9430,51 +10114,93 @@ fn escape_applescript_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn surface_stack_chip(
+fn pane_frame_intersects_viewport(
+    frame: PaneViewportFrame,
+    sidebar_width: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> bool {
+    let viewport_left = sidebar_width;
+    let viewport_right = viewport_width;
+    let viewport_top = 0.0;
+    let viewport_bottom = viewport_height;
+
+    frame.x < viewport_right
+        && frame.x + frame.width > viewport_left
+        && frame.y < viewport_bottom
+        && frame.y + frame.height > viewport_top
+}
+
+fn surface_stack_rail_button(
     surface: &SurfaceRecord,
+    index: usize,
     active: bool,
     accent: gpui::Hsla,
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let border = if active { accent } else { rgb(0x2b3641).into() };
-    let background = if active { rgb(0x1c2630) } else { rgb(0x151c23) };
-    let label = if surface.dirty {
-        format!("{}*", surface.title)
-    } else {
-        surface.title.clone()
-    };
+    let border = if active { accent } else { rgb(0x24303a).into() };
+    let background = if active { rgb(0x19222a) } else { rgb(0x10161c) };
+    let text_color = if active { accent } else { rgb(0x86929c).into() };
+    let label = format!("{}{}", surface_kind_rail_code(&surface.kind), index + 1);
 
     div()
+        .relative()
         .flex()
         .items_center()
-        .gap_2()
-        .max_w(px(196.0))
-        .px_2()
-        .py_1()
+        .justify_center()
+        .w(px(28.0))
+        .h(px(22.0))
         .cursor_pointer()
         .bg(background)
         .border_1()
         .border_color(border)
-        .rounded_md()
-        .overflow_hidden()
+        .rounded_sm()
+        .font_family(".ZedMono")
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
         .on_mouse_up(MouseButton::Left, listener)
-        .child(
-            div()
-                .text_xs()
-                .text_color(accent)
-                .child(surface_kind_slug(&surface.kind)),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(0xdce2e8))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .child(label),
-        )
+        .child(div().text_xs().text_color(text_color).child(label))
+        .when(surface.dirty, |button| {
+            button.child(
+                div()
+                    .absolute()
+                    .right(px(2.0))
+                    .bottom(px(2.0))
+                    .w(px(4.0))
+                    .h(px(4.0))
+                    .rounded_full()
+                    .bg(rgb(0xf0d35f)),
+            )
+        })
+}
+
+fn surface_stack_rail_action_button(
+    label: &str,
+    accent: gpui::Hsla,
+    active: bool,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let border = if active { accent } else { rgb(0x24303a).into() };
+    let background = if active { rgb(0x162029) } else { rgb(0x10161c) };
+
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(28.0))
+        .h(px(22.0))
+        .cursor_pointer()
+        .bg(background)
+        .border_1()
+        .border_color(border)
+        .rounded_sm()
+        .font_family(".ZedMono")
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, listener)
+        .child(div().text_xs().text_color(accent).child(label.to_string()))
 }
 
 fn browser_preview_card(
@@ -9575,12 +10301,23 @@ fn editor_line_display(
     let cursor_offset = editor.cursor_offset();
     let show_cursor = is_active && cursor_blink_visible && selection.is_empty();
     let append_cursor_cell = show_cursor && cursor_offset == line_range.end;
+    let highlights = editor.highlight_line(line_index);
+    let selection_intersects =
+        !selection.is_empty() && ranges_intersect(&selection, &line_range, true);
+    let search_intersects = search_match
+        .as_ref()
+        .is_some_and(|range| ranges_intersect(range, &line_range, true));
+    let cursor_on_line =
+        show_cursor && cursor_offset >= line_range.start && cursor_offset <= line_range.end;
+
+    if !selection_intersects && !search_intersects && !cursor_on_line {
+        return editor_static_line_display(line_text, &highlights);
+    }
 
     if display_text.is_empty() || append_cursor_cell {
         display_text.push(' ');
     }
 
-    let highlights = editor.highlight_line(line_index);
     let original_len = line_text.len();
     let mut runs: Vec<TextRun> = Vec::new();
 
@@ -9625,37 +10362,134 @@ fn editor_line_display(
             color = rgb(0x10161b).into();
         }
 
-        let font = editor_font_for_kind(highlight);
-        if let Some(last) = runs.last_mut() {
-            if last.font == font
-                && last.color == color
-                && last.background_color == background
-                && last.underline.is_none()
-                && last.strikethrough.is_none()
-            {
-                last.len += ch.len_utf8();
-                continue;
-            }
-        }
-
-        runs.push(TextRun {
-            len: ch.len_utf8(),
-            font,
-            color,
-            background_color: background,
-            underline: None,
-            strikethrough: None,
-        });
+        push_editor_text_run(&mut runs, ch.len_utf8(), highlight, color, background);
     }
 
     StyledText::new(display_text).with_runs(runs)
 }
 
+fn editor_static_line_display(
+    line_text: &str,
+    highlights: &[canvas_editor::HighlightSpan],
+) -> StyledText {
+    if line_text.is_empty() {
+        let mut runs = Vec::new();
+        push_editor_text_run(
+            &mut runs,
+            1,
+            HighlightKind::Plain,
+            editor_text_color_for_kind(HighlightKind::Plain),
+            None,
+        );
+        return StyledText::new(" ").with_runs(runs);
+    }
+
+    let mut cursor = 0usize;
+    let mut runs = Vec::new();
+    for span in highlights {
+        let start = span.range.start.min(line_text.len());
+        if cursor < start {
+            push_editor_text_run(
+                &mut runs,
+                start - cursor,
+                HighlightKind::Plain,
+                editor_text_color_for_kind(HighlightKind::Plain),
+                None,
+            );
+        }
+
+        let end = span.range.end.min(line_text.len());
+        if end > start {
+            push_editor_text_run(
+                &mut runs,
+                end - start,
+                span.kind,
+                editor_text_color_for_kind(span.kind),
+                None,
+            );
+            cursor = end;
+        }
+    }
+
+    if cursor < line_text.len() {
+        push_editor_text_run(
+            &mut runs,
+            line_text.len() - cursor,
+            HighlightKind::Plain,
+            editor_text_color_for_kind(HighlightKind::Plain),
+            None,
+        );
+    }
+
+    StyledText::new(line_text.to_string()).with_runs(runs)
+}
+
+fn push_editor_text_run(
+    runs: &mut Vec<TextRun>,
+    len: usize,
+    kind: HighlightKind,
+    color: gpui::Hsla,
+    background: Option<gpui::Hsla>,
+) {
+    if len == 0 {
+        return;
+    }
+
+    let font = editor_font_for_kind(kind);
+    if let Some(last) = runs.last_mut() {
+        if last.font == font
+            && last.color == color
+            && last.background_color == background
+            && last.underline.is_none()
+            && last.strikethrough.is_none()
+        {
+            last.len += len;
+            return;
+        }
+    }
+
+    runs.push(TextRun {
+        len,
+        font,
+        color,
+        background_color: background,
+        underline: None,
+        strikethrough: None,
+    });
+}
+
+fn ranges_intersect(left: &Range<usize>, right: &Range<usize>, inclusive_cursor_end: bool) -> bool {
+    if inclusive_cursor_end && left.start == left.end {
+        left.start >= right.start && left.start <= right.end
+    } else {
+        left.start < right.end && left.end > right.start
+    }
+}
+
+fn approx_eq_f32(left: f32, right: f32) -> bool {
+    (left - right).abs() <= 0.25
+}
+
+fn bounds_approx_eq(left: Bounds<Pixels>, right: Bounds<Pixels>) -> bool {
+    approx_eq_f32(f32::from(left.left()), f32::from(right.left()))
+        && approx_eq_f32(f32::from(left.top()), f32::from(right.top()))
+        && approx_eq_f32(f32::from(left.size.width), f32::from(right.size.width))
+        && approx_eq_f32(f32::from(left.size.height), f32::from(right.size.height))
+}
+
 fn terminal_header_height_for_surface_count(surface_count: usize) -> f32 {
     if surface_count > 1 {
-        58.0
+        32.0
     } else {
-        38.0
+        30.0
+    }
+}
+
+fn pane_stack_rail_width(surface_count: usize) -> f32 {
+    if surface_count == 0 {
+        0.0
+    } else {
+        40.0
     }
 }
 
@@ -9696,7 +10530,7 @@ fn terminal_text_metrics(window: &Window, zoom: f32) -> TerminalTextMetrics {
 }
 
 fn terminal_grid_size_for_pane(size: WorkdeskSize, surface_count: usize) -> TerminalGridSize {
-    let horizontal_chrome = TERMINAL_BODY_INSET * 2.0 + 24.0;
+    let horizontal_chrome = pane_stack_rail_width(surface_count) + TERMINAL_BODY_INSET * 2.0 + 24.0;
     let vertical_chrome =
         terminal_header_height_for_surface_count(surface_count) + TERMINAL_BODY_INSET * 2.0 + 24.0;
     let cols = ((size.width - horizontal_chrome) / terminal_cell_width_for_zoom(1.0))
@@ -9717,7 +10551,9 @@ fn terminal_grid_size_for_frame(
     let header_height =
         terminal_header_height_for_surface_count(surface_count) * frame.zoom.clamp(0.78, 1.3);
     let pane_padding = 12.0 * frame.zoom.clamp(0.85, 1.25);
-    let content_width = (frame.width - pane_padding * 2.0 - TERMINAL_BODY_INSET * 2.0).max(1.0);
+    let stack_rail_width = pane_stack_rail_width(surface_count) * frame.zoom.clamp(0.82, 1.2);
+    let content_width =
+        (frame.width - pane_padding * 2.0 - TERMINAL_BODY_INSET * 2.0 - stack_rail_width).max(1.0);
     let content_height =
         (frame.height - header_height - pane_padding * 2.0 - TERMINAL_BODY_INSET * 2.0).max(1.0);
     let cols = (content_width / metrics.cell_width).floor().max(40.0) as u16;
@@ -9797,6 +10633,12 @@ fn terminal_row_element(
         && is_active
         && row_index == cursor_row
         && (cursor_blink_visible || !snapshot.cursor_blinking);
+    let row_has_selection = selection.is_some_and(|selection| selection.affects_row(row_index));
+
+    if !show_cursor && !row_has_selection {
+        return terminal_row_fast_element(row, metrics);
+    }
+
     let mut cell_index = 0usize;
     let mut cells = Vec::new();
 
@@ -9832,12 +10674,7 @@ fn terminal_row_element(
                     .h(px(metrics.line_height))
                     .overflow_hidden()
                     .font_family(TERMINAL_FONT_FAMILY)
-                    .font_weight(if style.bold {
-                        FontWeight::MEDIUM
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .when(style.italic, |cell| cell.italic())
+                    .font_weight(FontWeight::NORMAL)
                     .text_size(px(metrics.font_size))
                     .line_height(px(metrics.line_height))
                     .text_color(color)
@@ -9866,6 +10703,62 @@ fn terminal_row_element(
         .whitespace_nowrap()
         .children(cells)
         .into_any_element()
+}
+
+fn terminal_row_fast_element(row: &TerminalRow, metrics: TerminalTextMetrics) -> gpui::AnyElement {
+    let runs = row
+        .runs
+        .iter()
+        .filter(|run| !run.text.is_empty())
+        .map(|run| terminal_run_element(run, metrics))
+        .collect::<Vec<_>>();
+
+    div()
+        .h(px(metrics.line_height))
+        .flex()
+        .items_start()
+        .whitespace_nowrap()
+        .children(runs)
+        .into_any_element()
+}
+
+fn terminal_run_element(run: &TerminalRun, metrics: TerminalTextMetrics) -> gpui::AnyElement {
+    let underline_color = run.style.underline_color.map(terminal_color_hsla);
+    let background = run.style.background.map(terminal_color_hsla);
+    let color = terminal_text_color_from_style(run.style);
+    let cell_count = terminal_run_cell_count(&run.text).max(1);
+
+    div()
+        .w(px(metrics.cell_width * cell_count as f32))
+        .h(px(metrics.line_height))
+        .overflow_hidden()
+        .font_family(TERMINAL_FONT_FAMILY)
+        .font_weight(FontWeight::NORMAL)
+        .text_size(px(metrics.font_size))
+        .line_height(px(metrics.line_height))
+        .text_color(color)
+        .when_some(background, |cell, background| cell.bg(background))
+        .when(run.style.underline, |cell| {
+            let cell = cell.underline().text_decoration_solid();
+            if let Some(color) = underline_color {
+                cell.text_decoration_color(color)
+            } else {
+                cell
+            }
+        })
+        .when(run.style.strikethrough, |cell| cell.line_through())
+        .child(terminal_run_display_text(&run.text))
+        .into_any_element()
+}
+
+fn terminal_run_cell_count(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn terminal_run_display_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch == ' ' { '\u{00A0}' } else { ch })
+        .collect()
 }
 
 fn terminal_row_text(row: &TerminalRow) -> String {
@@ -9901,9 +10794,10 @@ fn terminal_frame_metrics(
     screen_y: f32,
     header_height: f32,
     pane_padding: f32,
+    stack_rail_width: f32,
     snapshot: &TerminalSnapshot,
 ) -> TerminalFrameMetrics {
-    let body_origin_x = screen_x + pane_padding + TERMINAL_BODY_INSET;
+    let body_origin_x = screen_x + stack_rail_width + pane_padding + TERMINAL_BODY_INSET;
     let body_origin_y = screen_y + header_height + pane_padding + TERMINAL_BODY_INSET;
 
     TerminalFrameMetrics {
@@ -10225,6 +11119,56 @@ mod tests {
     }
 
     #[test]
+    fn stacking_surface_on_existing_pane_preserves_stack_identity_and_persistence() {
+        let mut workdesks = vec![WorkdeskState::new(
+            "Desk",
+            "Summary",
+            vec![PaneRecord::new(
+                PaneId::new(1),
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(980.0, 640.0),
+                SurfaceRecord::browser(SurfaceId::new(11), "Research", "https://example.com"),
+                None,
+            )],
+        )];
+        let mut active_workdesk = 0;
+
+        let (pane_id, surface_id) = CanvasShell::spawn_surface_on_workdesk_state(
+            &mut workdesks,
+            &mut active_workdesk,
+            0,
+            Some(PaneId::new(1)),
+            PaneKind::Browser,
+            Some("Preview".to_string()),
+            Some("https://example.com/preview".to_string()),
+            None,
+            true,
+        )
+        .expect("stacking into the active pane should succeed");
+
+        assert_eq!(pane_id, PaneId::new(1));
+        assert_eq!(active_workdesk, 0);
+
+        let pane = workdesks[0]
+            .pane(pane_id)
+            .expect("pane should remain present");
+        assert_eq!(pane.surfaces.len(), 2);
+        assert_eq!(pane.active_surface_id, surface_id);
+        assert_eq!(pane.stack_title.as_deref(), Some("Research"));
+        assert_eq!(pane.stack_display_title(), "Research");
+        assert_eq!(pane.title, "Preview");
+
+        let restored = PersistedWorkdesk::from_state(&workdesks[0]).into_state();
+        let restored_pane = restored
+            .pane(pane_id)
+            .expect("restored pane should remain present");
+        assert_eq!(restored_pane.surfaces.len(), 2);
+        assert_eq!(restored_pane.active_surface_id, surface_id);
+        assert_eq!(restored_pane.stack_title.as_deref(), Some("Research"));
+        assert_eq!(restored_pane.stack_display_title(), "Research");
+    }
+
+    #[test]
     fn shortcut_reassignment_clears_previous_owner() {
         let mut shortcuts = ShortcutMap::default();
         let binding = ShortcutBinding::parse("cmd-shift-n").unwrap();
@@ -10323,6 +11267,86 @@ mod tests {
             next_attention_target_for_workdesks(&[left, right]),
             Some((0, PaneId::new(1)))
         );
+    }
+
+    #[test]
+    fn next_attention_target_for_single_workdesk_picks_oldest_unread_attention() {
+        let mut desk = WorkdeskState::new(
+            "Desk",
+            "Summary",
+            vec![
+                single_surface_pane(
+                    1,
+                    "Build Shell",
+                    PaneKind::Shell,
+                    WorkdeskPoint::new(0.0, 0.0),
+                    WorkdeskSize::new(920.0, 560.0),
+                ),
+                single_surface_pane(
+                    2,
+                    "Review Agent",
+                    PaneKind::Agent,
+                    WorkdeskPoint::new(960.0, 0.0),
+                    WorkdeskSize::new(720.0, 420.0),
+                ),
+            ],
+        );
+        desk.pane_attention.insert(
+            PaneId::new(1),
+            PaneAttention {
+                state: AttentionState::Error,
+                unread: true,
+                last_attention_sequence: 9,
+                last_activity_sequence: 4,
+            },
+        );
+        desk.pane_attention.insert(
+            PaneId::new(2),
+            PaneAttention {
+                state: AttentionState::Waiting,
+                unread: true,
+                last_attention_sequence: 6,
+                last_activity_sequence: 5,
+            },
+        );
+
+        assert_eq!(
+            next_attention_target_for_workdesk(&desk),
+            Some(PaneId::new(2))
+        );
+    }
+
+    #[test]
+    fn workdesk_navigation_target_falls_back_to_active_pane_when_attention_is_clear() {
+        let mut desk = WorkdeskState::new(
+            "Desk",
+            "Summary",
+            vec![single_surface_pane(
+                3,
+                "Build Shell",
+                PaneKind::Shell,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(920.0, 560.0),
+            )],
+        );
+        desk.active_pane = Some(PaneId::new(3));
+        desk.pane_attention.insert(
+            PaneId::new(3),
+            PaneAttention {
+                state: AttentionState::Idle,
+                unread: false,
+                last_attention_sequence: 0,
+                last_activity_sequence: 2,
+            },
+        );
+
+        let target = workdesk_navigation_target(&desk).expect("active pane should be resumable");
+
+        assert_eq!(target.pane_id, PaneId::new(3));
+        assert_eq!(target.mode, WorkdeskNavigationMode::Resume);
+        assert_eq!(target.label, "Build Shell");
+        assert!(target.detail.contains("shell"));
+        assert!(target.detail.contains("1 surface"));
     }
 
     #[test]

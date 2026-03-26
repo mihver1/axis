@@ -200,6 +200,9 @@ impl PaneRecord {
     }
 
     pub fn push_surface(&mut self, surface: SurfaceRecord, make_active: bool) {
+        if self.surfaces.len() == 1 && self.stack_title.is_none() {
+            self.stack_title = Some(self.title.clone());
+        }
         let surface_id = surface.id;
         self.surfaces.push(surface);
         if make_active {
@@ -222,6 +225,9 @@ impl PaneRecord {
             self.active_surface_id = self.surfaces[fallback_index].id;
         }
         self.sync_from_active_surface();
+        if self.surfaces.len() == 1 {
+            self.stack_title = None;
+        }
         Some(removed)
     }
 
@@ -244,6 +250,14 @@ impl PaneRecord {
             (current_index + 1) % self.surfaces.len()
         };
         Some(self.surfaces[next_index].id)
+    }
+
+    pub fn stack_display_title(&self) -> &str {
+        self.stack_title.as_deref().unwrap_or_else(|| {
+            self.active_surface()
+                .map(|surface| surface.title.as_str())
+                .unwrap_or(self.title.as_str())
+        })
     }
 
     pub fn sync_from_active_surface(&mut self) {
@@ -294,5 +308,56 @@ impl Workdesk {
 
     pub fn panes(&self) -> &[PaneRecord] {
         &self.panes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_stack_title_snapshots_when_second_surface_is_added() {
+        let mut pane = PaneRecord::new(
+            PaneId::new(1),
+            Point::new(0.0, 0.0),
+            Size::new(640.0, 480.0),
+            SurfaceRecord::new(SurfaceId::new(1), "Build Shell", SurfaceKind::Shell),
+            None,
+        );
+
+        pane.push_surface(
+            SurfaceRecord::new(SurfaceId::new(2), "Implement Agent", SurfaceKind::Agent),
+            true,
+        );
+
+        assert_eq!(pane.stack_title.as_deref(), Some("Build Shell"));
+        assert_eq!(pane.stack_display_title(), "Build Shell");
+        assert_eq!(pane.title, "Implement Agent");
+        assert_eq!(pane.active_surface_id, SurfaceId::new(2));
+        assert_eq!(pane.surfaces.len(), 2);
+    }
+
+    #[test]
+    fn pane_stack_title_clears_when_stack_returns_to_single_surface() {
+        let mut pane = PaneRecord::new(
+            PaneId::new(1),
+            Point::new(0.0, 0.0),
+            Size::new(640.0, 480.0),
+            SurfaceRecord::new(SurfaceId::new(1), "Build Shell", SurfaceKind::Shell),
+            None,
+        );
+        pane.push_surface(
+            SurfaceRecord::new(SurfaceId::new(2), "Implement Agent", SurfaceKind::Agent),
+            true,
+        );
+
+        let removed = pane.remove_surface(SurfaceId::new(2));
+
+        assert!(removed.is_some());
+        assert_eq!(pane.surfaces.len(), 1);
+        assert_eq!(pane.stack_title, None);
+        assert_eq!(pane.stack_display_title(), "Build Shell");
+        assert_eq!(pane.title, "Build Shell");
+        assert_eq!(pane.active_surface_id, SurfaceId::new(1));
     }
 }
