@@ -7,7 +7,11 @@ pub mod provider;
 pub mod session;
 pub mod worktree;
 
-pub use bin_resolver::provider_base_argv_from_env_or_default;
+pub use bin_resolver::{
+    provider_base_argv_from_env_or_default, resolve_provider_command_from_env_or_default,
+    resolve_provider_command_from_env_or_default_for_cwd,
+    ProviderCommandResolution,
+};
 pub use events::RuntimeEvent;
 pub use provider::{
     AgentProvider, ProviderProfileMetadata, ProviderRegistry, StartAgentRequest, StartedSession,

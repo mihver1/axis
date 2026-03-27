@@ -20,6 +20,7 @@ use review::{
     review_changed_file_preview, review_status_label, DeskReviewSummaryView,
 };
 
+mod agent_provider_popup;
 mod agent_sessions;
 mod attention;
 mod automation;
@@ -190,6 +191,9 @@ struct AxisShell {
     last_agent_runtime_revision: u64,
     workdesk_menu: Option<WorkdeskContextMenu>,
     stack_surface_menu: Option<StackSurfaceMenu>,
+    // Popup UI and shortcuts land in follow-up tasks; state is wired here for Task 2.
+    #[allow(dead_code)]
+    agent_provider_popup: Option<agent_provider_popup::AgentProviderPopupState>,
     workdesk_editor: Option<WorkdeskEditorState>,
     automation_rx: Receiver<AutomationEnvelope>,
     focus_handle: FocusHandle,
@@ -2468,6 +2472,30 @@ impl AxisShell {
         ghostty_vendor_dir: SharedString,
         ghostty_status: SharedString,
     ) -> Self {
+        Self::new_with_agent_runtime(
+            workdesks,
+            active_workdesk,
+            shortcuts,
+            boot_notice,
+            automation_server,
+            focus_handle,
+            ghostty_vendor_dir,
+            ghostty_status,
+            agent_sessions::AgentRuntimeBridge::new(),
+        )
+    }
+
+    fn new_with_agent_runtime(
+        workdesks: Vec<WorkdeskState>,
+        active_workdesk: usize,
+        shortcuts: ShortcutMap,
+        boot_notice: Option<SharedString>,
+        automation_server: AutomationServer,
+        focus_handle: FocusHandle,
+        ghostty_vendor_dir: SharedString,
+        ghostty_status: SharedString,
+        agent_runtime: agent_sessions::AgentRuntimeBridge,
+    ) -> Self {
         let AutomationServer {
             receiver,
             socket_path,
@@ -2478,10 +2506,11 @@ impl AxisShell {
             active_workdesk: clamped_active_workdesk,
             next_workdesk_id: 1,
             next_workdesk_runtime_id: 1,
-            agent_runtime: agent_sessions::AgentRuntimeBridge::new(),
+            agent_runtime,
             last_agent_runtime_revision: 0,
             workdesk_menu: None,
             stack_surface_menu: None,
+            agent_provider_popup: None,
             workdesk_editor: None,
             automation_rx: receiver,
             focus_handle,
@@ -2541,6 +2570,15 @@ impl AxisShell {
 
     fn active_workdesk_mut(&mut self) -> &mut WorkdeskState {
         &mut self.workdesks[self.active_workdesk]
+    }
+
+    fn workdesk_agent_cwd(workdesk: &WorkdeskState) -> String {
+        workdesk
+            .worktree_binding
+            .as_ref()
+            .map(|binding| binding.root_path.clone())
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or_else(|| workdesk.metadata.cwd.clone())
     }
 
     fn assign_workdesk_ids_to_workdesks(&mut self) {
@@ -2652,12 +2690,7 @@ impl AxisShell {
 
     fn sync_agent_desk_paths(&self) {
         for desk in &self.workdesks {
-            let cwd = desk
-                .worktree_binding
-                .as_ref()
-                .map(|b| b.root_path.clone())
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| desk.metadata.cwd.clone());
+            let cwd = Self::workdesk_agent_cwd(desk);
             self.agent_runtime.set_desk_cwd(desk.runtime_id, cwd);
         }
     }
@@ -2871,6 +2904,7 @@ impl AxisShell {
         surface: &SurfaceRecord,
         editor: Option<EditorBuffer>,
         agent_bridge: &agent_sessions::AgentRuntimeBridge,
+        agent_profile_id: Option<&str>,
     ) {
         match surface.kind {
             PaneKind::Shell | PaneKind::Agent => {
@@ -2887,13 +2921,26 @@ impl AxisShell {
                         .map(|b| b.root_path.as_str())
                         .unwrap_or_else(|| desk.metadata.cwd.as_str());
                     if let Some(terminal) = desk.terminals.get(&surface.id) {
-                        if let Err(error) = agent_bridge.start_agent_for_surface(
-                            desk.runtime_id,
-                            &desk.workdesk_id,
-                            surface.id,
-                            cwd,
-                            terminal,
-                        ) {
+                        let result = if let Some(profile_id) = agent_profile_id {
+                            agent_bridge.start_agent_for_surface_with_profile(
+                                desk.runtime_id,
+                                &desk.workdesk_id,
+                                surface.id,
+                                cwd,
+                                terminal,
+                                profile_id,
+                                vec![],
+                            )
+                        } else {
+                            agent_bridge.start_agent_for_surface(
+                                desk.runtime_id,
+                                &desk.workdesk_id,
+                                surface.id,
+                                cwd,
+                                terminal,
+                            )
+                        };
+                        if let Err(error) = result {
                             let msg = format!("Agent runtime did not start: {error}");
                             desk.runtime_notice = Some(SharedString::from(msg));
                         }
@@ -2919,6 +2966,34 @@ impl AxisShell {
         url: Option<String>,
         file_path: Option<String>,
         focus: bool,
+        agent_bridge: &agent_sessions::AgentRuntimeBridge,
+    ) -> Result<(PaneId, SurfaceId), String> {
+        Self::spawn_surface_on_workdesk_state_with_agent_profile(
+            workdesks,
+            active_workdesk,
+            desk_index,
+            target_pane_id,
+            kind,
+            title,
+            url,
+            file_path,
+            focus,
+            None,
+            agent_bridge,
+        )
+    }
+
+    fn spawn_surface_on_workdesk_state_with_agent_profile(
+        workdesks: &mut [WorkdeskState],
+        active_workdesk: &mut usize,
+        desk_index: usize,
+        target_pane_id: Option<PaneId>,
+        kind: PaneKind,
+        title: Option<String>,
+        url: Option<String>,
+        file_path: Option<String>,
+        focus: bool,
+        agent_profile_id: Option<&str>,
         agent_bridge: &agent_sessions::AgentRuntimeBridge,
     ) -> Result<(PaneId, SurfaceId), String> {
         let editor_lookup_path = if kind == PaneKind::Editor {
@@ -2963,6 +3038,7 @@ impl AxisShell {
                 &surface,
                 editor,
                 agent_bridge,
+                agent_profile_id,
             );
             desk.resize_terminals_for_pane(pane_id);
             if focus {
@@ -2997,12 +3073,66 @@ impl AxisShell {
             .unwrap_or_else(|| WorkdeskPoint::new(80.0 + cascade, 96.0 + cascade));
         let pane = PaneRecord::new(pane_id, position, size, surface.clone(), None);
         desk.panes.push(pane);
-        Self::initialize_surface_runtime(desk, size, 1, &surface, editor, agent_bridge);
+        Self::initialize_surface_runtime(
+            desk,
+            size,
+            1,
+            &surface,
+            editor,
+            agent_bridge,
+            agent_profile_id,
+        );
         if focus {
             desk.focus_surface(pane_id, surface_id);
             *active_workdesk = desk_index;
         }
         desk.drag_state = DragState::Idle;
+        Ok((pane_id, surface_id))
+    }
+
+    fn spawn_agent_surface_on_workdesk_state_with_profile(
+        workdesks: &mut [WorkdeskState],
+        active_workdesk: &mut usize,
+        desk_index: usize,
+        target_pane_id: Option<PaneId>,
+        profile_id: &str,
+        world_center: WorkdeskPoint,
+        focus: bool,
+        agent_bridge: &agent_sessions::AgentRuntimeBridge,
+    ) -> Result<(PaneId, SurfaceId), String> {
+        let previous_count = workdesks
+            .get(desk_index)
+            .ok_or_else(|| format!("workdesk {desk_index} was not found"))?
+            .panes
+            .len();
+        let (pane_id, surface_id) = Self::spawn_surface_on_workdesk_state_with_agent_profile(
+            workdesks,
+            active_workdesk,
+            desk_index,
+            target_pane_id,
+            PaneKind::Agent,
+            None,
+            None,
+            None,
+            focus,
+            Some(profile_id),
+            agent_bridge,
+        )?;
+
+        if target_pane_id.is_none() {
+            if let Some(pane) = workdesks[desk_index]
+                .panes
+                .iter_mut()
+                .find(|pane| pane.id == pane_id)
+            {
+                let cascade = 36.0 * (previous_count % 6) as f32;
+                pane.position = WorkdeskPoint::new(
+                    world_center.x - pane.size.width * 0.5 + cascade,
+                    world_center.y - pane.size.height * 0.5 + cascade,
+                );
+            }
+        }
+
         Ok((pane_id, surface_id))
     }
 
@@ -4250,7 +4380,7 @@ impl AxisShell {
                 true
             }
             ShortcutAction::SpawnAgentPane => {
-                self.spawn_pane(PaneKind::Agent, window, cx);
+                self.open_agent_provider_popup_for_new_pane(window, cx);
                 true
             }
             ShortcutAction::SpawnBrowserPane => {
@@ -4704,6 +4834,107 @@ impl AxisShell {
         cx.notify();
     }
 
+    fn open_agent_provider_popup(
+        &mut self,
+        target: agent_provider_popup::AgentLaunchTarget,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_workdesk_menu();
+        self.dismiss_stack_surface_menu();
+        self.dismiss_notifications();
+        let desk_index = self.active_workdesk;
+        let cwd = Self::workdesk_agent_cwd(&self.workdesks[desk_index]);
+        let options = self.agent_runtime.provider_options_for_cwd(&cwd);
+        self.agent_provider_popup = Some(agent_provider_popup::AgentProviderPopupState::new(
+            desk_index,
+            target,
+            options,
+        ));
+        cx.notify();
+    }
+
+    fn open_agent_provider_popup_for_new_pane(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let world_center = self.screen_to_world(self.viewport_center(window));
+        self.open_agent_provider_popup(
+            agent_provider_popup::AgentLaunchTarget::NewPane { world_center },
+            cx,
+        );
+    }
+
+    fn open_agent_provider_popup_for_stack(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if self.active_workdesk().pane(pane_id).is_none() {
+            return;
+        }
+
+        self.active_workdesk_mut().focus_pane(pane_id);
+        self.active_workdesk_mut().note_pane_activity(pane_id);
+        let desk_index = self.active_workdesk;
+        self.ensure_agent_runtime_for_pane(desk_index, pane_id);
+        self.open_agent_provider_popup(
+            agent_provider_popup::AgentLaunchTarget::StackIntoPane(pane_id),
+            cx,
+        );
+    }
+
+    fn complete_agent_provider_popup_selection(
+        &mut self,
+        profile_id: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (desk_index, target) = {
+            let Some(popup) = self.agent_provider_popup.as_ref() else {
+                return false;
+            };
+            if !popup.allows_selection(profile_id) {
+                return false;
+            }
+            (popup.desk_index, popup.target)
+        };
+
+        self.agent_provider_popup = None;
+        let result = match target {
+            agent_provider_popup::AgentLaunchTarget::NewPane { world_center } => {
+                Self::spawn_agent_surface_on_workdesk_state_with_profile(
+                    &mut self.workdesks,
+                    &mut self.active_workdesk,
+                    desk_index,
+                    None,
+                    profile_id,
+                    world_center,
+                    true,
+                    &self.agent_runtime,
+                )
+                .map(|_| ())
+            }
+            agent_provider_popup::AgentLaunchTarget::StackIntoPane(pane_id) => {
+                Self::spawn_agent_surface_on_workdesk_state_with_profile(
+                    &mut self.workdesks,
+                    &mut self.active_workdesk,
+                    desk_index,
+                    Some(pane_id),
+                    profile_id,
+                    WorkdeskPoint::new(0.0, 0.0),
+                    true,
+                    &self.agent_runtime,
+                )
+                .map(|_| ())
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                self.request_persist(cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.set_runtime_notice(error);
+                cx.notify();
+                false
+            }
+        }
+    }
+
     fn stack_surface_in_pane(
         &mut self,
         pane_id: PaneId,
@@ -5155,6 +5386,16 @@ impl AxisShell {
         }
 
         if self.handle_workdesk_editor_key_down(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.agent_provider_popup.is_some() {
+            if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
+                if self.dismiss_agent_provider_popup() {
+                    cx.notify();
+                }
+            }
             cx.stop_propagation();
             return;
         }
@@ -5802,6 +6043,10 @@ impl AxisShell {
 
     fn dismiss_stack_surface_menu(&mut self) -> bool {
         self.stack_surface_menu.take().is_some()
+    }
+
+    fn dismiss_agent_provider_popup(&mut self) -> bool {
+        self.agent_provider_popup.take().is_some()
     }
 
     fn dismiss_notifications(&mut self) -> bool {
@@ -7618,8 +7863,7 @@ impl Render for AxisShell {
                         "Stack an agent beside this flow",
                         rgb(0x7cc7ff).into(),
                         cx.listener(move |this, _, _, cx| {
-                            this.dismiss_stack_surface_menu();
-                            this.stack_surface_in_pane(pane_id, PaneKind::Agent, cx);
+                            this.open_agent_provider_popup_for_stack(pane_id, cx);
                             cx.stop_propagation();
                         }),
                     ))
@@ -7644,6 +7888,153 @@ impl Render for AxisShell {
                         }),
                     )),
             )
+        });
+        let agent_provider_popup_overlay = self.agent_provider_popup.as_ref().map(|popup| {
+            let popup_width = 360.0_f32.min(
+                (viewport_width - sidebar_width - FLOATING_DOCK_MARGIN * 2.0).max(280.0),
+            );
+            let left = ((viewport_width - popup_width) * 0.5).max(sidebar_width + 16.0);
+            let top = (viewport_height * 0.16).max(44.0);
+            let option_rows = popup
+                .options
+                .iter()
+                .cloned()
+                .map(|option| {
+                    let available = option.available;
+                    let profile_id = option.profile_id.clone();
+
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .px_3()
+                        .py_2()
+                        .bg(if available { rgb(0x171f26) } else { rgb(0x13191f) })
+                        .border_1()
+                        .border_color(if available {
+                            rgb(0x2b3641)
+                        } else {
+                            rgb(0x22303a)
+                        })
+                        .rounded_md()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .when(available, |row| {
+                            row.cursor_pointer().on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.complete_agent_provider_popup_selection(&profile_id, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(if available {
+                                    rgb(0x7cc7ff)
+                                } else {
+                                    rgb(0x6f7b85)
+                                })
+                                .child(option.profile_id),
+                        )
+                        .when_some(option.capability_note, |row, note| {
+                            row.child(div().text_xs().text_color(rgb(0x90a0aa)).child(note))
+                        })
+                        .when_some(option.unavailable_reason, |row, reason| {
+                            row.child(div().text_xs().text_color(rgb(0xff9b88)).child(reason))
+                        })
+                })
+                .collect::<Vec<_>>();
+
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(viewport_width))
+                .h(px(viewport_height))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .w(px(viewport_width))
+                        .h(px(viewport_height))
+                        .debug_selector(|| "agent-provider-popup-backdrop".to_string())
+                        .bg(rgba(0x091016b8))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            if this.dismiss_agent_provider_popup() {
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                        }))
+                        .on_scroll_wheel(|_, _, cx| {
+                            cx.stop_propagation();
+                        }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(top))
+                        .left(px(left))
+                        .w(px(popup_width))
+                        .debug_selector(|| "agent-provider-popup-panel".to_string())
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .bg(rgb(0x0f151b))
+                        .border_1()
+                        .border_color(rgb(0x2c3944))
+                        .rounded_xl()
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            if this.dismiss_agent_provider_popup() {
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                        }))
+                        .on_scroll_wheel(|_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_xs().text_color(rgb(0x7cc7ff)).child("Start Agent"))
+                                .child(div().text_lg().child("Choose a provider"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x90a0aa))
+                                        .child("Pick an installed backend before opening a new agent pane."),
+                                ),
+                        )
+                        .child(div().flex().flex_col().gap_2().children(option_rows))
+                        .when_some(popup.empty_state_message(), |panel, message| {
+                            panel.child(div().text_xs().text_color(rgb(0xff9b88)).child(message))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .child(control_button(
+                                    "Cancel",
+                                    rgb(0x7f8a94).into(),
+                                    cx.listener(|this, _, _, cx| {
+                                        if this.dismiss_agent_provider_popup() {
+                                            cx.notify();
+                                        }
+                                        cx.stop_propagation();
+                                    }),
+                                )),
+                        ),
+                )
         });
         let workdesk_editor_overlay = self.workdesk_editor.as_ref().map(|editor| {
             let accent = match editor.mode {
@@ -8262,6 +8653,7 @@ impl Render for AxisShell {
             .when_some(workdesk_editor_overlay, |root, overlay| root.child(overlay))
             .when_some(notification_overlay, |root, overlay| root.child(overlay))
             .when_some(stack_surface_context_menu, |root, menu| root.child(menu))
+            .when_some(agent_provider_popup_overlay, |root, overlay| root.child(overlay))
             .when_some(workdesk.runtime_notice.clone(), |root, notice| {
                 root.child(
                     div()
@@ -11883,6 +12275,574 @@ mod tests {
         assert_eq!(workdesks[1].workdesk_id, "desk-2");
         assert_eq!(workdesks[2].workdesk_id, "desk-3");
         assert_eq!(next_workdesk_id, 4);
+    }
+
+    #[gpui::test]
+    async fn spawn_agent_shortcut_opens_popup_before_creating_pane(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+
+        let window = cx.add_empty_window();
+        let shell = window.update(|_, cx| {
+            let mut registry = ProviderRegistry::new();
+            registry.register("alpha", Arc::new(FakeProvider::with_standard_script()));
+            let bridge = agent_sessions::AgentRuntimeBridge::with_registry_and_options(
+                "alpha",
+                registry,
+                vec![agent_sessions::ProviderProfileOption {
+                    profile_id: "alpha".to_string(),
+                    capability_note: None,
+                    available: true,
+                    unavailable_reason: None,
+                }],
+            );
+
+            cx.new(|view_cx| {
+                AxisShell::new_with_agent_runtime(
+                    vec![blank_workdesk("Desk", "Summary")],
+                    0,
+                    ShortcutMap::default(),
+                    None,
+                    automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                        "axis-popup-test-{}-{}.sock",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .expect("clock should be available")
+                            .as_nanos()
+                    )))
+                    .expect("automation server should start"),
+                    view_cx.focus_handle(),
+                    SharedString::from(""),
+                    SharedString::from(""),
+                    bridge,
+                )
+            })
+        });
+
+        window.update(|window, cx| {
+            shell.update(cx, |shell, view_cx| {
+                let before = shell.active_workdesk().panes.len();
+                assert!(shell.execute_shortcut_action(
+                    ShortcutAction::SpawnAgentPane,
+                    window,
+                    view_cx
+                ));
+                assert_eq!(shell.active_workdesk().panes.len(), before);
+                assert!(shell.agent_provider_popup.is_some());
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn popup_selection_starts_requested_provider_for_stack_target(
+        cx: &mut TestAppContext,
+    ) {
+        use std::sync::Arc;
+
+        let window = cx.add_empty_window();
+        let shell = window.update(|_, cx| {
+            let mut registry = ProviderRegistry::new();
+            registry.register("alpha", Arc::new(FakeProvider::with_standard_script()));
+            registry.register("beta", Arc::new(FakeProvider::with_standard_script()));
+            let bridge = agent_sessions::AgentRuntimeBridge::with_registry_and_options(
+                "alpha",
+                registry,
+                vec![
+                    agent_sessions::ProviderProfileOption {
+                        profile_id: "alpha".to_string(),
+                        capability_note: None,
+                        available: true,
+                        unavailable_reason: None,
+                    },
+                    agent_sessions::ProviderProfileOption {
+                        profile_id: "beta".to_string(),
+                        capability_note: Some("basic lifecycle only".to_string()),
+                        available: true,
+                        unavailable_reason: None,
+                    },
+                ],
+            );
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = std::env::current_dir()
+                .expect("cwd should resolve")
+                .display()
+                .to_string();
+
+            cx.new(|view_cx| {
+                AxisShell::new_with_agent_runtime(
+                    vec![desk],
+                    0,
+                    ShortcutMap::default(),
+                    None,
+                    automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                        "axis-popup-stack-test-{}-{}.sock",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .expect("clock should be available")
+                            .as_nanos()
+                    )))
+                    .expect("automation server should start"),
+                    view_cx.focus_handle(),
+                    SharedString::from(""),
+                    SharedString::from(""),
+                    bridge,
+                )
+            })
+        });
+
+        window.update(|window, cx| {
+            shell.update(cx, |shell, view_cx| {
+                shell.spawn_pane(PaneKind::Shell, window, view_cx);
+                let before = shell.active_workdesk().panes.len();
+                let runtime_id = shell.active_workdesk().runtime_id;
+                let pane_id = shell
+                    .active_workdesk()
+                    .panes
+                    .first()
+                    .map(|pane| pane.id)
+                    .expect("existing pane should exist");
+
+                shell.open_agent_provider_popup_for_stack(pane_id, view_cx);
+                assert!(shell.complete_agent_provider_popup_selection("beta", view_cx));
+                assert_eq!(shell.active_workdesk().panes.len(), before);
+                assert!(shell.agent_provider_popup.is_none());
+
+                let pane = shell
+                    .active_workdesk()
+                    .pane(pane_id)
+                    .expect("stack target pane should remain");
+                let record = shell
+                    .agent_runtime
+                    .session_for_surface(runtime_id, pane.active_surface_id)
+                    .expect("runtime session should exist");
+                assert_eq!(record.provider_profile_id, "beta");
+                assert_eq!(pane.id, pane_id);
+
+                shutdown_workdesk_terminals(shell.active_workdesk_mut());
+            });
+        });
+    }
+
+    #[test]
+    fn popup_selection_starts_requested_provider_for_new_pane() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            "alpha",
+            std::sync::Arc::new(FakeProvider::with_standard_script()),
+        );
+        registry.register(
+            "beta",
+            std::sync::Arc::new(FakeProvider::with_standard_script()),
+        );
+
+        let bridge = agent_sessions::AgentRuntimeBridge::with_registry_and_options(
+            "alpha",
+            registry,
+            vec![
+                agent_sessions::ProviderProfileOption {
+                    profile_id: "alpha".to_string(),
+                    capability_note: None,
+                    available: true,
+                    unavailable_reason: None,
+                },
+                agent_sessions::ProviderProfileOption {
+                    profile_id: "beta".to_string(),
+                    capability_note: Some("basic lifecycle only".to_string()),
+                    available: true,
+                    unavailable_reason: None,
+                },
+            ],
+        );
+
+        let mut workdesks = vec![blank_workdesk("Desk", "Summary")];
+        workdesks[0].runtime_id = 88;
+        workdesks[0].metadata.cwd = std::env::current_dir()
+            .expect("cwd should resolve")
+            .display()
+            .to_string();
+        let mut active_workdesk = 0;
+
+        let (_pane_id, surface_id) = AxisShell::spawn_agent_surface_on_workdesk_state_with_profile(
+            &mut workdesks,
+            &mut active_workdesk,
+            0,
+            None,
+            "beta",
+            WorkdeskPoint::new(640.0, 360.0),
+            true,
+            &bridge,
+        )
+        .expect("selected provider should launch a new agent pane");
+
+        let record = bridge
+            .session_for_surface(workdesks[0].runtime_id, surface_id)
+            .expect("runtime session should exist");
+        assert_eq!(record.provider_profile_id, "beta");
+
+        shutdown_workdesk_terminals(&mut workdesks[0]);
+    }
+
+    #[gpui::test]
+    async fn popup_selection_from_shortcut_creates_new_agent_pane(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+
+        let window = cx.add_empty_window();
+        let shell = window.update(|_, cx| {
+            let mut registry = ProviderRegistry::new();
+            registry.register("alpha", Arc::new(FakeProvider::with_standard_script()));
+            registry.register("beta", Arc::new(FakeProvider::with_standard_script()));
+            let bridge = agent_sessions::AgentRuntimeBridge::with_registry_and_options(
+                "alpha",
+                registry,
+                vec![
+                    agent_sessions::ProviderProfileOption {
+                        profile_id: "alpha".to_string(),
+                        capability_note: None,
+                        available: true,
+                        unavailable_reason: None,
+                    },
+                    agent_sessions::ProviderProfileOption {
+                        profile_id: "beta".to_string(),
+                        capability_note: Some("basic lifecycle only".to_string()),
+                        available: true,
+                        unavailable_reason: None,
+                    },
+                ],
+            );
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = std::env::current_dir()
+                .expect("cwd should resolve")
+                .display()
+                .to_string();
+
+            cx.new(|view_cx| {
+                AxisShell::new_with_agent_runtime(
+                    vec![desk],
+                    0,
+                    ShortcutMap::default(),
+                    None,
+                    automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                        "axp-{}-{}.sock",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .expect("clock should be available")
+                            .as_nanos()
+                    )))
+                    .expect("automation server should start"),
+                    view_cx.focus_handle(),
+                    SharedString::from(""),
+                    SharedString::from(""),
+                    bridge,
+                )
+            })
+        });
+
+        window.update(|window, cx| {
+            shell.update(cx, |shell, view_cx| {
+                let before = shell.active_workdesk().panes.len();
+                let runtime_id = shell.active_workdesk().runtime_id;
+                assert!(shell.execute_shortcut_action(
+                    ShortcutAction::SpawnAgentPane,
+                    window,
+                    view_cx
+                ));
+                assert!(shell.complete_agent_provider_popup_selection("beta", view_cx));
+                assert_eq!(shell.active_workdesk().panes.len(), before + 1);
+                assert!(shell.agent_provider_popup.is_none());
+
+                let surface_id = shell
+                    .active_workdesk()
+                    .panes
+                    .last()
+                    .and_then(|pane| pane.surfaces.last())
+                    .map(|surface| surface.id)
+                    .expect("new pane should contain an agent surface");
+                let record = shell
+                    .agent_runtime
+                    .session_for_surface(runtime_id, surface_id)
+                    .expect("runtime session should exist");
+                assert_eq!(record.provider_profile_id, "beta");
+
+                shutdown_workdesk_terminals(shell.active_workdesk_mut());
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn dismissing_popup_keeps_pane_count_unchanged(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+
+        let window = cx.add_empty_window();
+        let shell = window.update(|_, cx| {
+            let mut registry = ProviderRegistry::new();
+            registry.register("alpha", Arc::new(FakeProvider::with_standard_script()));
+            let bridge = agent_sessions::AgentRuntimeBridge::with_registry_and_options(
+                "alpha",
+                registry,
+                vec![agent_sessions::ProviderProfileOption {
+                    profile_id: "alpha".to_string(),
+                    capability_note: None,
+                    available: true,
+                    unavailable_reason: None,
+                }],
+            );
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = std::env::current_dir()
+                .expect("cwd should resolve")
+                .display()
+                .to_string();
+
+            cx.new(|view_cx| {
+                AxisShell::new_with_agent_runtime(
+                    vec![desk],
+                    0,
+                    ShortcutMap::default(),
+                    None,
+                    automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                        "axis-popup-dismiss-test-{}-{}.sock",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .expect("clock should be available")
+                            .as_nanos()
+                    )))
+                    .expect("automation server should start"),
+                    view_cx.focus_handle(),
+                    SharedString::from(""),
+                    SharedString::from(""),
+                    bridge,
+                )
+            })
+        });
+
+        window.update(|window, cx| {
+            shell.update(cx, |shell, view_cx| {
+                let before = shell.active_workdesk().panes.len();
+
+                shell.open_agent_provider_popup_for_new_pane(window, view_cx);
+                assert!(shell.agent_provider_popup.is_some());
+                assert!(shell.dismiss_agent_provider_popup());
+                assert_eq!(shell.active_workdesk().panes.len(), before);
+                assert!(shell.agent_provider_popup.is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn popup_dismisses_on_escape_without_side_effects(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut registry = ProviderRegistry::new();
+            registry.register("alpha", Arc::new(FakeProvider::with_standard_script()));
+            let bridge = agent_sessions::AgentRuntimeBridge::with_registry_and_options(
+                "alpha",
+                registry,
+                vec![agent_sessions::ProviderProfileOption {
+                    profile_id: "alpha".to_string(),
+                    capability_note: None,
+                    available: true,
+                    unavailable_reason: None,
+                }],
+            );
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = std::env::current_dir()
+                .expect("cwd should resolve")
+                .display()
+                .to_string();
+
+            AxisShell::new_with_agent_runtime(
+                vec![desk],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                    "apesc-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock should be available")
+                        .as_nanos()
+                )))
+                .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                bridge,
+            )
+        });
+
+        let before = window.update(|window, cx| {
+            window.activate_window();
+            shell.update(cx, |shell, view_cx| {
+                window.focus(&shell.focus_handle);
+                let before = shell.active_workdesk().panes.len();
+                assert!(shell.execute_shortcut_action(
+                    ShortcutAction::SpawnAgentPane,
+                    window,
+                    view_cx
+                ));
+                assert_eq!(shell.active_workdesk().panes.len(), before);
+                assert!(shell.agent_provider_popup.is_some());
+                assert!(shell.agent_runtime.sessions_snapshot().is_empty());
+                before
+            })
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("agent-provider-popup-panel").is_some());
+
+        window.simulate_keystrokes("escape");
+
+        shell.read_with(window, |shell, _| {
+            assert!(shell.agent_provider_popup.is_none());
+            assert_eq!(shell.active_workdesk().panes.len(), before);
+            assert!(shell.agent_runtime.sessions_snapshot().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn popup_dismisses_on_outside_click_without_side_effects(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut registry = ProviderRegistry::new();
+            registry.register("alpha", Arc::new(FakeProvider::with_standard_script()));
+            let bridge = agent_sessions::AgentRuntimeBridge::with_registry_and_options(
+                "alpha",
+                registry,
+                vec![agent_sessions::ProviderProfileOption {
+                    profile_id: "alpha".to_string(),
+                    capability_note: None,
+                    available: true,
+                    unavailable_reason: None,
+                }],
+            );
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = std::env::current_dir()
+                .expect("cwd should resolve")
+                .display()
+                .to_string();
+
+            AxisShell::new_with_agent_runtime(
+                vec![desk],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                    "apout-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock should be available")
+                        .as_nanos()
+                )))
+                .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                bridge,
+            )
+        });
+
+        let before = window.update(|window, cx| {
+            window.activate_window();
+            shell.update(cx, |shell, view_cx| {
+                window.focus(&shell.focus_handle);
+                let before = shell.active_workdesk().panes.len();
+                assert!(shell.execute_shortcut_action(
+                    ShortcutAction::SpawnAgentPane,
+                    window,
+                    view_cx
+                ));
+                assert_eq!(shell.active_workdesk().panes.len(), before);
+                assert!(shell.agent_provider_popup.is_some());
+                assert!(shell.agent_runtime.sessions_snapshot().is_empty());
+                before
+            })
+        });
+        window.run_until_parked();
+        let backdrop_bounds = window
+            .debug_bounds("agent-provider-popup-backdrop")
+            .expect("popup backdrop should render");
+        let panel_bounds = window
+            .debug_bounds("agent-provider-popup-panel")
+            .expect("popup panel should render");
+        let click_position = GpuiPoint::new(
+            backdrop_bounds.origin.x + px(4.0),
+            backdrop_bounds.origin.y + px(4.0),
+        );
+        assert!(!panel_bounds.contains(&click_position));
+
+        window.simulate_click(click_position, gpui::Modifiers::none());
+
+        shell.read_with(window, |shell, _| {
+            assert!(shell.agent_provider_popup.is_none());
+            assert_eq!(shell.active_workdesk().panes.len(), before);
+            assert!(shell.agent_runtime.sessions_snapshot().is_empty());
+        });
+    }
+
+    #[test]
+    fn agent_pane_without_explicit_profile_uses_default_provider() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            "alpha",
+            std::sync::Arc::new(FakeProvider::with_standard_script()),
+        );
+        registry.register(
+            "beta",
+            std::sync::Arc::new(FakeProvider::with_standard_script()),
+        );
+
+        let bridge = agent_sessions::AgentRuntimeBridge::with_registry_and_options(
+            "alpha",
+            registry,
+            vec![
+                agent_sessions::ProviderProfileOption {
+                    profile_id: "alpha".to_string(),
+                    capability_note: None,
+                    available: true,
+                    unavailable_reason: None,
+                },
+                agent_sessions::ProviderProfileOption {
+                    profile_id: "beta".to_string(),
+                    capability_note: Some("basic lifecycle only".to_string()),
+                    available: true,
+                    unavailable_reason: None,
+                },
+            ],
+        );
+
+        let mut workdesks = vec![blank_workdesk("Desk", "Summary")];
+        workdesks[0].runtime_id = 89;
+        workdesks[0].metadata.cwd = std::env::current_dir()
+            .expect("cwd should resolve")
+            .display()
+            .to_string();
+        let mut active_workdesk = 0;
+
+        let (_pane_id, surface_id) = AxisShell::spawn_surface_on_workdesk_state(
+            &mut workdesks,
+            &mut active_workdesk,
+            0,
+            None,
+            PaneKind::Agent,
+            None,
+            None,
+            None,
+            true,
+            &bridge,
+        )
+        .expect("default provider should launch a new agent pane");
+
+        let record = bridge
+            .session_for_surface(workdesks[0].runtime_id, surface_id)
+            .expect("runtime session should exist");
+        assert_eq!(record.provider_profile_id, "alpha");
+
+        shutdown_workdesk_terminals(&mut workdesks[0]);
     }
 
     #[test]
