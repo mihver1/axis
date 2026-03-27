@@ -8352,6 +8352,7 @@ fn main() {
     Application::new()
         .with_assets(AxisAppAssets::new())
         .run(move |cx: &mut App| {
+            install_quit_on_last_window_closed(cx);
             let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
             let workdesks = workdesks.clone();
             let active_workdesk = active_workdesk;
@@ -8411,6 +8412,22 @@ fn main() {
 
             cx.activate(true);
         });
+}
+
+fn install_quit_on_last_window_closed(cx: &mut App) {
+    install_quit_on_last_window_closed_with(cx, |cx| cx.quit());
+}
+
+fn install_quit_on_last_window_closed_with(
+    cx: &mut App,
+    mut quit: impl FnMut(&mut App) + 'static,
+) {
+    cx.on_window_closed(move |cx| {
+        if cx.windows().is_empty() {
+            quit(cx);
+        }
+    })
+    .detach();
 }
 
 fn load_boot_state() -> (Vec<WorkdeskState>, usize, ShortcutMap, Option<SharedString>) {
@@ -11631,6 +11648,9 @@ mod tests {
     use super::*;
     use axis_agent_runtime::adapters::fake::FakeProvider;
     use axis_agent_runtime::ProviderRegistry;
+    use gpui::TestAppContext;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     #[test]
     fn persisted_workdesk_round_trips_layout_state() {
@@ -12532,5 +12552,28 @@ mod tests {
             Some("right failure".to_string())
         );
         assert!(!dismiss_runtime_notice_for_workdesks(&mut workdesks, 0));
+    }
+
+    #[gpui::test]
+    async fn closing_last_window_quits_the_app(cx: &mut TestAppContext) {
+        let did_quit = Rc::new(Cell::new(false));
+        cx.update(|cx| {
+            install_quit_on_last_window_closed_with(cx, |cx| cx.shutdown());
+            let did_quit = did_quit.clone();
+            cx.on_app_quit(move |_| {
+                let did_quit = did_quit.clone();
+                async move {
+                    did_quit.set(true);
+                }
+            })
+            .detach();
+        });
+
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            window.remove_window();
+        });
+
+        assert!(did_quit.get(), "closing the last window should quit the app");
     }
 }
