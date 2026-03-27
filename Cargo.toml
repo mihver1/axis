@@ -2,6 +2,7 @@
 members = [
     "apps/axis-app",
     "apps/axis-cli",
+    "apps/axisd",
     "crates/axis-agent-runtime",
     "crates/axis-core",
     "crates/axis-editor",

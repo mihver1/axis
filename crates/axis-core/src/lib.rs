@@ -1,5 +1,8 @@
 pub mod agent;
 pub mod automation;
+pub mod paths;
+pub mod terminal;
+pub mod workdesk;
 pub mod worktree;
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -1,7 +1,10 @@
 //! Shared automation request/response schema for app and CLI over a local control channel.
 
 use crate::agent::AgentSessionId;
+use crate::terminal::{TerminalSessionId, TerminalSurfaceKind};
+use crate::workdesk::{WorkdeskId, WorkdeskRecord};
 use crate::worktree::WorktreeId;
+use crate::SurfaceId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -21,12 +24,56 @@ pub enum AutomationRequest {
     WorktreeStatus {
         worktree_id: WorktreeId,
     },
+    #[serde(rename = "workdesk.list")]
+    WorkdeskList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_root: Option<String>,
+    },
+    #[serde(rename = "workdesk.ensure")]
+    WorkdeskEnsure {
+        record: WorkdeskRecord,
+    },
     #[serde(rename = "agent.start")]
     AgentStart {
         worktree_id: WorktreeId,
         provider_profile_id: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         argv: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workdesk_id: Option<WorkdeskId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface_id: Option<SurfaceId>,
+    },
+    #[serde(rename = "terminal.ensure")]
+    TerminalEnsure {
+        workdesk_id: WorkdeskId,
+        surface_id: SurfaceId,
+        kind: TerminalSurfaceKind,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+    },
+    #[serde(rename = "terminal.read")]
+    TerminalRead {
+        terminal_session_id: TerminalSessionId,
+        offset: u64,
+    },
+    #[serde(rename = "terminal.write")]
+    TerminalWrite {
+        terminal_session_id: TerminalSessionId,
+        bytes: Vec<u8>,
+    },
+    #[serde(rename = "terminal.resize")]
+    TerminalResize {
+        terminal_session_id: TerminalSessionId,
+        cols: u16,
+        rows: u16,
+    },
+    #[serde(rename = "terminal.close")]
+    TerminalClose {
+        terminal_session_id: TerminalSessionId,
     },
     #[serde(rename = "agent.stop")]
     AgentStop {
@@ -51,6 +98,17 @@ pub enum AutomationRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workdesk_id: Option<String>,
     },
+    #[serde(rename = "gui.heartbeat")]
+    GuiHeartbeat {
+        workspace_root: String,
+        gui_pid: u32,
+    },
+    #[serde(rename = "gui.ensure_running")]
+    GuiEnsureRunning {
+        workspace_root: String,
+    },
+    #[serde(rename = "daemon.health")]
+    DaemonHealth,
 }
 
 /// Minimal success/failure reply; richer results can be added as optional fields later.

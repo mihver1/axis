@@ -1,6 +1,8 @@
 //! Local Unix-socket transport for shared automation requests.
+#![allow(dead_code)]
 
 use axis_core::automation::{AutomationRequest, AutomationResponse};
+use axis_core::paths::{axis_user_data_dir, daemon_socket_path_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
@@ -72,12 +74,7 @@ pub(crate) fn automation_socket_path() -> PathBuf {
 }
 
 fn automation_socket_path_for(explicit_override: Option<PathBuf>) -> PathBuf {
-    if let Some(path) = explicit_override {
-        return path;
-    }
-    crate::workspace_root_path()
-        .join(crate::APP_DATA_DIR)
-        .join(crate::AUTOMATION_SOCKET_FILE)
+    daemon_socket_path_for(explicit_override, axis_user_data_dir())
 }
 
 pub(crate) fn start_automation_server() -> Result<AutomationServer, String> {

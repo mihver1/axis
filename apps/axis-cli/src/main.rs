@@ -1,6 +1,7 @@
 use axis_core::{
     agent::AgentSessionId,
     automation::{AutomationRequest, AutomationResponse},
+    paths::{axis_user_data_dir, daemon_socket_path_for, AXIS_SOCKET_PATH_ENV},
     worktree::WorktreeId,
 };
 use serde::Serialize;
@@ -16,12 +17,7 @@ use std::{
 
 const PRODUCT_NAME: &str = "axis";
 const APP_BINARY: &str = "axis";
-const APP_PACKAGE: &str = "axis-app";
-const APP_DATA_DIR: &str = ".axis";
-const LEGACY_APP_DATA_DIR: &str = ".canvas";
-const SOCKET_FILE: &str = "axis.sock";
-const LEGACY_SOCKET_FILE: &str = "canvas.sock";
-const SOCKET_PATH_ENV: &str = "AXIS_SOCKET_PATH";
+const DAEMON_BINARY: &str = "axisd";
 
 #[derive(Debug)]
 struct CliOptions {
@@ -39,6 +35,7 @@ enum CommandAlias {
     ListAgents,
     Review,
     NextAttention,
+    EnsureGui,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,6 +143,7 @@ fn resolve_command_alias(command: &str) -> Option<CommandAlias> {
         "list-agents" => Some(CommandAlias::ListAgents),
         "review" => Some(CommandAlias::Review),
         "next-attention" => Some(CommandAlias::NextAttention),
+        "ensure-gui" => Some(CommandAlias::EnsureGui),
         _ => None,
     }
 }
@@ -184,6 +182,8 @@ fn request_from_alias(alias: CommandAlias, args: &[String]) -> Result<Automation
                 worktree_id,
                 provider_profile_id,
                 argv,
+                workdesk_id: None,
+                surface_id: None,
             }
         }
         CommandAlias::StopAgent => {
@@ -208,17 +208,34 @@ fn request_from_alias(alias: CommandAlias, args: &[String]) -> Result<Automation
             ensure_no_unknown_params(&params, "next-attention")?;
             AutomationRequest::AttentionNext { workdesk_id }
         }
+        CommandAlias::EnsureGui => {
+            ensure_no_unknown_params(&params, "ensure-gui")?;
+            AutomationRequest::GuiEnsureRunning {
+                workspace_root: workspace_root_path().display().to_string(),
+            }
+        }
     };
 
     Ok(request)
 }
 
 fn request_from_method_and_params(method: &str, params: Value) -> Result<AutomationRequest, String> {
-    serde_json::from_value(json!({
+    let request_with_params = json!({
         "method": method,
         "params": params,
-    }))
-    .map_err(|error| format!("parse automation request `{method}`: {error}"))
+    });
+    match serde_json::from_value(request_with_params) {
+        Ok(request) => Ok(request),
+        Err(error) if params.as_object().is_some_and(|params| params.is_empty()) => {
+            serde_json::from_value(json!({ "method": method }))
+                .map_err(|fallback| {
+                    format!(
+                        "parse automation request `{method}`: {error}; retry without params also failed: {fallback}"
+                    )
+                })
+        }
+        Err(error) => Err(format!("parse automation request `{method}`: {error}")),
+    }
 }
 
 fn parse_key_value_args(args: &[String]) -> Result<Map<String, Value>, String> {
@@ -344,7 +361,7 @@ fn send_request(
 ) -> Result<AutomationResponse, String> {
     let mut stream = UnixStream::connect(socket_path).map_err(|error| {
         format!(
-            "connect {}: {error}\nLaunch `{APP_PACKAGE}` first or pass `--socket <path>`.",
+            "connect {}: {error}\nStart `{DAEMON_BINARY}` first or pass `--socket <path>`.",
             socket_path.display()
         )
     })?;
@@ -373,26 +390,15 @@ fn send_request(
 }
 
 fn default_socket_path() -> PathBuf {
-    default_socket_path_for(env::var_os(SOCKET_PATH_ENV).filter(|value| !value.is_empty()).map(PathBuf::from))
+    default_socket_path_for(
+        env::var_os(AXIS_SOCKET_PATH_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+    )
 }
 
 fn default_socket_path_for(explicit_override: Option<PathBuf>) -> PathBuf {
-    if let Some(path) = explicit_override {
-        return path;
-    }
-    let preferred = workspace_root_path().join(APP_DATA_DIR).join(SOCKET_FILE);
-    if preferred.exists() {
-        return preferred;
-    }
-
-    let legacy = workspace_root_path()
-        .join(LEGACY_APP_DATA_DIR)
-        .join(LEGACY_SOCKET_FILE);
-    if legacy.exists() {
-        legacy
-    } else {
-        preferred
-    }
+    daemon_socket_path_for(explicit_override, axis_user_data_dir())
 }
 
 fn workspace_root_path() -> PathBuf {
@@ -416,6 +422,7 @@ Aliases:
   list-agents       -> agent.list
   review            -> review.summary
   next-attention    -> attention.next
+  ensure-gui        -> gui.ensure_running
 
 Examples:
   {APP_BINARY} state
@@ -427,6 +434,7 @@ Examples:
   {APP_BINARY} list-agents worktree_id=wt-demo
   {APP_BINARY} review worktree_id=wt-demo
   {APP_BINARY} next-attention workdesk_id=desk-7
+  {APP_BINARY} ensure-gui
   {APP_BINARY} raw state.current '{{\"workdesk_id\":\"desk-7\"}}'
 
 Default socket:
@@ -458,6 +466,7 @@ mod tests {
             resolve_command_alias("start-agent"),
             Some(CommandAlias::StartAgent)
         );
+        assert_eq!(resolve_command_alias("ensure-gui"), Some(CommandAlias::EnsureGui));
         assert_eq!(resolve_command_alias("unknown"), None);
     }
 
@@ -495,6 +504,18 @@ mod tests {
                 workdesk_id: Some("desk-3".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn parses_unit_variant_raw_request_with_empty_object_payload() {
+        let options = parse_cli(vec![
+            "raw".to_string(),
+            "daemon.health".to_string(),
+            "{}".to_string(),
+        ])
+        .expect("raw unit variant should parse");
+
+        assert_eq!(options.request, AutomationRequest::DaemonHealth);
     }
 
     #[test]
@@ -562,6 +583,8 @@ mod tests {
                 worktree_id: WorktreeId::new("wt-1"),
                 provider_profile_id: "codex".to_string(),
                 argv: vec!["--danger-full-access".to_string()],
+                workdesk_id: None,
+                surface_id: None,
             }
         );
     }
@@ -620,6 +643,15 @@ mod tests {
             attention.request,
             AutomationRequest::AttentionNext {
                 workdesk_id: Some("desk-7".to_string()),
+            }
+        );
+
+        let ensure_gui =
+            parse_cli(vec!["ensure-gui".to_string()]).expect("ensure gui alias should parse");
+        assert_eq!(
+            ensure_gui.request,
+            AutomationRequest::GuiEnsureRunning {
+                workspace_root: workspace_root_path().display().to_string(),
             }
         );
     }

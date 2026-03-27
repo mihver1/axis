@@ -4,6 +4,8 @@ use attention::{
 };
 use axis_agent_runtime::WorktreeService;
 use axis_core::agent::AgentSessionRecord;
+use axis_core::paths::daemon_socket_path;
+use axis_core::workdesk::{WorkdeskId, WorkdeskRecord};
 use axis_core::worktree::{ReviewSummary, WorktreeBinding, WorktreeId};
 use axis_core::{
     automation::{
@@ -21,13 +23,16 @@ use review::{
 mod agent_sessions;
 mod attention;
 mod automation;
+mod daemon_client;
+mod remote_terminals;
 mod review;
 mod worktrees;
 use automation::{AutomationEnvelope, AutomationServer};
+use daemon_client::DaemonClient;
 use axis_editor::{EditorBuffer, HighlightKind};
 use axis_terminal::{
-    ghostty_build_info, spawn_terminal_session_with_grid, TerminalColor, TerminalGridSize,
-    TerminalRow, TerminalRun, TerminalSession, TerminalSnapshot,
+    ghostty_build_info, TerminalColor, TerminalGridSize, TerminalRow, TerminalRun,
+    TerminalSnapshot,
 };
 use gpui::{
     div, font, img, prelude::*, px, relative, rgb, rgba, size, App, Application, AssetSource,
@@ -40,6 +45,7 @@ use gpui::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use remote_terminals::RemoteTerminalSession;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
@@ -101,7 +107,6 @@ const PRODUCT_NAME: &str = "axis";
 const APP_DATA_DIR: &str = ".axis";
 const LEGACY_APP_DATA_DIR: &str = ".canvas";
 const APP_DATA_DIR_ENV: &str = "AXIS_APP_DATA_DIR";
-const AUTOMATION_SOCKET_FILE: &str = "axis.sock";
 const BRAND_ICON_ASSET: &str = "assets/branding/axis-icon.svg";
 
 #[cfg(target_os = "macos")]
@@ -146,6 +151,7 @@ impl AssetSource for AxisAppAssets {
 
 #[derive(Clone)]
 struct WorkdeskState {
+    workdesk_id: String,
     name: String,
     summary: String,
     metadata: WorkdeskMetadata,
@@ -157,7 +163,7 @@ struct WorkdeskState {
     review_summary: Option<DeskReviewSummaryView>,
     panes: Vec<PaneRecord>,
     pane_attention: HashMap<PaneId, PaneAttention>,
-    terminals: HashMap<SurfaceId, TerminalSession>,
+    terminals: HashMap<SurfaceId, RemoteTerminalSession>,
     terminal_revisions: HashMap<SurfaceId, u64>,
     terminal_statuses: HashMap<SurfaceId, Option<String>>,
     terminal_views: HashMap<SurfaceId, TerminalViewState>,
@@ -179,6 +185,7 @@ struct WorkdeskState {
 struct AxisShell {
     workdesks: Vec<WorkdeskState>,
     active_workdesk: usize,
+    next_workdesk_id: u64,
     next_workdesk_runtime_id: u64,
     agent_runtime: agent_sessions::AgentRuntimeBridge,
     last_agent_runtime_revision: u64,
@@ -199,6 +206,7 @@ struct AxisShell {
     visible_terminal_surfaces: HashSet<SurfaceId>,
     cursor_blink_visible: bool,
     last_cursor_blink_at: Instant,
+    last_daemon_sync_at: Instant,
     persist_generation: u64,
     touchpad_pan_state: Option<TouchpadPanState>,
     last_touchpad_pan_end: Option<Instant>,
@@ -499,6 +507,8 @@ struct PersistedSession {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedWorkdesk {
+    #[serde(default)]
+    workdesk_id: String,
     name: String,
     summary: String,
     #[serde(default)]
@@ -1844,6 +1854,7 @@ impl WorkdeskState {
             .collect();
 
         Self {
+            workdesk_id: String::new(),
             name,
             summary: summary.clone(),
             metadata: default_workdesk_metadata(summary, None, None),
@@ -1907,7 +1918,7 @@ impl WorkdeskState {
             .map(|surface| surface.id)
     }
 
-    fn active_terminal_session_for_pane(&self, pane_id: PaneId) -> Option<&TerminalSession> {
+    fn active_terminal_session_for_pane(&self, pane_id: PaneId) -> Option<&RemoteTerminalSession> {
         let surface_id = self.active_terminal_surface_id_for_pane(pane_id)?;
         self.terminals.get(&surface_id)
     }
@@ -1933,6 +1944,7 @@ impl WorkdeskState {
         let mut changed = Vec::new();
 
         for (surface_id, terminal) in &self.terminals {
+            terminal.sync();
             let revision = terminal.revision();
             if self.terminal_revisions.get(surface_id).copied() != Some(revision) {
                 self.terminal_revisions.insert(*surface_id, revision);
@@ -2031,7 +2043,14 @@ impl WorkdeskState {
         title: &str,
         grid: TerminalGridSize,
     ) {
-        match spawn_terminal_session_with_grid(kind, title, grid) {
+        match RemoteTerminalSession::attach_or_create(
+            &self.workdesk_id,
+            surface_id,
+            kind,
+            title,
+            &self.metadata.cwd,
+            grid,
+        ) {
             Ok(session) => {
                 self.terminal_revisions
                     .insert(surface_id, session.revision());
@@ -2260,6 +2279,7 @@ impl PersistedSession {
 impl PersistedWorkdesk {
     fn from_state(state: &WorkdeskState) -> Self {
         Self {
+            workdesk_id: state.workdesk_id.clone(),
             name: state.name.clone(),
             summary: state.summary.clone(),
             metadata: state.metadata.clone(),
@@ -2304,6 +2324,7 @@ impl PersistedWorkdesk {
 
     fn into_state(self) -> WorkdeskState {
         let PersistedWorkdesk {
+            workdesk_id,
             name,
             summary,
             metadata,
@@ -2406,6 +2427,7 @@ impl PersistedWorkdesk {
             .collect::<Vec<_>>();
 
         let mut state = WorkdeskState::new(name, summary, panes);
+        state.workdesk_id = workdesk_id;
         state.metadata = metadata.hydrated();
         state.worktree_binding = worktrees::refreshed_binding_from_desk_paths(
             &state.metadata.cwd,
@@ -2455,6 +2477,7 @@ impl AxisShell {
         let mut shell = Self {
             workdesks,
             active_workdesk: clamped_active_workdesk,
+            next_workdesk_id: 1,
             next_workdesk_runtime_id: 1,
             agent_runtime: agent_sessions::AgentRuntimeBridge::new(),
             last_agent_runtime_revision: 0,
@@ -2475,10 +2498,12 @@ impl AxisShell {
             visible_terminal_surfaces: HashSet::new(),
             cursor_blink_visible: true,
             last_cursor_blink_at: Instant::now(),
+            last_daemon_sync_at: Instant::now(),
             persist_generation: 0,
             touchpad_pan_state: None,
             last_touchpad_pan_end: None,
         };
+        shell.assign_workdesk_ids_to_workdesks();
         shell.assign_runtime_ids_to_workdesks();
 
         if let Some(notice) = boot_notice {
@@ -2500,6 +2525,14 @@ impl AxisShell {
             }
         }
 
+        if let Err(error) = shell.sync_daemon_runtime_state() {
+            if let Some(workdesk) = shell.workdesks.get_mut(shell.active_workdesk) {
+                workdesk
+                    .runtime_notice
+                    .get_or_insert_with(|| SharedString::from(format!("axisd sync failed: {error}")));
+            }
+        }
+
         shell
     }
 
@@ -2509,6 +2542,20 @@ impl AxisShell {
 
     fn active_workdesk_mut(&mut self) -> &mut WorkdeskState {
         &mut self.workdesks[self.active_workdesk]
+    }
+
+    fn assign_workdesk_ids_to_workdesks(&mut self) {
+        assign_missing_workdesk_ids(&mut self.workdesks, &mut self.next_workdesk_id);
+    }
+
+    fn allocate_workdesk_id(&mut self) -> String {
+        loop {
+            let candidate = format!("desk-{}", self.next_workdesk_id);
+            self.next_workdesk_id = self.next_workdesk_id.saturating_add(1);
+            if !self.workdesks.iter().any(|desk| desk.workdesk_id == candidate) {
+                return candidate;
+            }
+        }
     }
 
     fn assign_runtime_ids_to_workdesks(&mut self) {
@@ -2610,6 +2657,24 @@ impl AxisShell {
                 .unwrap_or_else(|| desk.metadata.cwd.clone());
             self.agent_runtime.set_desk_cwd(desk.runtime_id, cwd);
         }
+    }
+
+    fn sync_daemon_runtime_state(&mut self) -> Result<(), String> {
+        let daemon = DaemonClient::default();
+        let workspace_root = workspace_root_path().display().to_string();
+        daemon.gui_heartbeat(workspace_root.clone(), std::process::id())?;
+        for desk in &self.workdesks {
+            daemon.ensure_workdesk(workdesk_record_from_state(desk, &workspace_root))?;
+        }
+        self.last_daemon_sync_at = Instant::now();
+        Ok(())
+    }
+
+    fn sync_daemon_runtime_state_if_due(&mut self) {
+        if self.last_daemon_sync_at.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        let _ = self.sync_daemon_runtime_state();
     }
 
     fn sync_agent_runtime_activity(&mut self, cx: &mut Context<Self>) -> bool {
@@ -2817,6 +2882,7 @@ impl AxisShell {
                     if let Some(terminal) = desk.terminals.get(&surface.id) {
                         if let Err(error) = agent_bridge.start_agent_for_surface(
                             desk.runtime_id,
+                            &desk.workdesk_id,
                             surface.id,
                             cwd,
                             terminal,
@@ -3075,6 +3141,7 @@ impl AxisShell {
                 let draft =
                     normalize_workdesk_draft(editor.draft, &name, editor.template.summary());
                 let mut desk = workdesk_from_template(editor.template, draft);
+                desk.workdesk_id = self.allocate_workdesk_id();
                 desk.runtime_id = self.allocate_workdesk_runtime_id();
                 boot_workdesk_terminals(&mut desk);
                 self.workdesks.push(desk);
@@ -3191,7 +3258,11 @@ impl AxisShell {
     fn resolve_workdesk_index_by_automation_id(&self, workdesk_id: &str) -> Result<usize, String> {
         self.workdesks
             .iter()
-            .position(|desk| desk.runtime_id.to_string() == workdesk_id || desk.name == workdesk_id)
+            .position(|desk| {
+                desk.workdesk_id == workdesk_id
+                    || desk.runtime_id.to_string() == workdesk_id
+                    || desk.name == workdesk_id
+            })
             .ok_or_else(|| format!("workdesk `{workdesk_id}` was not found"))
     }
 
@@ -3222,13 +3293,28 @@ impl AxisShell {
         &mut self,
         desk_index: usize,
     ) -> Result<WorktreeBinding, String> {
+        let daemon = DaemonClient::default();
         let binding = {
             let desk = &self.workdesks[desk_index];
-            if let Some(binding) = desk.worktree_binding.clone() {
-                WorktreeService::refresh(&binding).map_err(|error| error.to_string())?
+            let daemon_result = if let Some(binding) = desk.worktree_binding.clone() {
+                daemon
+                    .worktree_status(&WorktreeId::new(binding.root_path.clone()))
+                    .map(|result| result.binding)
             } else {
-                WorktreeService::attach(&desk.metadata.cwd, None)
-                    .map_err(|error| error.to_string())?
+                daemon
+                    .worktree_create_or_attach(desk.metadata.cwd.clone(), None, None)
+                    .map(|result| result.binding)
+            };
+            match daemon_result {
+                Ok(binding) => binding,
+                Err(_) => {
+                    if let Some(binding) = desk.worktree_binding.clone() {
+                        WorktreeService::refresh(&binding).map_err(|error| error.to_string())?
+                    } else {
+                        WorktreeService::attach(&desk.metadata.cwd, None)
+                            .map_err(|error| error.to_string())?
+                    }
+                }
             }
         };
 
@@ -3264,17 +3350,26 @@ impl AxisShell {
             return Ok(());
         };
 
-        let base_changed = binding
-            .base_branch
-            .as_deref()
-            .map(|base_branch| {
-                WorktreeService::changed_files_since_base(&binding.root_path, base_branch)
-                    .map_err(|error| error.to_string())
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let uncommitted = WorktreeService::uncommitted_changed_files(&binding.root_path)
-            .map_err(|error| error.to_string())?;
+        let daemon = DaemonClient::default();
+        let (base_changed, uncommitted) = match daemon.desk_review_summary(&WorktreeId::new(
+            binding.root_path.clone(),
+        )) {
+            Ok(result) => (result.changed_files, result.uncommitted_files),
+            Err(_) => {
+                let base_changed = binding
+                    .base_branch
+                    .as_deref()
+                    .map(|base_branch| {
+                        WorktreeService::changed_files_since_base(&binding.root_path, base_branch)
+                            .map_err(|error| error.to_string())
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let uncommitted = WorktreeService::uncommitted_changed_files(&binding.root_path)
+                    .map_err(|error| error.to_string())?;
+                (base_changed, uncommitted)
+            }
+        };
         let changed_files = merge_changed_files(&base_changed, &uncommitted);
 
         if let Some(desk) = self.workdesks.get_mut(desk_index) {
@@ -3324,6 +3419,7 @@ impl AxisShell {
         draft.metadata.cwd = binding.root_path.clone();
         draft.metadata.branch = binding.branch.clone();
         let mut desk = workdesk_from_template(WorkdeskTemplate::Implementation, draft);
+        desk.workdesk_id = self.allocate_workdesk_id();
         desk.runtime_id = self.allocate_workdesk_runtime_id();
         desk.worktree_binding = Some(binding);
         boot_workdesk_terminals(&mut desk);
@@ -3364,78 +3460,128 @@ impl AxisShell {
                     branch,
                     attach_path,
                 } => {
-                    let binding = match (attach_path, branch) {
-                        (Some(path), base_branch) => WorktreeService::attach(&path, base_branch)
-                            .map_err(|error| error.to_string())?,
-                        (None, Some(branch)) => {
-                            let repo_binding = WorktreeService::attach(&repo_root, None)
-                                .map_err(|error| error.to_string())?;
-                            let worktree_path = default_worktree_path(&repo_root, &branch)?;
-                            if worktree_path.exists() {
-                                WorktreeService::attach(&worktree_path, Some(repo_binding.branch))
+                    let daemon = DaemonClient::default();
+                    let binding = match daemon.worktree_create_or_attach(
+                        repo_root.clone(),
+                        branch.clone(),
+                        attach_path.clone(),
+                    ) {
+                        Ok(result) => result.binding,
+                        Err(_) => match (attach_path, branch) {
+                            (Some(path), base_branch) => WorktreeService::attach(&path, base_branch)
+                                .map_err(|error| error.to_string())?,
+                            (None, Some(branch)) => {
+                                let repo_binding = WorktreeService::attach(&repo_root, None)
+                                    .map_err(|error| error.to_string())?;
+                                let worktree_path = default_worktree_path(&repo_root, &branch)?;
+                                if worktree_path.exists() {
+                                    WorktreeService::attach(&worktree_path, Some(repo_binding.branch))
+                                        .map_err(|error| error.to_string())?
+                                } else {
+                                    WorktreeService::create_worktree(
+                                        &repo_root,
+                                        &worktree_path,
+                                        &branch,
+                                        &repo_binding.branch,
+                                    )
                                     .map_err(|error| error.to_string())?
-                            } else {
-                                WorktreeService::create_worktree(
-                                    &repo_root,
-                                    &worktree_path,
-                                    &branch,
-                                    &repo_binding.branch,
-                                )
-                                .map_err(|error| error.to_string())?
+                                }
                             }
-                        }
-                        (None, None) => WorktreeService::attach(&repo_root, None)
-                            .map_err(|error| error.to_string())?,
+                            (None, None) => WorktreeService::attach(&repo_root, None)
+                                .map_err(|error| error.to_string())?,
+                        },
                     };
                     let desk_index = self.ensure_worktree_backed_desk(binding, cx);
                     Ok(self.worktree_state_json(desk_index))
                 }
                 SharedAutomationRequest::WorktreeStatus { worktree_id } => {
-                    let desk_index = self.resolve_workdesk_index_by_worktree_id(&worktree_id)?;
+                    let daemon = DaemonClient::default();
+                    let binding = daemon
+                        .worktree_status(&worktree_id)
+                        .map(|result| result.binding)
+                        .or_else(|_| {
+                            WorktreeService::attach(&worktree_id.0, None)
+                                .map_err(|error| error.to_string())
+                        })?;
+                    let desk_index = self.ensure_worktree_backed_desk(binding, cx);
                     self.refresh_worktree_binding_for_desk(desk_index)?;
                     self.request_persist(cx);
                     Ok(self.worktree_state_json(desk_index))
                 }
+                SharedAutomationRequest::WorkdeskList { .. }
+                | SharedAutomationRequest::WorkdeskEnsure { .. }
+                | SharedAutomationRequest::TerminalEnsure { .. }
+                | SharedAutomationRequest::TerminalRead { .. }
+                | SharedAutomationRequest::TerminalWrite { .. }
+                | SharedAutomationRequest::TerminalResize { .. }
+                | SharedAutomationRequest::TerminalClose { .. }
+                | SharedAutomationRequest::GuiHeartbeat { .. }
+                | SharedAutomationRequest::GuiEnsureRunning { .. }
+                | SharedAutomationRequest::DaemonHealth => Err(
+                    "daemon-only automation requests are not supported by axis-app yet"
+                        .to_string(),
+                ),
                 SharedAutomationRequest::AgentStart {
                     worktree_id,
                     provider_profile_id,
                     argv,
+                    workdesk_id,
+                    surface_id,
                 } => {
-                    let desk_index = self.resolve_workdesk_index_by_worktree_id(&worktree_id)?;
-                    let desk_runtime_id = self.workdesks[desk_index].runtime_id;
-                    let surface_id = self.first_agent_surface_id(desk_index).ok_or_else(|| {
-                        format!("worktree `{}` has no agent surface", worktree_id.0)
-                    })?;
-                    if let Some(existing) = self
-                        .agent_runtime
-                        .session_for_surface(desk_runtime_id, surface_id)
-                    {
-                        if existing.provider_profile_id != provider_profile_id {
-                            return Err(format!(
-                                "agent surface already runs `{}`",
-                                existing.provider_profile_id
-                            ));
+                    let requested_workdesk_id = workdesk_id.clone();
+                    let requested_surface_id = surface_id;
+                    let desk_index = requested_workdesk_id
+                        .as_ref()
+                        .map(|workdesk_id| self.resolve_workdesk_index_by_automation_id(&workdesk_id.0))
+                        .transpose()?
+                        .or_else(|| self.resolve_workdesk_index_by_worktree_id(&worktree_id).ok());
+                    if let Some(desk_index) = desk_index {
+                        let desk_runtime_id = self.workdesks[desk_index].runtime_id;
+                        let surface_id = requested_surface_id
+                            .or_else(|| self.first_agent_surface_id(desk_index))
+                            .ok_or_else(|| {
+                                format!("worktree `{}` has no agent surface", worktree_id.0)
+                            })?;
+                        if let Some(existing) = self
+                            .agent_runtime
+                            .session_for_surface(desk_runtime_id, surface_id)
+                        {
+                            if existing.provider_profile_id != provider_profile_id {
+                                return Err(format!(
+                                    "agent surface already runs `{}`",
+                                    existing.provider_profile_id
+                                ));
+                            }
+                            return Ok(agent_session_json(&existing));
                         }
-                        return Ok(agent_session_json(&existing));
-                    }
 
-                    {
-                        let bridge = &self.agent_runtime;
-                        let desk = &mut self.workdesks[desk_index];
-                        start_agent_runtime_for_surface_with_profile(
-                            bridge,
-                            desk_runtime_id,
-                            desk,
-                            surface_id,
-                            Some(&provider_profile_id),
+                        {
+                            let bridge = &self.agent_runtime;
+                            let desk = &mut self.workdesks[desk_index];
+                            start_agent_runtime_for_surface_with_profile(
+                                bridge,
+                                desk_runtime_id,
+                                desk,
+                                surface_id,
+                                Some(&provider_profile_id),
+                                argv,
+                            )?;
+                        }
+                        let record = self
+                            .agent_runtime
+                            .session_for_surface(desk_runtime_id, surface_id)
+                            .ok_or_else(|| "agent session did not register".to_string())?;
+                        Ok(agent_session_json(&record))
+                    } else {
+                        let record = DaemonClient::default().start_agent(
+                            &worktree_id,
+                            provider_profile_id,
                             argv,
+                            requested_workdesk_id,
+                            requested_surface_id,
                         )?;
+                        Ok(agent_session_json(&record))
                     }
-                    let record = self
-                        .agent_runtime
-                        .session_for_surface(desk_runtime_id, surface_id)
-                        .ok_or_else(|| "agent session did not register".to_string())?;
-                    Ok(agent_session_json(&record))
                 }
                 SharedAutomationRequest::AgentStop { agent_session_id } => {
                     self.agent_runtime.stop_session(&agent_session_id)?;
@@ -3456,55 +3602,87 @@ impl AxisShell {
                     }))
                 }
                 SharedAutomationRequest::AgentList { worktree_id } => {
-                    let filter_workdesk_id = worktree_id
-                        .as_ref()
-                        .map(|id| self.resolve_workdesk_index_by_worktree_id(id))
-                        .transpose()?
-                        .map(|index| self.workdesks[index].runtime_id.to_string());
-                    let sessions = self
-                        .agent_runtime
-                        .sessions_snapshot()
-                        .into_iter()
-                        .filter(|record| {
-                            filter_workdesk_id.as_ref().map_or(true, |workdesk_id| {
-                                record.workdesk_id.as_ref() == Some(workdesk_id)
-                            })
-                        })
-                        .map(|record| agent_session_json(&record))
-                        .collect::<Vec<_>>();
+                    let sessions = match DaemonClient::default().list_agents(worktree_id.as_ref()) {
+                        Ok(records) => records,
+                        Err(_) => {
+                            let filter_workdesk_ids = worktree_id
+                                .as_ref()
+                                .map(|id| self.resolve_workdesk_index_by_worktree_id(id))
+                                .transpose()?
+                                .map(|index| {
+                                    vec![
+                                        self.workdesks[index].workdesk_id.clone(),
+                                        self.workdesks[index].runtime_id.to_string(),
+                                    ]
+                                });
+                            self.agent_runtime
+                                .sessions_snapshot()
+                                .into_iter()
+                                .filter(|record| {
+                                    filter_workdesk_ids.as_ref().map_or(true, |workdesk_ids| {
+                                        record.workdesk_id.as_ref().is_some_and(|workdesk_id| {
+                                            workdesk_ids.iter().any(|candidate| candidate == workdesk_id)
+                                        })
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                    }
+                    .into_iter()
+                    .map(|record| agent_session_json(&record))
+                    .collect::<Vec<_>>();
                     Ok(Value::Array(sessions))
                 }
                 SharedAutomationRequest::DeskReviewSummary { worktree_id } => {
-                    let desk_index = self.resolve_workdesk_index_by_worktree_id(&worktree_id)?;
-                    let binding = self.refresh_worktree_binding_for_desk(desk_index)?;
-                    let changed_files = binding
-                        .base_branch
-                        .as_deref()
-                        .map(|base_branch| {
-                            WorktreeService::changed_files_since_base(
-                                &binding.root_path,
-                                base_branch,
-                            )
-                            .map_err(|error| error.to_string())
-                        })
-                        .transpose()?
-                        .unwrap_or_default();
-                    let uncommitted_files =
-                        WorktreeService::uncommitted_changed_files(&binding.root_path)
+                    let daemon = DaemonClient::default();
+                    let result = daemon.desk_review_summary(&worktree_id).or_else(
+                        |_| -> Result<daemon_client::DeskReviewResult, String> {
+                        let binding = WorktreeService::attach(&worktree_id.0, None)
                             .map_err(|error| error.to_string())?;
-                    let summary = ReviewSummary {
-                        files_changed: changed_files.len() as u32,
-                        uncommitted_files: uncommitted_files.len() as u32,
-                        ready_for_review: !changed_files.is_empty()
-                            || !uncommitted_files.is_empty(),
-                        last_inspected_at_ms: Some(unix_time_ms()),
-                    };
-                    self.request_persist(cx);
+                        let changed_files = binding
+                            .base_branch
+                            .as_deref()
+                            .map(|base_branch| {
+                                WorktreeService::changed_files_since_base(
+                                    &binding.root_path,
+                                    base_branch,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                            .transpose()?
+                            .unwrap_or_default();
+                        let uncommitted_files =
+                            WorktreeService::uncommitted_changed_files(&binding.root_path)
+                                .map_err(|error| error.to_string())?;
+                        Ok(daemon_client::DeskReviewResult {
+                            worktree_id: worktree_id.clone(),
+                            summary: ReviewSummary {
+                                files_changed: changed_files.len() as u32,
+                                uncommitted_files: uncommitted_files.len() as u32,
+                                ready_for_review: !changed_files.is_empty()
+                                    || !uncommitted_files.is_empty(),
+                                last_inspected_at_ms: Some(unix_time_ms()),
+                            },
+                            changed_files,
+                            uncommitted_files,
+                        })
+                    },
+                    )?;
+                    if let Ok(desk_index) = self.resolve_workdesk_index_by_worktree_id(&worktree_id) {
+                        let binding = self.refresh_worktree_binding_for_desk(desk_index)?;
+                        let changed_files =
+                            merge_changed_files(&result.changed_files, &result.uncommitted_files);
+                        if let Some(desk) = self.workdesks.get_mut(desk_index) {
+                            desk.review_summary =
+                                Some(build_desk_review_summary_view(&binding, &changed_files));
+                        }
+                        self.request_persist(cx);
+                    }
                     Ok(json!({
-                        "worktree_id": worktree_id,
-                        "summary": summary,
-                        "changed_files": changed_files,
-                        "uncommitted_files": uncommitted_files,
+                        "worktree_id": result.worktree_id,
+                        "summary": result.summary,
+                        "changed_files": result.changed_files,
+                        "uncommitted_files": result.uncommitted_files,
                     }))
                 }
                 SharedAutomationRequest::AttentionNext { workdesk_id } => {
@@ -3537,13 +3715,20 @@ impl AxisShell {
                     if let Some(workdesk_id) = workdesk_id {
                         let desk_index =
                             self.resolve_workdesk_index_by_automation_id(&workdesk_id)?;
-                        let filter_workdesk_id = self.workdesks[desk_index].runtime_id.to_string();
+                        let filter_workdesk_ids = [
+                            self.workdesks[desk_index].workdesk_id.clone(),
+                            self.workdesks[desk_index].runtime_id.to_string(),
+                        ];
                         let sessions = self
                             .agent_runtime
                             .sessions_snapshot()
                             .into_iter()
                             .filter(|record| {
-                                record.workdesk_id.as_deref() == Some(filter_workdesk_id.as_str())
+                                record.workdesk_id.as_ref().is_some_and(|record_workdesk_id| {
+                                    filter_workdesk_ids
+                                        .iter()
+                                        .any(|candidate| candidate == record_workdesk_id)
+                                })
                             })
                             .map(|record| agent_session_json(&record))
                             .collect::<Vec<_>>();
@@ -4188,6 +4373,7 @@ impl AxisShell {
                 .update(cx, |this, cx| {
                     let automation_changed = this.process_automation_commands(cx);
                     let blink_changed = this.tick_cursor_blink();
+                    this.sync_daemon_runtime_state_if_due();
                     let agent_changed = this.sync_agent_runtime_activity(cx);
                     if automation_changed
                         || this.sync_terminal_revisions(cx)
@@ -5741,6 +5927,7 @@ impl AxisShell {
                 WorkdeskTemplate::ShellDesk,
             ),
         );
+        desk.workdesk_id = self.allocate_workdesk_id();
         desk.runtime_id = self.allocate_workdesk_runtime_id();
         boot_workdesk_terminals(&mut desk);
         self.workdesks.push(desk);
@@ -5757,6 +5944,7 @@ impl AxisShell {
         let mut duplicated = PersistedWorkdesk::from_state(source).into_state();
         duplicated.name = self.unique_workdesk_name(&format!("{} Copy", source.name));
         duplicated.summary = source.summary.clone();
+        duplicated.workdesk_id = self.allocate_workdesk_id();
         duplicated.runtime_id = self.allocate_workdesk_runtime_id();
 
         let insert_at = index + 1;
@@ -8076,21 +8264,16 @@ impl Render for AxisShell {
 
 fn main() {
     let (workdesks, active_workdesk, shortcuts, boot_notice) = load_boot_state();
-    let (automation_server, automation_notice) = match automation::start_automation_server() {
-        Ok(server) => (server, None),
-        Err(error) => {
-            let (_sender, receiver) = mpsc::channel();
-            (
-                AutomationServer {
-                    receiver,
-                    socket_path: automation::automation_socket_path(),
-                },
-                Some(SharedString::from(format!(
-                    "automation socket disabled: {error}"
-                ))),
-            )
-        }
+    let (_sender, receiver) = mpsc::channel();
+    let daemon_socket = daemon_socket_path();
+    let automation_server = AutomationServer {
+        receiver,
+        socket_path: daemon_socket,
     };
+    let automation_notice = DaemonClient::default()
+        .daemon_health()
+        .err()
+        .map(|error| SharedString::from(format!("axisd unavailable: {error}")));
     let boot_notice = match (boot_notice, automation_notice) {
         (Some(left), Some(right)) => Some(SharedString::from(format!("{left} | {right}"))),
         (Some(left), None) => Some(left),
@@ -8420,6 +8603,7 @@ fn start_agent_runtime_for_surface_with_profile(
         Some(profile_id) => bridge
             .start_agent_for_surface_with_profile(
                 workdesk_runtime_id,
+                &desk.workdesk_id,
                 surface_id,
                 cwd,
                 &terminal,
@@ -8428,7 +8612,13 @@ fn start_agent_runtime_for_surface_with_profile(
             )
             .map(|_| true),
         None => bridge
-            .start_agent_for_surface(workdesk_runtime_id, surface_id, cwd, &terminal)
+            .start_agent_for_surface(
+                workdesk_runtime_id,
+                &desk.workdesk_id,
+                surface_id,
+                cwd,
+                &terminal,
+            )
             .map(|_| true),
     }
 }
@@ -8515,6 +8705,17 @@ fn worktree_id_from_desk(desk: &WorkdeskState) -> Option<WorktreeId> {
         .map(WorktreeId::new)
 }
 
+fn workdesk_record_from_state(desk: &WorkdeskState, workspace_root: &str) -> WorkdeskRecord {
+    WorkdeskRecord {
+        workdesk_id: WorkdeskId::new(desk.workdesk_id.clone()),
+        workspace_root: workspace_root.to_string(),
+        name: desk.name.clone(),
+        summary: desk.summary.clone(),
+        template: None,
+        worktree_binding: desk.worktree_binding.clone(),
+    }
+}
+
 fn agent_session_json(record: &AgentSessionRecord) -> Value {
     json!({
         "id": record.id,
@@ -8565,6 +8766,26 @@ fn unix_time_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn assign_missing_workdesk_ids(workdesks: &mut [WorkdeskState], next_workdesk_id: &mut u64) {
+    let mut seen = HashSet::new();
+
+    for desk in workdesks {
+        let existing = desk.workdesk_id.trim();
+        if !existing.is_empty() && seen.insert(existing.to_string()) {
+            continue;
+        }
+
+        loop {
+            let candidate = format!("desk-{}", *next_workdesk_id);
+            *next_workdesk_id = next_workdesk_id.saturating_add(1);
+            if seen.insert(candidate.clone()) {
+                desk.workdesk_id = candidate;
+                break;
+            }
+        }
+    }
 }
 
 fn compact_cwd_label(path: &str) -> String {
@@ -8808,6 +9029,7 @@ fn automation_workdesk_summary_json(index: usize, desk: &WorkdeskState, active: 
 
     json!({
         "index": index,
+        "workdesk_id": desk.workdesk_id,
         "active": active,
         "name": desk.name,
         "summary": desk.summary,
@@ -11416,6 +11638,7 @@ mod tests {
     #[test]
     fn legacy_persisted_pane_migrates_to_single_surface_stack() {
         let restored = PersistedWorkdesk {
+            workdesk_id: String::new(),
             name: "Desk".to_string(),
             summary: "Summary".to_string(),
             metadata: WorkdeskMetadata::default(),
@@ -11531,6 +11754,44 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn persisted_workdesk_round_trips_stable_workdesk_id() {
+        let mut state = blank_workdesk("Desk", "Summary");
+        state.workdesk_id = "desk-42".to_string();
+
+        let restored = PersistedWorkdesk::from_state(&state).into_state();
+
+        assert_eq!(restored.workdesk_id, "desk-42");
+    }
+
+    #[test]
+    fn automation_workdesk_summary_uses_stable_workdesk_id() {
+        let mut desk = blank_workdesk("Desk", "Summary");
+        desk.workdesk_id = "desk-7".to_string();
+
+        let payload = automation_workdesk_summary_json(0, &desk, true);
+
+        assert_eq!(payload["workdesk_id"], "desk-7");
+    }
+
+    #[test]
+    fn assign_missing_workdesk_ids_replaces_missing_and_duplicate_ids() {
+        let mut first = blank_workdesk("One", "Summary");
+        first.workdesk_id = "desk-1".to_string();
+        let second = blank_workdesk("Two", "Summary");
+        let mut third = blank_workdesk("Three", "Summary");
+        third.workdesk_id = "desk-1".to_string();
+
+        let mut workdesks = vec![first, second, third];
+        let mut next_workdesk_id = 2;
+        assign_missing_workdesk_ids(&mut workdesks, &mut next_workdesk_id);
+
+        assert_eq!(workdesks[0].workdesk_id, "desk-1");
+        assert_eq!(workdesks[1].workdesk_id, "desk-2");
+        assert_eq!(workdesks[2].workdesk_id, "desk-3");
+        assert_eq!(next_workdesk_id, 4);
     }
 
     #[test]
