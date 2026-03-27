@@ -6,15 +6,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use axis_core::agent::{
-    AgentAttention, AgentLifecycle, AgentSessionId,
-};
+use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionId};
 
 use crate::events::RuntimeEvent;
 use crate::provider::{AgentProvider, StartAgentRequest, StartedSession};
-use process_manager::{
-    spawn_process_launch, ProcessLaunchSpec, TerminalGridSize, WaitOutcome,
-};
+use process_manager::{spawn_process_launch, ProcessLaunchSpec, TerminalGridSize, WaitOutcome};
 
 const DEFAULT_GRID: TerminalGridSize = TerminalGridSize::new(80, 24);
 /// Max bytes retained without a newline (defensive cap for marker parsing).

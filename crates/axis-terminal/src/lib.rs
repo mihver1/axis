@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use axis_core::{PaneKind, Point, Size, Workdesk};
 mod client;
 mod host;
+pub use client::TerminalReplayClient;
 use ghostty_sys::{
     ghostty_build_info as ghostty_vt_build_info, ghostty_render_state_colors_get,
     ghostty_render_state_free, ghostty_render_state_get, ghostty_render_state_new,
@@ -19,7 +20,6 @@ use ghostty_sys::{
     GhosttyTerminalScrollViewport, GhosttyTerminalScrollViewportTag, GhosttyTerminalScrollbar,
     GHOSTTY_MODE_DECCKM, GHOSTTY_SUCCESS,
 };
-pub use client::TerminalReplayClient;
 pub use host::{HostReadEvent, TerminalHostSession};
 pub use process_manager::TerminalGridSize;
 use process_manager::{spawn_process, ProcessSpec, RunningProcess};

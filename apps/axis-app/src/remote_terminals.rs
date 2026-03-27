@@ -1,11 +1,11 @@
 use crate::daemon_client::DaemonClient;
 use axis_core::terminal::{TerminalSessionId, TerminalSurfaceKind};
+use axis_core::PaneKind;
 use axis_core::SurfaceId;
 use axis_terminal::{
-    spawn_terminal_session_with_grid, TerminalAgentMetadata, TerminalGridSize, TerminalReplayClient,
-    TerminalSession, TerminalSnapshot,
+    spawn_terminal_session_with_grid, TerminalAgentMetadata, TerminalGridSize,
+    TerminalReplayClient, TerminalSession, TerminalSnapshot,
 };
-use axis_core::PaneKind;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -45,7 +45,9 @@ impl RemoteTerminalSession {
     ) -> Result<Self, String> {
         let daemon = DaemonClient::default();
         let Some(remote_kind) = surface_kind_from_pane(kind) else {
-            return Err(format!("surface kind {kind:?} does not support remote terminals"));
+            return Err(format!(
+                "surface kind {kind:?} does not support remote terminals"
+            ));
         };
 
         match daemon.ensure_terminal(workdesk_id, surface_id, remote_kind, title, cwd, grid) {
@@ -58,8 +60,10 @@ impl RemoteTerminalSession {
                 Ok(session)
             }
             Err(_error) => {
-                let local = spawn_terminal_session_with_grid(kind, title, grid)
-                    .map_err(|spawn_error| format!("terminal boot failed for {title}: {spawn_error}"))?;
+                let local =
+                    spawn_terminal_session_with_grid(kind, title, grid).map_err(|spawn_error| {
+                        format!("terminal boot failed for {title}: {spawn_error}")
+                    })?;
                 Ok(Self {
                     inner: Arc::new(RemoteTerminalSessionInner::Local(local)),
                 })
@@ -131,7 +135,9 @@ impl RemoteTerminalSession {
     pub fn send_bytes(&self, bytes: &[u8]) -> RemoteResult<()> {
         match self.inner.as_ref() {
             RemoteTerminalSessionInner::Remote(backend) => backend.send_bytes(bytes),
-            RemoteTerminalSessionInner::Local(local) => local.send_bytes(bytes).map_err(|e| e.to_string()),
+            RemoteTerminalSessionInner::Local(local) => {
+                local.send_bytes(bytes).map_err(|e| e.to_string())
+            }
         }
     }
 
@@ -142,9 +148,9 @@ impl RemoteTerminalSession {
     pub fn scroll_viewport_delta(&self, delta: isize) -> RemoteResult<()> {
         match self.inner.as_ref() {
             RemoteTerminalSessionInner::Remote(backend) => backend.scroll_viewport_delta(delta),
-            RemoteTerminalSessionInner::Local(local) => {
-                local.scroll_viewport_delta(delta).map_err(|e| e.to_string())
-            }
+            RemoteTerminalSessionInner::Local(local) => local
+                .scroll_viewport_delta(delta)
+                .map_err(|e| e.to_string()),
         }
     }
 
@@ -160,7 +166,9 @@ impl RemoteTerminalSession {
     pub fn resize(&self, grid: TerminalGridSize) -> RemoteResult<()> {
         match self.inner.as_ref() {
             RemoteTerminalSessionInner::Remote(backend) => backend.resize(grid),
-            RemoteTerminalSessionInner::Local(local) => local.resize(grid).map_err(|e| e.to_string()),
+            RemoteTerminalSessionInner::Local(local) => {
+                local.resize(grid).map_err(|e| e.to_string())
+            }
         }
     }
 
@@ -195,18 +203,18 @@ impl RemoteTerminalBackend {
 
     fn sync(&self) -> Result<(), String> {
         let offset = self.transcript_offset.load(Ordering::SeqCst);
-        let result = self.daemon.read_terminal(&self.terminal_session_id, offset)?;
+        let result = self
+            .daemon
+            .read_terminal(&self.terminal_session_id, offset)?;
         let mut changed = false;
 
         if let Some(chunk) = result.chunk {
             if !chunk.bytes.is_empty() {
-                self.replay
-                    .apply_bytes(&chunk.bytes)
-                    .map_err(|error| self.record_sync_error(format!("ghostty-vt replay failed: {error}")))?;
-                self.transcript_offset.store(
-                    chunk.offset + chunk.bytes.len() as u64,
-                    Ordering::SeqCst,
-                );
+                self.replay.apply_bytes(&chunk.bytes).map_err(|error| {
+                    self.record_sync_error(format!("ghostty-vt replay failed: {error}"))
+                })?;
+                self.transcript_offset
+                    .store(chunk.offset + chunk.bytes.len() as u64, Ordering::SeqCst);
                 changed = true;
             }
         }
@@ -257,7 +265,9 @@ impl RemoteTerminalBackend {
     }
 
     fn resize(&self, grid: TerminalGridSize) -> RemoteResult<()> {
-        let record = self.daemon.resize_terminal(&self.terminal_session_id, grid)?;
+        let record = self
+            .daemon
+            .resize_terminal(&self.terminal_session_id, grid)?;
         self.replay
             .resize(grid)
             .map_err(|error| error.to_string())?;

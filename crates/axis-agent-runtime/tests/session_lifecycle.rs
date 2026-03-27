@@ -7,9 +7,7 @@ use axis_agent_runtime::adapters::fake::FakeProvider;
 use axis_agent_runtime::events::RuntimeEvent;
 use axis_agent_runtime::provider::{ProviderRegistry, StartAgentRequest};
 use axis_agent_runtime::SessionManager;
-use axis_core::agent::{
-    AgentAttention, AgentLifecycle, AgentSessionId, AgentTransportKind,
-};
+use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionId, AgentTransportKind};
 
 #[test]
 fn start_session_registers_planned_session_and_bumps_revision() {
@@ -94,8 +92,10 @@ fn transition_lifecycle_and_attention_bump_revision_when_changed() {
     .unwrap();
     let mid = mgr.revision();
 
-    mgr.transition_attention(&id, AgentAttention::Working).unwrap();
-    mgr.transition_lifecycle(&id, AgentLifecycle::Completed).unwrap();
+    mgr.transition_attention(&id, AgentAttention::Working)
+        .unwrap();
+    mgr.transition_lifecycle(&id, AgentLifecycle::Completed)
+        .unwrap();
 
     assert_eq!(mgr.revision(), mid + 2);
     let s = mgr.session(&id).unwrap();

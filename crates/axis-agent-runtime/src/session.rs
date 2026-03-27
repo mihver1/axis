@@ -3,9 +3,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context};
-use axis_core::agent::{
-    AgentAttention, AgentLifecycle, AgentSessionId, AgentSessionRecord,
-};
+use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionId, AgentSessionRecord};
 
 use crate::events::RuntimeEvent;
 use crate::provider::{
@@ -56,10 +54,7 @@ impl SessionManager {
         let id = started.session_id.clone();
 
         if self.sessions.contains_key(&id) {
-            return Err(anyhow!(
-                "provider returned duplicate session id {}",
-                id.0
-            ));
+            return Err(anyhow!("provider returned duplicate session id {}", id.0));
         }
 
         let record = AgentSessionRecord {
@@ -203,10 +198,7 @@ mod tests {
     #[test]
     fn revision_unchanged_when_lifecycle_transition_is_noop() {
         let mut reg = ProviderRegistry::new();
-        reg.register(
-            "fake",
-            Arc::new(FakeProvider::with_standard_script()),
-        );
+        reg.register("fake", Arc::new(FakeProvider::with_standard_script()));
         let mut mgr = SessionManager::new(reg);
         let id = mgr
             .start_session(StartAgentRequest {

@@ -71,7 +71,9 @@ impl TerminalHostSession {
                             on_event(HostReadEvent::Closed(status_text));
                             break;
                         }
-                        Ok(bytes_read) => on_event(HostReadEvent::Bytes(buffer[..bytes_read].to_vec())),
+                        Ok(bytes_read) => {
+                            on_event(HostReadEvent::Bytes(buffer[..bytes_read].to_vec()))
+                        }
                         Err(error) => {
                             on_event(HostReadEvent::Error(format!("PTY read error: {error}")));
                             break;

@@ -25,21 +25,33 @@ fn fake_emits_starting_running_needs_review_completed_sequence() {
         .unwrap();
 
     mgr.poll_provider(&id).unwrap();
-    assert_eq!(mgr.session(&id).unwrap().lifecycle, AgentLifecycle::Starting);
+    assert_eq!(
+        mgr.session(&id).unwrap().lifecycle,
+        AgentLifecycle::Starting
+    );
 
     mgr.poll_provider(&id).unwrap();
     assert_eq!(mgr.session(&id).unwrap().lifecycle, AgentLifecycle::Running);
     assert_eq!(mgr.session(&id).unwrap().attention, AgentAttention::Quiet);
 
     mgr.poll_provider(&id).unwrap();
-    assert_eq!(mgr.session(&id).unwrap().attention, AgentAttention::NeedsReview);
+    assert_eq!(
+        mgr.session(&id).unwrap().attention,
+        AgentAttention::NeedsReview
+    );
     assert_eq!(mgr.session(&id).unwrap().lifecycle, AgentLifecycle::Running);
 
     mgr.poll_provider(&id).unwrap();
-    assert_eq!(mgr.session(&id).unwrap().lifecycle, AgentLifecycle::Completed);
+    assert_eq!(
+        mgr.session(&id).unwrap().lifecycle,
+        AgentLifecycle::Completed
+    );
 
     mgr.poll_provider(&id).unwrap();
-    assert_eq!(mgr.session(&id).unwrap().lifecycle, AgentLifecycle::Completed);
+    assert_eq!(
+        mgr.session(&id).unwrap().lifecycle,
+        AgentLifecycle::Completed
+    );
 }
 
 #[test]

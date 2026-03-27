@@ -24,7 +24,10 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-fn send_request(socket_path: &Path, request: &AutomationRequest) -> anyhow::Result<AutomationResponse> {
+fn send_request(
+    socket_path: &Path,
+    request: &AutomationRequest,
+) -> anyhow::Result<AutomationResponse> {
     let mut stream = UnixStream::connect(socket_path)?;
     let payload = serde_json::to_vec(request)?;
     stream.write_all(&payload)?;

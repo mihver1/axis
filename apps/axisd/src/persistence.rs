@@ -23,8 +23,7 @@ pub fn load_registry(data_dir: &Path) -> anyhow::Result<DaemonRegistry> {
 }
 
 pub fn save_registry(data_dir: &Path, registry: &DaemonRegistry) -> anyhow::Result<()> {
-    fs::create_dir_all(data_dir)
-        .with_context(|| format!("create {}", data_dir.display()))?;
+    fs::create_dir_all(data_dir).with_context(|| format!("create {}", data_dir.display()))?;
     let path = registry_file_path(data_dir);
     let payload = serde_json::to_vec_pretty(registry)
         .with_context(|| format!("serialize {}", path.display()))?;

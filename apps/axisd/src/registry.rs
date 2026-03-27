@@ -111,7 +111,8 @@ impl TerminalRegistry {
         self.next_session_serial = self.next_session_serial.saturating_add(1);
         let cwd = cwd.unwrap_or_default();
         let launch = terminal_launch_spec(kind, &cwd);
-        let pty = DaemonPtySession::spawn(session_id.clone(), &launch, grid, self.transcripts.clone())?;
+        let pty =
+            DaemonPtySession::spawn(session_id.clone(), &launch, grid, self.transcripts.clone())?;
 
         let mut record = TerminalSessionRecord {
             terminal_session_id: session_id.clone(),
@@ -130,8 +131,13 @@ impl TerminalRegistry {
 
         self.session_key_by_id
             .insert(session_id.0.clone(), key.clone());
-        self.sessions_by_key
-            .insert(key, DaemonTerminalSession { record: record.clone(), pty });
+        self.sessions_by_key.insert(
+            key,
+            DaemonTerminalSession {
+                record: record.clone(),
+                pty,
+            },
+        );
         Ok(record)
     }
 

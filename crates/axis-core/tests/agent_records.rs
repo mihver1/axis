@@ -190,9 +190,7 @@ fn automation_agent_list_optional_worktree_id_round_trips() {
         }
     );
 
-    let list_none = AutomationRequest::AgentList {
-        worktree_id: None,
-    };
+    let list_none = AutomationRequest::AgentList { worktree_id: None };
     let v = serde_json::to_value(&list_none).unwrap();
     assert!(v["params"].get("worktree_id").is_none());
 }
@@ -253,7 +251,12 @@ fn terminal_session_record_and_transcript_chunk_round_trip() {
     };
     let chunk_json = serde_json::to_value(&chunk).unwrap();
     assert_eq!(chunk_json["offset"], 128);
-    assert_eq!(chunk_json["bytes"], serde_json::json!([112, 114, 105, 110, 116, 102, 32, 39, 114, 101, 97, 100, 121, 92, 114, 92, 110, 39]));
+    assert_eq!(
+        chunk_json["bytes"],
+        serde_json::json!([
+            112, 114, 105, 110, 116, 102, 32, 39, 114, 101, 97, 100, 121, 92, 114, 92, 110, 39
+        ])
+    );
     let chunk_back: TerminalTranscriptChunk = serde_json::from_value(chunk_json).unwrap();
     assert_eq!(chunk_back, chunk);
 }

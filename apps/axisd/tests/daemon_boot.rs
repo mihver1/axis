@@ -40,8 +40,8 @@ fn daemon_health_round_trips_over_temp_socket() {
 
     let server = request_handler::start_background_daemon(socket_path.clone(), data_dir)
         .expect("daemon should start");
-    let response =
-        send_request(&socket_path, &AutomationRequest::DaemonHealth).expect("request should round-trip");
+    let response = send_request(&socket_path, &AutomationRequest::DaemonHealth)
+        .expect("request should round-trip");
 
     assert!(response.ok);
     assert_eq!(response.result.expect("health result")["status"], "ok");

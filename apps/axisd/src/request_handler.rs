@@ -7,6 +7,7 @@ use anyhow::Context;
 use axis_agent_runtime::WorktreeService;
 use axis_core::automation::{AutomationRequest, AutomationResponse};
 use axis_core::worktree::ReviewSummary;
+use axis_terminal::TerminalGridSize;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -17,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use axis_terminal::TerminalGridSize;
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -98,7 +98,10 @@ pub fn run_forever(socket_path: PathBuf, data_dir: PathBuf) -> anyhow::Result<()
 }
 
 #[allow(dead_code)]
-pub fn start_background_daemon(socket_path: PathBuf, data_dir: PathBuf) -> anyhow::Result<RunningDaemon> {
+pub fn start_background_daemon(
+    socket_path: PathBuf,
+    data_dir: PathBuf,
+) -> anyhow::Result<RunningDaemon> {
     let state = Arc::new(Mutex::new(DaemonState {
         workdesks: load_registry(&data_dir)?,
         terminals: TerminalRegistry::new(TranscriptStore::new(data_dir.join("transcripts"))),
@@ -140,8 +143,7 @@ fn bind_listener(socket_path: &Path) -> anyhow::Result<UnixListener> {
     let Some(socket_dir) = socket_path.parent() else {
         anyhow::bail!("invalid daemon socket path")
     };
-    fs::create_dir_all(socket_dir)
-        .with_context(|| format!("create {}", socket_dir.display()))?;
+    fs::create_dir_all(socket_dir).with_context(|| format!("create {}", socket_dir.display()))?;
 
     if socket_path.exists() {
         match std::os::unix::net::UnixStream::connect(socket_path) {
@@ -186,8 +188,7 @@ fn serve(
                         &thread_state,
                     )
                     .unwrap_or_else(|error| {
-                        serde_json::to_vec(&AutomationResponse::failure(error.to_string()))
-                            .unwrap()
+                        serde_json::to_vec(&AutomationResponse::failure(error.to_string())).unwrap()
                     });
                     let _ = stream.write_all(&response_payload);
                     let _ = stream.write_all(b"\n");
@@ -197,7 +198,9 @@ fn serve(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(error) => return Err(error).with_context(|| format!("accept {}", socket_path.display())),
+            Err(error) => {
+                return Err(error).with_context(|| format!("accept {}", socket_path.display()))
+            }
         }
     }
 
@@ -261,7 +264,8 @@ fn encode_response(
     response: AutomationResponse,
 ) -> anyhow::Result<Vec<u8>> {
     if wrapped {
-        serde_json::to_vec(&SocketAutomationResponse { id, response }).context("serialize socket response")
+        serde_json::to_vec(&SocketAutomationResponse { id, response })
+            .context("serialize socket response")
     } else {
         serde_json::to_vec(&response).context("serialize automation response")
     }
@@ -396,7 +400,9 @@ fn handle_request(
             let changed_files = binding
                 .base_branch
                 .as_deref()
-                .map(|base_branch| WorktreeService::changed_files_since_base(&binding.root_path, base_branch))
+                .map(|base_branch| {
+                    WorktreeService::changed_files_since_base(&binding.root_path, base_branch)
+                })
                 .transpose()?
                 .unwrap_or_default();
             let uncommitted_files = WorktreeService::uncommitted_changed_files(&binding.root_path)?;
@@ -582,7 +588,9 @@ fn unix_time_ms() -> u64 {
 }
 
 fn gui_heartbeat_is_fresh(record: Option<&GuiHeartbeatRecord>, now_ms: u64) -> bool {
-    record.is_some_and(|record| now_ms.saturating_sub(record.last_seen_at_ms) <= gui_heartbeat_ttl_ms())
+    record.is_some_and(|record| {
+        now_ms.saturating_sub(record.last_seen_at_ms) <= gui_heartbeat_ttl_ms()
+    })
 }
 
 fn gui_heartbeat_ttl_ms() -> u64 {

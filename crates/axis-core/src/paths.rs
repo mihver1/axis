@@ -57,7 +57,10 @@ pub fn daemon_socket_path() -> PathBuf {
     )
 }
 
-pub fn daemon_socket_path_for(explicit_socket_override: Option<PathBuf>, data_dir: PathBuf) -> PathBuf {
+pub fn daemon_socket_path_for(
+    explicit_socket_override: Option<PathBuf>,
+    data_dir: PathBuf,
+) -> PathBuf {
     explicit_socket_override.unwrap_or_else(|| data_dir.join(DAEMON_SOCKET_FILE))
 }
 

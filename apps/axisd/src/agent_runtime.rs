@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use axis_agent_runtime::adapters::codex::CodexProvider;
 use axis_agent_runtime::adapters::process_only::ProcessOnlyProvider;
 use axis_agent_runtime::{
-    ProviderProfileMetadata, ProviderRegistry, SessionManager, StartAgentRequest,
+    provider_base_argv_from_env_or_default, ProviderProfileMetadata, ProviderRegistry,
+    SessionManager, StartAgentRequest,
 };
 use axis_core::agent::{AgentSessionId, AgentSessionRecord, AgentTransportKind};
 use axis_core::workdesk::WorkdeskId;
@@ -37,19 +38,15 @@ pub struct DaemonAgentRuntime {
 impl DaemonAgentRuntime {
     pub fn new() -> Self {
         let mut registry = ProviderRegistry::new();
-        let codex_base_argv = provider_base_argv_from_bin_override(
-            provider_bin_override(CODEX_BIN_ENV).as_deref(),
-            CODEX_PROFILE_ID,
-        );
+        let codex_base_argv =
+            provider_base_argv_from_env_or_default(CODEX_BIN_ENV, CODEX_PROFILE_ID);
         registry.register_with_metadata(
             CODEX_PROFILE_ID,
             std::sync::Arc::new(CodexProvider::with_base_argv(codex_base_argv)),
             None::<String>,
         );
-        let claude_base_argv = provider_base_argv_from_bin_override(
-            provider_bin_override(CLAUDE_CODE_BIN_ENV).as_deref(),
-            CLAUDE_CODE_PROFILE_ID,
-        );
+        let claude_base_argv =
+            provider_base_argv_from_env_or_default(CLAUDE_CODE_BIN_ENV, CLAUDE_CODE_PROFILE_ID);
         registry.register_with_metadata(
             CLAUDE_CODE_PROFILE_ID,
             std::sync::Arc::new(ProcessOnlyProvider::with_base_argv(
@@ -89,7 +86,8 @@ impl DaemonAgentRuntime {
             return Err("agent session requires non-empty cwd".to_string());
         }
 
-        let provider_profile_id = provider_profile_id.unwrap_or_else(|| self.default_profile_id.clone());
+        let provider_profile_id =
+            provider_profile_id.unwrap_or_else(|| self.default_profile_id.clone());
         let binding = SessionBinding {
             workdesk_id: workdesk_id.clone().map(|id| id.0),
             surface_id,
@@ -232,18 +230,4 @@ impl Default for DaemonAgentRuntime {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn provider_bin_override(env_name: &str) -> Option<String> {
-    std::env::var(env_name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn provider_base_argv_from_bin_override(
-    bin_override: Option<&str>,
-    default_binary: &str,
-) -> Vec<String> {
-    vec![bin_override.unwrap_or(default_binary).to_string()]
 }

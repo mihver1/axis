@@ -1,5 +1,6 @@
 use super::{
-    GhosttyEngine, TerminalGridSize, TerminalRow, TerminalScrollbar, TerminalSnapshot, TerminalTheme,
+    GhosttyEngine, TerminalGridSize, TerminalRow, TerminalScrollbar, TerminalSnapshot,
+    TerminalTheme,
 };
 use anyhow::Result;
 use std::sync::Mutex;
@@ -52,11 +53,14 @@ impl TerminalReplayClient {
 
     pub fn snapshot(&self) -> TerminalSnapshot {
         match self.engine.lock() {
-            Ok(mut engine) => engine.snapshot(&self.fallback_title).unwrap_or_else(|error| {
-                replay_error_snapshot(self.fallback_title.clone(), format!(
-                    "ghostty-vt snapshot failed: {error}"
-                ))
-            }),
+            Ok(mut engine) => engine
+                .snapshot(&self.fallback_title)
+                .unwrap_or_else(|error| {
+                    replay_error_snapshot(
+                        self.fallback_title.clone(),
+                        format!("ghostty-vt snapshot failed: {error}"),
+                    )
+                }),
             Err(_) => replay_error_snapshot(
                 self.fallback_title.clone(),
                 "ghostty-vt state mutex poisoned".to_string(),

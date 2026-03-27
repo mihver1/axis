@@ -28,12 +28,11 @@ mod remote_terminals;
 mod review;
 mod worktrees;
 use automation::{AutomationEnvelope, AutomationServer};
-use daemon_client::DaemonClient;
 use axis_editor::{EditorBuffer, HighlightKind};
 use axis_terminal::{
-    ghostty_build_info, TerminalColor, TerminalGridSize, TerminalRow, TerminalRun,
-    TerminalSnapshot,
+    ghostty_build_info, TerminalColor, TerminalGridSize, TerminalRow, TerminalRun, TerminalSnapshot,
 };
+use daemon_client::DaemonClient;
 use gpui::{
     div, font, img, prelude::*, px, relative, rgb, rgba, size, App, Application, AssetSource,
     Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, EntityInputHandler,
@@ -43,9 +42,9 @@ use gpui::{
     SmartMagnifyGestureEvent, Style, StyledText, SwipeGestureEvent, TextRun, Timer,
     TitlebarOptions, TouchEvent, TouchPhase, UTF16Selection, Window, WindowBounds, WindowOptions,
 };
+use remote_terminals::RemoteTerminalSession;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use remote_terminals::RemoteTerminalSession;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
@@ -2527,9 +2526,9 @@ impl AxisShell {
 
         if let Err(error) = shell.sync_daemon_runtime_state() {
             if let Some(workdesk) = shell.workdesks.get_mut(shell.active_workdesk) {
-                workdesk
-                    .runtime_notice
-                    .get_or_insert_with(|| SharedString::from(format!("axisd sync failed: {error}")));
+                workdesk.runtime_notice.get_or_insert_with(|| {
+                    SharedString::from(format!("axisd sync failed: {error}"))
+                });
             }
         }
 
@@ -2552,7 +2551,11 @@ impl AxisShell {
         loop {
             let candidate = format!("desk-{}", self.next_workdesk_id);
             self.next_workdesk_id = self.next_workdesk_id.saturating_add(1);
-            if !self.workdesks.iter().any(|desk| desk.workdesk_id == candidate) {
+            if !self
+                .workdesks
+                .iter()
+                .any(|desk| desk.workdesk_id == candidate)
+            {
                 return candidate;
             }
         }
@@ -2725,6 +2728,10 @@ impl AxisShell {
         if let Some(workdesk) = self.workdesks.get_mut(self.active_workdesk) {
             workdesk.runtime_notice = Some(SharedString::from(message.into()));
         }
+    }
+
+    fn dismiss_runtime_notice(&mut self) -> bool {
+        dismiss_runtime_notice_for_workdesks(&mut self.workdesks, self.active_workdesk)
     }
 
     fn active_editor_ids(&self) -> Option<(PaneId, SurfaceId)> {
@@ -3351,9 +3358,9 @@ impl AxisShell {
         };
 
         let daemon = DaemonClient::default();
-        let (base_changed, uncommitted) = match daemon.desk_review_summary(&WorktreeId::new(
-            binding.root_path.clone(),
-        )) {
+        let (base_changed, uncommitted) = match daemon
+            .desk_review_summary(&WorktreeId::new(binding.root_path.clone()))
+        {
             Ok(result) => (result.changed_files, result.uncommitted_files),
             Err(_) => {
                 let base_changed = binding
@@ -3468,15 +3475,20 @@ impl AxisShell {
                     ) {
                         Ok(result) => result.binding,
                         Err(_) => match (attach_path, branch) {
-                            (Some(path), base_branch) => WorktreeService::attach(&path, base_branch)
-                                .map_err(|error| error.to_string())?,
+                            (Some(path), base_branch) => {
+                                WorktreeService::attach(&path, base_branch)
+                                    .map_err(|error| error.to_string())?
+                            }
                             (None, Some(branch)) => {
                                 let repo_binding = WorktreeService::attach(&repo_root, None)
                                     .map_err(|error| error.to_string())?;
                                 let worktree_path = default_worktree_path(&repo_root, &branch)?;
                                 if worktree_path.exists() {
-                                    WorktreeService::attach(&worktree_path, Some(repo_binding.branch))
-                                        .map_err(|error| error.to_string())?
+                                    WorktreeService::attach(
+                                        &worktree_path,
+                                        Some(repo_binding.branch),
+                                    )
+                                    .map_err(|error| error.to_string())?
                                 } else {
                                     WorktreeService::create_worktree(
                                         &repo_root,
@@ -3518,8 +3530,7 @@ impl AxisShell {
                 | SharedAutomationRequest::GuiHeartbeat { .. }
                 | SharedAutomationRequest::GuiEnsureRunning { .. }
                 | SharedAutomationRequest::DaemonHealth => Err(
-                    "daemon-only automation requests are not supported by axis-app yet"
-                        .to_string(),
+                    "daemon-only automation requests are not supported by axis-app yet".to_string(),
                 ),
                 SharedAutomationRequest::AgentStart {
                     worktree_id,
@@ -3532,9 +3543,14 @@ impl AxisShell {
                     let requested_surface_id = surface_id;
                     let desk_index = requested_workdesk_id
                         .as_ref()
-                        .map(|workdesk_id| self.resolve_workdesk_index_by_automation_id(&workdesk_id.0))
+                        .map(|workdesk_id| {
+                            self.resolve_workdesk_index_by_automation_id(&workdesk_id.0)
+                        })
                         .transpose()?
-                        .or_else(|| self.resolve_workdesk_index_by_worktree_id(&worktree_id).ok());
+                        .or_else(|| {
+                            self.resolve_workdesk_index_by_worktree_id(&worktree_id)
+                                .ok()
+                        });
                     if let Some(desk_index) = desk_index {
                         let desk_runtime_id = self.workdesks[desk_index].runtime_id;
                         let surface_id = requested_surface_id
@@ -3602,73 +3618,77 @@ impl AxisShell {
                     }))
                 }
                 SharedAutomationRequest::AgentList { worktree_id } => {
-                    let sessions = match DaemonClient::default().list_agents(worktree_id.as_ref()) {
-                        Ok(records) => records,
-                        Err(_) => {
-                            let filter_workdesk_ids = worktree_id
-                                .as_ref()
-                                .map(|id| self.resolve_workdesk_index_by_worktree_id(id))
-                                .transpose()?
-                                .map(|index| {
-                                    vec![
-                                        self.workdesks[index].workdesk_id.clone(),
-                                        self.workdesks[index].runtime_id.to_string(),
-                                    ]
-                                });
-                            self.agent_runtime
-                                .sessions_snapshot()
-                                .into_iter()
-                                .filter(|record| {
-                                    filter_workdesk_ids.as_ref().map_or(true, |workdesk_ids| {
-                                        record.workdesk_id.as_ref().is_some_and(|workdesk_id| {
-                                            workdesk_ids.iter().any(|candidate| candidate == workdesk_id)
+                    let sessions =
+                        match DaemonClient::default().list_agents(worktree_id.as_ref()) {
+                            Ok(records) => records,
+                            Err(_) => {
+                                let filter_workdesk_ids = worktree_id
+                                    .as_ref()
+                                    .map(|id| self.resolve_workdesk_index_by_worktree_id(id))
+                                    .transpose()?
+                                    .map(|index| {
+                                        vec![
+                                            self.workdesks[index].workdesk_id.clone(),
+                                            self.workdesks[index].runtime_id.to_string(),
+                                        ]
+                                    });
+                                self.agent_runtime
+                                    .sessions_snapshot()
+                                    .into_iter()
+                                    .filter(|record| {
+                                        filter_workdesk_ids.as_ref().map_or(true, |workdesk_ids| {
+                                            record.workdesk_id.as_ref().is_some_and(|workdesk_id| {
+                                                workdesk_ids
+                                                    .iter()
+                                                    .any(|candidate| candidate == workdesk_id)
+                                            })
                                         })
                                     })
-                                })
-                                .collect::<Vec<_>>()
+                                    .collect::<Vec<_>>()
+                            }
                         }
-                    }
-                    .into_iter()
-                    .map(|record| agent_session_json(&record))
-                    .collect::<Vec<_>>();
+                        .into_iter()
+                        .map(|record| agent_session_json(&record))
+                        .collect::<Vec<_>>();
                     Ok(Value::Array(sessions))
                 }
                 SharedAutomationRequest::DeskReviewSummary { worktree_id } => {
                     let daemon = DaemonClient::default();
                     let result = daemon.desk_review_summary(&worktree_id).or_else(
                         |_| -> Result<daemon_client::DeskReviewResult, String> {
-                        let binding = WorktreeService::attach(&worktree_id.0, None)
-                            .map_err(|error| error.to_string())?;
-                        let changed_files = binding
-                            .base_branch
-                            .as_deref()
-                            .map(|base_branch| {
-                                WorktreeService::changed_files_since_base(
-                                    &binding.root_path,
-                                    base_branch,
-                                )
-                                .map_err(|error| error.to_string())
-                            })
-                            .transpose()?
-                            .unwrap_or_default();
-                        let uncommitted_files =
-                            WorktreeService::uncommitted_changed_files(&binding.root_path)
+                            let binding = WorktreeService::attach(&worktree_id.0, None)
                                 .map_err(|error| error.to_string())?;
-                        Ok(daemon_client::DeskReviewResult {
-                            worktree_id: worktree_id.clone(),
-                            summary: ReviewSummary {
-                                files_changed: changed_files.len() as u32,
-                                uncommitted_files: uncommitted_files.len() as u32,
-                                ready_for_review: !changed_files.is_empty()
-                                    || !uncommitted_files.is_empty(),
-                                last_inspected_at_ms: Some(unix_time_ms()),
-                            },
-                            changed_files,
-                            uncommitted_files,
-                        })
-                    },
+                            let changed_files = binding
+                                .base_branch
+                                .as_deref()
+                                .map(|base_branch| {
+                                    WorktreeService::changed_files_since_base(
+                                        &binding.root_path,
+                                        base_branch,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                })
+                                .transpose()?
+                                .unwrap_or_default();
+                            let uncommitted_files =
+                                WorktreeService::uncommitted_changed_files(&binding.root_path)
+                                    .map_err(|error| error.to_string())?;
+                            Ok(daemon_client::DeskReviewResult {
+                                worktree_id: worktree_id.clone(),
+                                summary: ReviewSummary {
+                                    files_changed: changed_files.len() as u32,
+                                    uncommitted_files: uncommitted_files.len() as u32,
+                                    ready_for_review: !changed_files.is_empty()
+                                        || !uncommitted_files.is_empty(),
+                                    last_inspected_at_ms: Some(unix_time_ms()),
+                                },
+                                changed_files,
+                                uncommitted_files,
+                            })
+                        },
                     )?;
-                    if let Ok(desk_index) = self.resolve_workdesk_index_by_worktree_id(&worktree_id) {
+                    if let Ok(desk_index) = self.resolve_workdesk_index_by_worktree_id(&worktree_id)
+                    {
                         let binding = self.refresh_worktree_binding_for_desk(desk_index)?;
                         let changed_files =
                             merge_changed_files(&result.changed_files, &result.uncommitted_files);
@@ -3724,11 +3744,14 @@ impl AxisShell {
                             .sessions_snapshot()
                             .into_iter()
                             .filter(|record| {
-                                record.workdesk_id.as_ref().is_some_and(|record_workdesk_id| {
-                                    filter_workdesk_ids
-                                        .iter()
-                                        .any(|candidate| candidate == record_workdesk_id)
-                                })
+                                record
+                                    .workdesk_id
+                                    .as_ref()
+                                    .is_some_and(|record_workdesk_id| {
+                                        filter_workdesk_ids
+                                            .iter()
+                                            .any(|candidate| candidate == record_workdesk_id)
+                                    })
                             })
                             .map(|record| agent_session_json(&record))
                             .collect::<Vec<_>>();
@@ -8247,15 +8270,53 @@ impl Render for AxisShell {
                         .right(px(20.0))
                         .max_w(px(420.0))
                         .px_3()
-                        .py_2()
+                        .py_3()
                         .bg(rgb(0x2a1a1a))
                         .border_1()
                         .border_color(rgb(0x5b3434))
                         .rounded_lg()
                         .shadow_lg()
-                        .text_xs()
-                        .text_color(rgb(0xffd4c7))
-                        .child(notice),
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            if this.dismiss_runtime_notice() {
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .items_start()
+                                .justify_between()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0xff9b88))
+                                                .child("Runtime error"),
+                                        )
+                                        .child(
+                                            div().text_xs().text_color(rgb(0xffd4c7)).child(notice),
+                                        ),
+                                )
+                                .child(control_button(
+                                    "Dismiss",
+                                    rgb(0xffb9ab).into(),
+                                    cx.listener(|this, _, _, cx| {
+                                        if this.dismiss_runtime_notice() {
+                                            cx.notify();
+                                        }
+                                        cx.stop_propagation();
+                                    }),
+                                )),
+                        ),
                 )
             })
             .when_some(workdesk_context_menu, |root, menu| root.child(menu))
@@ -8728,6 +8789,16 @@ fn agent_session_json(record: &AgentSessionRecord) -> Value {
         "attention": record.attention,
         "status_message": record.status_message,
     })
+}
+
+fn dismiss_runtime_notice_for_workdesks(
+    workdesks: &mut [WorkdeskState],
+    active_workdesk: usize,
+) -> bool {
+    workdesks
+        .get_mut(active_workdesk)
+        .and_then(|workdesk| workdesk.runtime_notice.take())
+        .is_some()
 }
 
 fn sanitize_branch_slug(branch: &str) -> String {
@@ -12440,5 +12511,26 @@ mod tests {
             payload["panes"][0]["attention"]["state"],
             Value::String("needs-input".to_string())
         );
+    }
+
+    #[test]
+    fn dismiss_runtime_notice_only_clears_active_workdesk() {
+        let mut workdesks = vec![
+            WorkdeskState::new("Left", "Summary", Vec::new()),
+            WorkdeskState::new("Right", "Summary", Vec::new()),
+        ];
+        workdesks[0].runtime_notice = Some(SharedString::from("left failure"));
+        workdesks[1].runtime_notice = Some(SharedString::from("right failure"));
+
+        assert!(dismiss_runtime_notice_for_workdesks(&mut workdesks, 0));
+        assert!(workdesks[0].runtime_notice.is_none());
+        assert_eq!(
+            workdesks[1]
+                .runtime_notice
+                .as_ref()
+                .map(ToString::to_string),
+            Some("right failure".to_string())
+        );
+        assert!(!dismiss_runtime_notice_for_workdesks(&mut workdesks, 0));
     }
 }

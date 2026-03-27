@@ -24,7 +24,10 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-fn send_request(socket_path: &Path, request: &AutomationRequest) -> anyhow::Result<AutomationResponse> {
+fn send_request(
+    socket_path: &Path,
+    request: &AutomationRequest,
+) -> anyhow::Result<AutomationResponse> {
     let mut stream = UnixStream::connect(socket_path)?;
     let payload = serde_json::to_vec(request)?;
     stream.write_all(&payload)?;
@@ -101,7 +104,8 @@ fn gui_ensure_running_only_launches_when_heartbeat_is_absent_or_stale() {
         .expect("launcher script metadata should exist")
         .permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&launcher_script, permissions).expect("launcher script should be executable");
+    fs::set_permissions(&launcher_script, permissions)
+        .expect("launcher script should be executable");
 
     let _app_bin = EnvVarGuard::set("AXIS_APP_BIN", &launcher_script);
     let _ttl = EnvVarGuard::set("AXIS_GUI_HEARTBEAT_TTL_MS", "25");
@@ -188,7 +192,8 @@ fn gui_ensure_running_does_not_relaunch_before_first_heartbeat_arrives() {
         .expect("launcher script metadata should exist")
         .permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&launcher_script, permissions).expect("launcher script should be executable");
+    fs::set_permissions(&launcher_script, permissions)
+        .expect("launcher script should be executable");
 
     let _app_bin = EnvVarGuard::set("AXIS_APP_BIN", &launcher_script);
     let _ttl = EnvVarGuard::set("AXIS_GUI_HEARTBEAT_TTL_MS", "1000");
@@ -224,7 +229,11 @@ fn gui_ensure_running_does_not_relaunch_before_first_heartbeat_arrives() {
     );
 
     let log = wait_for_log_lines(&launch_log, 1);
-    assert_eq!(log.lines().count(), 1, "expected only one GUI launch before heartbeat");
+    assert_eq!(
+        log.lines().count(),
+        1,
+        "expected only one GUI launch before heartbeat"
+    );
 
     drop(server);
 }

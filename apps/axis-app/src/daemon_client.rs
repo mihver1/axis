@@ -138,14 +138,20 @@ impl DaemonClient {
         })
     }
 
-    pub fn worktree_status(&self, worktree_id: &WorktreeId) -> Result<WorktreeBindingResult, String> {
+    pub fn worktree_status(
+        &self,
+        worktree_id: &WorktreeId,
+    ) -> Result<WorktreeBindingResult, String> {
         self.send_typed_request(AutomationRequest::WorktreeStatus {
             worktree_id: worktree_id.clone(),
         })
     }
 
     #[allow(dead_code)]
-    pub fn list_workdesks(&self, workspace_root: Option<String>) -> Result<Vec<WorkdeskRecord>, String> {
+    pub fn list_workdesks(
+        &self,
+        workspace_root: Option<String>,
+    ) -> Result<Vec<WorkdeskRecord>, String> {
         self.send_typed_request(AutomationRequest::WorkdeskList { workspace_root })
     }
 
@@ -170,7 +176,10 @@ impl DaemonClient {
         })
     }
 
-    pub fn stop_agent(&self, agent_session_id: &AgentSessionId) -> Result<serde_json::Value, String> {
+    pub fn stop_agent(
+        &self,
+        agent_session_id: &AgentSessionId,
+    ) -> Result<serde_json::Value, String> {
         self.send_typed_request(AutomationRequest::AgentStop {
             agent_session_id: agent_session_id.clone(),
         })
@@ -194,7 +203,11 @@ impl DaemonClient {
         })
     }
 
-    pub fn gui_heartbeat(&self, workspace_root: String, gui_pid: u32) -> Result<serde_json::Value, String> {
+    pub fn gui_heartbeat(
+        &self,
+        workspace_root: String,
+        gui_pid: u32,
+    ) -> Result<serde_json::Value, String> {
         self.send_typed_request(AutomationRequest::GuiHeartbeat {
             workspace_root,
             gui_pid,
@@ -210,7 +223,10 @@ impl DaemonClient {
         self.send_typed_request(AutomationRequest::DaemonHealth)
     }
 
-    fn send_typed_request<T: DeserializeOwned>(&self, request: AutomationRequest) -> Result<T, String> {
+    fn send_typed_request<T: DeserializeOwned>(
+        &self,
+        request: AutomationRequest,
+    ) -> Result<T, String> {
         let response = self.send_request(&request)?;
         if !response.ok {
             return Err(response
@@ -220,8 +236,7 @@ impl DaemonClient {
         let result = response
             .result
             .ok_or_else(|| "daemon automation request returned no result".to_string())?;
-        serde_json::from_value(result)
-            .map_err(|error| format!("decode daemon response: {error}"))
+        serde_json::from_value(result).map_err(|error| format!("decode daemon response: {error}"))
     }
 
     fn send_request(&self, request: &AutomationRequest) -> Result<AutomationResponse, String> {
@@ -363,8 +378,8 @@ mod tests {
             .expect("server thread should finish after release signal");
         let _ = std::fs::remove_file(&socket_path);
 
-        let (elapsed, result) = outcome
-            .expect("daemon request should time out instead of blocking indefinitely");
+        let (elapsed, result) =
+            outcome.expect("daemon request should time out instead of blocking indefinitely");
         assert!(
             elapsed < Duration::from_millis(500),
             "daemon request should fail fast, got {elapsed:?}"

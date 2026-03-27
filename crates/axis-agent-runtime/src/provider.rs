@@ -87,7 +87,9 @@ impl ProviderRegistry {
     }
 
     pub fn get(&self, profile_id: &str) -> Option<Arc<dyn AgentProvider>> {
-        self.providers.get(profile_id).map(|entry| entry.provider.clone())
+        self.providers
+            .get(profile_id)
+            .map(|entry| entry.provider.clone())
     }
 
     pub fn metadata(&self, profile_id: &str) -> Option<ProviderProfileMetadata> {

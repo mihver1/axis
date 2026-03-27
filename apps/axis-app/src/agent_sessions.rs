@@ -8,7 +8,8 @@ use std::sync::Mutex;
 use axis_agent_runtime::adapters::codex::CodexProvider;
 use axis_agent_runtime::adapters::process_only::ProcessOnlyProvider;
 use axis_agent_runtime::{
-    ProviderProfileMetadata, ProviderRegistry, SessionManager, StartAgentRequest,
+    provider_base_argv_from_env_or_default, ProviderProfileMetadata, ProviderRegistry,
+    SessionManager, StartAgentRequest,
 };
 use axis_core::agent::{AgentAttention, AgentSessionId, AgentSessionRecord, AgentTransportKind};
 use axis_core::workdesk::WorkdeskId;
@@ -46,19 +47,15 @@ struct BridgeInner {
 impl AgentRuntimeBridge {
     pub fn new() -> Self {
         let mut registry = ProviderRegistry::new();
-        let codex_base_argv = provider_base_argv_from_bin_override(
-            provider_bin_override(CODEX_BIN_ENV).as_deref(),
-            CODEX_PROFILE_ID,
-        );
+        let codex_base_argv =
+            provider_base_argv_from_env_or_default(CODEX_BIN_ENV, CODEX_PROFILE_ID);
         registry.register_with_metadata(
             CODEX_PROFILE_ID,
             std::sync::Arc::new(CodexProvider::with_base_argv(codex_base_argv)),
             None::<String>,
         );
-        let claude_base_argv = provider_base_argv_from_bin_override(
-            provider_bin_override(CLAUDE_CODE_BIN_ENV).as_deref(),
-            CLAUDE_CODE_PROFILE_ID,
-        );
+        let claude_base_argv =
+            provider_base_argv_from_env_or_default(CLAUDE_CODE_BIN_ENV, CLAUDE_CODE_PROFILE_ID);
         registry.register_with_metadata(
             CLAUDE_CODE_PROFILE_ID,
             std::sync::Arc::new(ProcessOnlyProvider::with_base_argv(
@@ -280,7 +277,9 @@ impl AgentRuntimeBridge {
             .map(|record| (record.id.clone(), record))
             .collect::<HashMap<_, _>>();
         for record in guard.daemon_records.values() {
-            sessions.entry(record.id.clone()).or_insert_with(|| record.clone());
+            sessions
+                .entry(record.id.clone())
+                .or_insert_with(|| record.clone());
         }
         sessions.into_values().collect()
     }
@@ -314,19 +313,15 @@ impl AgentRuntimeBridge {
                 .into_iter()
                 .map(|record| (record.id.clone(), record))
                 .collect();
-            let daemon_ids = guard
-                .daemon_records
-                .keys()
-                .cloned()
-                .collect::<HashSet<_>>();
+            let daemon_ids = guard.daemon_records.keys().cloned().collect::<HashSet<_>>();
             let local_ids = guard
                 .manager
                 .sessions()
                 .map(|record| record.id.clone())
                 .collect::<HashSet<_>>();
-            guard
-                .surface_to_session
-                .retain(|_, existing| daemon_ids.contains(existing) || local_ids.contains(existing));
+            guard.surface_to_session.retain(|_, existing| {
+                daemon_ids.contains(existing) || local_ids.contains(existing)
+            });
             guard.daemon_revision = guard.daemon_revision.wrapping_add(1);
             return Ok(());
         }
@@ -398,40 +393,5 @@ impl AgentRuntimeBridge {
 impl Default for AgentRuntimeBridge {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn provider_bin_override(env_name: &str) -> Option<String> {
-    std::env::var(env_name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn provider_base_argv_from_bin_override(
-    bin_override: Option<&str>,
-    default_binary: &str,
-) -> Vec<String> {
-    vec![bin_override.unwrap_or(default_binary).to_string()]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::provider_base_argv_from_bin_override;
-
-    #[test]
-    fn provider_base_argv_prefers_override_binary() {
-        assert_eq!(
-            provider_base_argv_from_bin_override(Some("/tmp/codex-demo"), "codex"),
-            vec!["/tmp/codex-demo".to_string()]
-        );
-    }
-
-    #[test]
-    fn provider_base_argv_falls_back_to_default_binary() {
-        assert_eq!(
-            provider_base_argv_from_bin_override(None, "claude-code"),
-            vec!["claude-code".to_string()]
-        );
     }
 }

@@ -21,18 +21,14 @@ pub enum AutomationRequest {
         attach_path: Option<String>,
     },
     #[serde(rename = "worktree.status")]
-    WorktreeStatus {
-        worktree_id: WorktreeId,
-    },
+    WorktreeStatus { worktree_id: WorktreeId },
     #[serde(rename = "workdesk.list")]
     WorkdeskList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_root: Option<String>,
     },
     #[serde(rename = "workdesk.ensure")]
-    WorkdeskEnsure {
-        record: WorkdeskRecord,
-    },
+    WorkdeskEnsure { record: WorkdeskRecord },
     #[serde(rename = "agent.start")]
     AgentStart {
         worktree_id: WorktreeId,
@@ -76,18 +72,14 @@ pub enum AutomationRequest {
         terminal_session_id: TerminalSessionId,
     },
     #[serde(rename = "agent.stop")]
-    AgentStop {
-        agent_session_id: AgentSessionId,
-    },
+    AgentStop { agent_session_id: AgentSessionId },
     #[serde(rename = "agent.list")]
     AgentList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktree_id: Option<WorktreeId>,
     },
     #[serde(rename = "review.summary")]
-    DeskReviewSummary {
-        worktree_id: WorktreeId,
-    },
+    DeskReviewSummary { worktree_id: WorktreeId },
     #[serde(rename = "attention.next")]
     AttentionNext {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,9 +96,7 @@ pub enum AutomationRequest {
         gui_pid: u32,
     },
     #[serde(rename = "gui.ensure_running")]
-    GuiEnsureRunning {
-        workspace_root: String,
-    },
+    GuiEnsureRunning { workspace_root: String },
     #[serde(rename = "daemon.health")]
     DaemonHealth,
 }

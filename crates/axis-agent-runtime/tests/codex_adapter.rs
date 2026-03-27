@@ -86,9 +86,7 @@ fn codex_adapter_needs_review_sets_waiting_and_attention() {
 
 #[test]
 fn codex_adapter_unexpected_exit_emits_failed() {
-    let mut mgr = SessionManager::new(codex_registry_sh_c(
-        "/bin/echo 'AXIS_STATUS oops'; exit 1",
-    ));
+    let mut mgr = SessionManager::new(codex_registry_sh_c("/bin/echo 'AXIS_STATUS oops'; exit 1"));
     let id = mgr
         .start_session(StartAgentRequest {
             cwd: "/".into(),

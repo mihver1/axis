@@ -92,11 +92,9 @@ impl AgentProvider for ProcessOnlyProvider {
                 .inner
                 .lock()
                 .map_err(|e| anyhow::anyhow!("{} provider lock poisoned: {e}", self.profile_id))?;
-            guard
-                .sessions
-                .get(session_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("unknown {} session {}", self.profile_id, session_id.0))?
+            guard.sessions.get(session_id).cloned().ok_or_else(|| {
+                anyhow::anyhow!("unknown {} session {}", self.profile_id, session_id.0)
+            })?
         };
 
         let mut session = slot
@@ -142,10 +140,9 @@ impl AgentProvider for ProcessOnlyProvider {
                 .inner
                 .lock()
                 .map_err(|e| anyhow::anyhow!("{} provider lock poisoned: {e}", self.profile_id))?;
-            guard
-                .sessions
-                .remove(session_id)
-                .ok_or_else(|| anyhow::anyhow!("unknown {} session {}", self.profile_id, session_id.0))?
+            guard.sessions.remove(session_id).ok_or_else(|| {
+                anyhow::anyhow!("unknown {} session {}", self.profile_id, session_id.0)
+            })?
         };
 
         let process = {

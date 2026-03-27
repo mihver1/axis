@@ -121,10 +121,7 @@ fn parse_cli(args: Vec<String>) -> Result<CliOptions, String> {
         let params = parse_key_value_args(&args[cursor..])?;
         request_from_method_and_params(command, Value::Object(params))?
     } else {
-        return Err(format!(
-            "unknown command `{command}`\n\n{}",
-            help_text()
-        ));
+        return Err(format!("unknown command `{command}`\n\n{}", help_text()));
     };
 
     Ok(CliOptions {
@@ -168,12 +165,14 @@ fn request_from_alias(alias: CommandAlias, args: &[String]) -> Result<Automation
             }
         }
         CommandAlias::WorktreeStatus => {
-            let worktree_id = WorktreeId::new(take_required_string_param(&mut params, "worktree_id")?);
+            let worktree_id =
+                WorktreeId::new(take_required_string_param(&mut params, "worktree_id")?);
             ensure_no_unknown_params(&params, "worktree-status")?;
             AutomationRequest::WorktreeStatus { worktree_id }
         }
         CommandAlias::StartAgent => {
-            let worktree_id = WorktreeId::new(take_required_string_param(&mut params, "worktree_id")?);
+            let worktree_id =
+                WorktreeId::new(take_required_string_param(&mut params, "worktree_id")?);
             let provider_profile_id =
                 take_required_string_param(&mut params, "provider_profile_id")?;
             let argv = take_string_vec_param(&mut params, "argv")?;
@@ -193,13 +192,14 @@ fn request_from_alias(alias: CommandAlias, args: &[String]) -> Result<Automation
             AutomationRequest::AgentStop { agent_session_id }
         }
         CommandAlias::ListAgents => {
-            let worktree_id = take_optional_string_param(&mut params, "worktree_id")?
-                .map(WorktreeId::new);
+            let worktree_id =
+                take_optional_string_param(&mut params, "worktree_id")?.map(WorktreeId::new);
             ensure_no_unknown_params(&params, "list-agents")?;
             AutomationRequest::AgentList { worktree_id }
         }
         CommandAlias::Review => {
-            let worktree_id = WorktreeId::new(take_required_string_param(&mut params, "worktree_id")?);
+            let worktree_id =
+                WorktreeId::new(take_required_string_param(&mut params, "worktree_id")?);
             ensure_no_unknown_params(&params, "review")?;
             AutomationRequest::DeskReviewSummary { worktree_id }
         }
@@ -219,7 +219,10 @@ fn request_from_alias(alias: CommandAlias, args: &[String]) -> Result<Automation
     Ok(request)
 }
 
-fn request_from_method_and_params(method: &str, params: Value) -> Result<AutomationRequest, String> {
+fn request_from_method_and_params(
+    method: &str,
+    params: Value,
+) -> Result<AutomationRequest, String> {
     let request_with_params = json!({
         "method": method,
         "params": params,
@@ -327,18 +330,25 @@ fn take_optional_string_param(
     }
 }
 
-fn take_string_vec_param(params: &mut Map<String, Value>, key: &str) -> Result<Vec<String>, String> {
+fn take_string_vec_param(
+    params: &mut Map<String, Value>,
+    key: &str,
+) -> Result<Vec<String>, String> {
     match params.remove(key) {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(values)) => values
             .into_iter()
             .map(|value| match value {
                 Value::String(value) => Ok(value),
-                other => Err(format!("expected `{key}` entries to be strings, got {other}")),
+                other => Err(format!(
+                    "expected `{key}` entries to be strings, got {other}"
+                )),
             })
             .collect(),
         Some(Value::String(value)) => Ok(vec![value]),
-        Some(other) => Err(format!("expected `{key}` to be a string array, got {other}")),
+        Some(other) => Err(format!(
+            "expected `{key}` to be a string array, got {other}"
+        )),
     }
 }
 
@@ -451,13 +461,19 @@ mod tests {
     #[test]
     fn default_socket_path_prefers_explicit_override() {
         let override_path = PathBuf::from("/tmp/axis-smoke-demo.sock");
-        assert_eq!(default_socket_path_for(Some(override_path.clone())), override_path);
+        assert_eq!(
+            default_socket_path_for(Some(override_path.clone())),
+            override_path
+        );
     }
 
     #[test]
     fn resolves_aliases() {
         assert_eq!(resolve_command_alias("state"), Some(CommandAlias::State));
-        assert_eq!(resolve_command_alias("worktree"), Some(CommandAlias::Worktree));
+        assert_eq!(
+            resolve_command_alias("worktree"),
+            Some(CommandAlias::Worktree)
+        );
         assert_eq!(
             resolve_command_alias("worktree-status"),
             Some(CommandAlias::WorktreeStatus)
@@ -466,7 +482,10 @@ mod tests {
             resolve_command_alias("start-agent"),
             Some(CommandAlias::StartAgent)
         );
-        assert_eq!(resolve_command_alias("ensure-gui"), Some(CommandAlias::EnsureGui));
+        assert_eq!(
+            resolve_command_alias("ensure-gui"),
+            Some(CommandAlias::EnsureGui)
+        );
         assert_eq!(resolve_command_alias("unknown"), None);
     }
 
@@ -615,8 +634,7 @@ mod tests {
             }
         );
 
-        let list = parse_cli(vec!["list-agents".to_string()])
-            .expect("list alias should parse");
+        let list = parse_cli(vec!["list-agents".to_string()]).expect("list alias should parse");
         assert_eq!(
             list.request,
             AutomationRequest::AgentList { worktree_id: None }

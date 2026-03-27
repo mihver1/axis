@@ -15,7 +15,9 @@ mod transcript_store;
 
 use axis_core::{
     automation::{AutomationRequest, AutomationResponse},
-    terminal::{TerminalSessionId, TerminalSessionRecord, TerminalSurfaceKind, TerminalTranscriptChunk},
+    terminal::{
+        TerminalSessionId, TerminalSessionRecord, TerminalSurfaceKind, TerminalTranscriptChunk,
+    },
     workdesk::WorkdeskId,
     SurfaceId,
 };
@@ -56,7 +58,9 @@ fn wait_for_transcript_text(
         )
         .expect("terminal read should succeed");
         assert!(response.ok);
-        let payload = response.result.expect("terminal read should return payload");
+        let payload = response
+            .result
+            .expect("terminal read should return payload");
         let chunk = payload
             .get("chunk")
             .cloned()
@@ -118,7 +122,9 @@ fn daemon_terminal_requests_spawn_write_read_and_close() {
     .expect("terminal ensure should succeed");
     assert!(ensure.ok);
     let record: TerminalSessionRecord = serde_json::from_value(
-        ensure.result.expect("terminal ensure should return a record"),
+        ensure
+            .result
+            .expect("terminal ensure should return a record"),
     )
     .expect("terminal ensure result should decode");
 
@@ -171,7 +177,9 @@ fn daemon_terminal_reuses_session_for_same_surface_after_reconnect() {
     .expect("first ensure should succeed");
     assert!(first_ensure.ok);
     let first_record: TerminalSessionRecord = serde_json::from_value(
-        first_ensure.result.expect("first ensure should return a record"),
+        first_ensure
+            .result
+            .expect("first ensure should return a record"),
     )
     .expect("first ensure should decode");
 
@@ -184,7 +192,8 @@ fn daemon_terminal_reuses_session_for_same_surface_after_reconnect() {
     )
     .expect("first write should succeed");
     assert!(write_first.ok);
-    let offset = wait_for_transcript_text(&socket_path, &first_record.terminal_session_id, 0, "alpha");
+    let offset =
+        wait_for_transcript_text(&socket_path, &first_record.terminal_session_id, 0, "alpha");
 
     let second_ensure = send_request(
         &socket_path,
@@ -201,12 +210,13 @@ fn daemon_terminal_reuses_session_for_same_surface_after_reconnect() {
     .expect("second ensure should succeed");
     assert!(second_ensure.ok);
     let second_record: TerminalSessionRecord = serde_json::from_value(
-        second_ensure.result.expect("second ensure should return a record"),
+        second_ensure
+            .result
+            .expect("second ensure should return a record"),
     )
     .expect("second ensure should decode");
     assert_eq!(
-        second_record.terminal_session_id,
-        first_record.terminal_session_id,
+        second_record.terminal_session_id, first_record.terminal_session_id,
         "same workdesk/surface should reattach to existing daemon terminal",
     );
 
@@ -240,7 +250,12 @@ fn daemon_terminal_reuses_session_for_same_surface_after_reconnect() {
     )
     .expect("second write should succeed");
     assert!(write_second.ok);
-    let _ = wait_for_transcript_text(&socket_path, &second_record.terminal_session_id, offset, "beta");
+    let _ = wait_for_transcript_text(
+        &socket_path,
+        &second_record.terminal_session_id,
+        offset,
+        "beta",
+    );
 
     let close = send_request(
         &socket_path,

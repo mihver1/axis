@@ -34,7 +34,10 @@ impl WorktreeService {
     }
 
     /// Treats `path` as an existing worktree (or repo) and reads current branch and status.
-    pub fn attach(path: impl AsRef<Path>, base_branch: Option<String>) -> anyhow::Result<WorktreeBinding> {
+    pub fn attach(
+        path: impl AsRef<Path>,
+        base_branch: Option<String>,
+    ) -> anyhow::Result<WorktreeBinding> {
         Self::inspect(path.as_ref(), base_branch)
     }
 
@@ -77,7 +80,9 @@ impl WorktreeService {
         let branch = git_output(root, &["rev-parse", "--abbrev-ref", "HEAD"])?
             .trim()
             .to_string();
-        let dirty = !git_output(root, &["status", "--porcelain"])?.trim().is_empty();
+        let dirty = !git_output(root, &["status", "--porcelain"])?
+            .trim()
+            .is_empty();
         let (ahead, behind) = match base_branch.as_deref() {
             Some(base) => parse_ahead_behind(root, base)?,
             None => (0, 0),

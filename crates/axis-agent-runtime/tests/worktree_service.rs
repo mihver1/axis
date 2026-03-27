@@ -19,10 +19,7 @@ fn run_git(repo: &Path, args: &[&str]) {
 
 fn init_repo_with_main(repo: &Path) {
     run_git(repo, &["init", "-b", "main"]);
-    run_git(
-        repo,
-        &["config", "user.email", "axis-test@example.com"],
-    );
+    run_git(repo, &["config", "user.email", "axis-test@example.com"]);
     run_git(repo, &["config", "user.name", "axis test"]);
     fs::write(repo.join("README.md"), "hello\n").unwrap();
     run_git(repo, &["add", "README.md"]);

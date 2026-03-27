@@ -38,13 +38,17 @@ impl DaemonPtySession {
                 HostReadEvent::Bytes(bytes) => {
                     if let Err(error) = transcripts.append(&thread_session_id, &bytes) {
                         thread_closed.store(true, Ordering::SeqCst);
-                        *thread_status.lock().expect("pty host status mutex poisoned") =
+                        *thread_status
+                            .lock()
+                            .expect("pty host status mutex poisoned") =
                             Some(format!("transcript append failed: {error}"));
                     }
                 }
                 HostReadEvent::Closed(message) | HostReadEvent::Error(message) => {
                     thread_closed.store(true, Ordering::SeqCst);
-                    *thread_status.lock().expect("pty host status mutex poisoned") = Some(message);
+                    *thread_status
+                        .lock()
+                        .expect("pty host status mutex poisoned") = Some(message);
                 }
             }
         })?;

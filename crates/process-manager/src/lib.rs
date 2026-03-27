@@ -180,7 +180,8 @@ impl RunningProcess {
         match self.inner.as_ref() {
             RunningProcessInner::Pty { writer, .. } | RunningProcessInner::Stdio { writer, .. } => {
                 let mut w = writer.lock().expect("process writer mutex poisoned");
-                w.write_all(bytes).context("failed to write to process stdin")?;
+                w.write_all(bytes)
+                    .context("failed to write to process stdin")?;
                 w.flush().context("failed to flush process stdin")?;
                 Ok(())
             }
@@ -209,7 +210,8 @@ impl RunningProcess {
                 .context("failed to terminate PTY child process"),
             RunningProcessInner::Stdio { child, .. } => {
                 let mut c = child.lock().expect("stdio child mutex poisoned");
-                c.kill().context("failed to terminate stdio child process")?;
+                c.kill()
+                    .context("failed to terminate stdio child process")?;
                 Ok(())
             }
         }
@@ -411,7 +413,10 @@ fn spawn_stdio_process(spec: &ProcessLaunchSpec) -> Result<SpawnedProcess> {
 }
 
 /// Spawns using [`ProcessLaunchSpec`]: PTY when `use_pty`, otherwise piped stdio (non-blocking stdout on Unix).
-pub fn spawn_process_launch(spec: &ProcessLaunchSpec, grid: TerminalGridSize) -> Result<SpawnedProcess> {
+pub fn spawn_process_launch(
+    spec: &ProcessLaunchSpec,
+    grid: TerminalGridSize,
+) -> Result<SpawnedProcess> {
     if spec.use_pty {
         spawn_pty_process(spec, grid)
     } else {
