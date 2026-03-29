@@ -12,7 +12,7 @@ The script:
 3. wires deterministic demo wrappers for `codex` and `claude-code` into the daemon;
 4. creates/attaches two worktrees and records daemon-side workdesk metadata;
 5. starts the canonical `codex` provider and the `claude-code` baseline;
-6. validates GUI heartbeat, daemon workdesk registry, and review-ready runtime state.
+6. validates GUI heartbeat, daemon workdesk registry, and structured review payload state.
 
 Environment overrides:
   AXIS_SMOKE_CODEX_BRANCH       default: axis-smoke-codex
@@ -368,7 +368,7 @@ log "Confirming codex attention while its desk is unfocused"
 axis_cli start-agent "worktree_id=$codex_worktree_id" "provider_profile_id=codex" >/dev/null
 codex_agents_json="$(wait_for_agent_state "$codex_worktree_id" "codex" "waiting" "needs_review")"
 
-log "Fetching review summary"
+log "Fetching review payload"
 review_json="$(axis_cli review "worktree_id=$codex_worktree_id")"
 
 GUI_JSON="$gui_json" \
@@ -395,6 +395,11 @@ import sys
 gui = json.loads(os.environ["GUI_JSON"])
 workdesks = json.loads(os.environ["WORKDESKS_JSON"])
 review = json.loads(os.environ["REVIEW_JSON"])
+review_summary = review.get("summary") or {}
+review_files = review.get("files") or []
+review_ready = bool(review_summary.get("ready_for_review", False))
+files_changed = int(review_summary.get("files_changed", 0))
+uncommitted_files = int(review_summary.get("uncommitted_files", 0))
 codex_agents = json.loads(os.environ["CODEX_AGENTS_JSON"])
 claude_agents = json.loads(os.environ["CLAUDE_AGENTS_JSON"])
 codex_worktree_id = os.environ["CODEX_WORKTREE_ID"]
@@ -429,12 +434,14 @@ if codex_session["lifecycle"] != "waiting" or codex_session["attention"] != "nee
     fail("codex session did not reach waiting/needs_review")
 if claude_session["lifecycle"] != "running" or claude_session["attention"] != "quiet":
     fail("claude-code baseline did not remain running/quiet")
-if not review["summary"]["ready_for_review"]:
-    fail("review summary did not become ready_for_review")
+if files_changed < 1:
+    fail("review payload did not report any changed files")
+if uncommitted_files < 1:
+    fail("review payload did not report the generated uncommitted change")
 
-changed = set(review.get("changed_files", [])) | set(review.get("uncommitted_files", []))
+changed = {entry.get("path") for entry in review_files if entry.get("path")}
 if review_file_name not in changed:
-    fail(f"review summary did not include {review_file_name}")
+    fail(f"review payload did not include {review_file_name}")
 
 summary = [
     "[smoke-acp] ACP smoke demo passed.",
@@ -450,7 +457,11 @@ summary = [
     f"[smoke-acp] Claude baseline: {claude_session['attention']} ({claude_session['lifecycle']})",
     f"[smoke-acp] GUI heartbeat observed: launched={json.dumps(gui['launched'])}",
     f"[smoke-acp] Daemon workdesks: codex={codex_desk['workdesk_id']} claude={claude_desk['workdesk_id']}",
-    f"[smoke-acp] Review ready: {json.dumps(review['summary']['ready_for_review'])} changed={len(changed)}",
+    "[smoke-acp] Review payload: "
+    f"ready={json.dumps(review_ready)} "
+    f"files_changed={json.dumps(files_changed)} "
+    f"uncommitted={json.dumps(uncommitted_files)} "
+    f"visible={len(changed)}",
 ]
 
 if os.environ["KEEP_APP"] == "1":

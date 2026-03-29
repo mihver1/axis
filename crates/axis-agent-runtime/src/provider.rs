@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use axis_core::agent::{AgentSessionId, AgentTransportKind};
+use axis_core::agent_history::{AgentApprovalRequestId, AgentSessionCapabilities};
 
 use crate::events::RuntimeEvent;
 
@@ -27,6 +28,25 @@ pub struct StartedSession {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SendTurnRequest {
+    pub session_id: AgentSessionId,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RespondApprovalRequest {
+    pub session_id: AgentSessionId,
+    pub approval_request_id: AgentApprovalRequestId,
+    pub approved: bool,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeRequest {
+    pub session_id: AgentSessionId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderProfileMetadata {
     pub profile_id: String,
     pub capability_note: Option<String>,
@@ -41,6 +61,31 @@ pub trait AgentProvider: Send + Sync {
     fn start(&self, req: StartAgentRequest) -> anyhow::Result<StartedSession>;
 
     fn poll_events(&self, session_id: &AgentSessionId) -> anyhow::Result<Vec<RuntimeEvent>>;
+
+    fn capabilities(&self) -> AgentSessionCapabilities {
+        AgentSessionCapabilities::default()
+    }
+
+    fn send_turn(&self, req: SendTurnRequest) -> anyhow::Result<Vec<RuntimeEvent>> {
+        Err(anyhow!(
+            "provider does not support structured turn input for session {}",
+            req.session_id.0
+        ))
+    }
+
+    fn respond_approval(&self, req: RespondApprovalRequest) -> anyhow::Result<Vec<RuntimeEvent>> {
+        Err(anyhow!(
+            "provider does not support approval responses for session {}",
+            req.session_id.0
+        ))
+    }
+
+    fn resume(&self, req: ResumeRequest) -> anyhow::Result<Vec<RuntimeEvent>> {
+        Err(anyhow!(
+            "provider does not support resume actions for session {}",
+            req.session_id.0
+        ))
+    }
 
     /// Tears down the provider-side session (signals subprocess, closes channels, etc.).
     fn stop(&self, session_id: &AgentSessionId) -> anyhow::Result<()>;

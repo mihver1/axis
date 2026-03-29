@@ -1,18 +1,24 @@
 //! Session registry, lifecycle/attention transitions, and UI revision counter.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionId, AgentSessionRecord};
+use axis_core::agent_history::{
+    AgentApprovalRequest, AgentApprovalRequestId, AgentApprovalState, AgentSessionDetail,
+    AgentTimelineEntry, AgentToolCall, AgentTurn,
+};
 
 use crate::events::RuntimeEvent;
 use crate::provider::{
-    validate_start_request, ProviderProfileMetadata, ProviderRegistry, StartAgentRequest,
+    validate_start_request, ProviderProfileMetadata, ProviderRegistry, RespondApprovalRequest,
+    ResumeRequest, SendTurnRequest, StartAgentRequest,
 };
 
-/// Owns agent session records, provider lookup, and monotonic revision for UI refresh.
+/// Owns agent session records, structured detail, provider lookup, and monotonic revision for UI refresh.
 pub struct SessionManager {
-    sessions: HashMap<AgentSessionId, AgentSessionRecord>,
+    sessions: HashMap<AgentSessionId, AgentSessionDetail>,
     registry: ProviderRegistry,
     revision: u64,
 }
@@ -31,11 +37,15 @@ impl SessionManager {
     }
 
     pub fn session(&self, id: &AgentSessionId) -> Option<&AgentSessionRecord> {
+        self.sessions.get(id).map(|detail| &detail.session)
+    }
+
+    pub fn session_detail(&self, id: &AgentSessionId) -> Option<&AgentSessionDetail> {
         self.sessions.get(id)
     }
 
     pub fn sessions(&self) -> impl Iterator<Item = &AgentSessionRecord> {
-        self.sessions.values()
+        self.sessions.values().map(|detail| &detail.session)
     }
 
     pub fn provider_profile(&self, profile_id: &str) -> Option<ProviderProfileMetadata> {
@@ -68,74 +78,81 @@ impl SessionManager {
             attention: AgentAttention::Quiet,
             status_message: String::new(),
         };
-        self.sessions.insert(id.clone(), record);
+        let now = now_ms();
+        self.sessions.insert(
+            id.clone(),
+            AgentSessionDetail {
+                session: record,
+                capabilities: provider.capabilities(),
+                started_at_ms: now,
+                updated_at_ms: now,
+                completed_at_ms: None,
+                revision: 0,
+                history_cursor: 0,
+                pending_approval_id: None,
+                timeline: Vec::new(),
+                truncated: false,
+            },
+        );
         self.bump_revision();
         Ok(id)
     }
 
-    /// Applies provider events, updating lifecycle, attention, and status text.
+    /// Applies provider events, updating lifecycle, attention, status text, and structured timeline entries.
     pub fn apply_events(
         &mut self,
         events: impl IntoIterator<Item = RuntimeEvent>,
     ) -> anyhow::Result<()> {
         for event in events {
-            match event {
-                RuntimeEvent::Lifecycle {
-                    session_id,
-                    lifecycle,
-                } => {
-                    let record = self
-                        .sessions
-                        .get_mut(&session_id)
-                        .with_context(|| format!("unknown session {}", session_id.0))?;
-                    record.lifecycle = lifecycle;
-                    self.bump_revision();
-                }
-                RuntimeEvent::Attention {
-                    session_id,
-                    attention,
-                } => {
-                    let record = self
-                        .sessions
-                        .get_mut(&session_id)
-                        .with_context(|| format!("unknown session {}", session_id.0))?;
-                    record.attention = attention;
-                    self.bump_revision();
-                }
-                RuntimeEvent::Status {
-                    session_id,
-                    message,
-                } => {
-                    let record = self
-                        .sessions
-                        .get_mut(&session_id)
-                        .with_context(|| format!("unknown session {}", session_id.0))?;
-                    record.status_message = message;
-                    self.bump_revision();
-                }
-            }
+            self.apply_event(event)?;
         }
         Ok(())
     }
 
     /// Polls the provider registered for the session’s profile and applies emitted events.
     pub fn poll_provider(&mut self, session_id: &AgentSessionId) -> anyhow::Result<()> {
-        let profile_id = self
-            .session(session_id)
-            .map(|s| s.provider_profile_id.clone())
-            .with_context(|| format!("unknown session {}", session_id.0))?;
-        let provider = self.registry.require(&profile_id)?;
+        let provider = self.provider_for_session(session_id)?;
         let events = provider.poll_events(session_id)?;
+        self.apply_events(events)
+    }
+
+    pub fn send_turn(&mut self, session_id: &AgentSessionId, text: &str) -> anyhow::Result<()> {
+        let provider = self.provider_for_session(session_id)?;
+        let events = provider.send_turn(SendTurnRequest {
+            session_id: session_id.clone(),
+            text: text.to_string(),
+        })?;
+        self.apply_events(events)
+    }
+
+    pub fn respond_approval(
+        &mut self,
+        session_id: &AgentSessionId,
+        approval_request_id: &AgentApprovalRequestId,
+        approved: bool,
+        note: Option<String>,
+    ) -> anyhow::Result<()> {
+        let provider = self.provider_for_session(session_id)?;
+        let events = provider.respond_approval(RespondApprovalRequest {
+            session_id: session_id.clone(),
+            approval_request_id: approval_request_id.clone(),
+            approved,
+            note,
+        })?;
+        self.apply_events(events)
+    }
+
+    pub fn resume(&mut self, session_id: &AgentSessionId) -> anyhow::Result<()> {
+        let provider = self.provider_for_session(session_id)?;
+        let events = provider.resume(ResumeRequest {
+            session_id: session_id.clone(),
+        })?;
         self.apply_events(events)
     }
 
     /// Stops the provider-backed session, then drops the local record.
     pub fn stop_session(&mut self, session_id: &AgentSessionId) -> anyhow::Result<()> {
-        let profile_id = self
-            .session(session_id)
-            .map(|s| s.provider_profile_id.clone())
-            .with_context(|| format!("unknown session {}", session_id.0))?;
-        let provider = self.registry.require(&profile_id)?;
+        let provider = self.provider_for_session(session_id)?;
         provider.stop(session_id)?;
         self.sessions
             .remove(session_id)
@@ -150,16 +167,10 @@ impl SessionManager {
         session_id: &AgentSessionId,
         lifecycle: AgentLifecycle,
     ) -> anyhow::Result<()> {
-        let record = self
-            .sessions
-            .get_mut(session_id)
-            .with_context(|| format!("unknown session {}", session_id.0))?;
-        if record.lifecycle == lifecycle {
-            return Ok(());
-        }
-        record.lifecycle = lifecycle;
-        self.bump_revision();
-        Ok(())
+        self.apply_events([RuntimeEvent::Lifecycle {
+            session_id: session_id.clone(),
+            lifecycle,
+        }])
     }
 
     /// Local attention transition; bumps revision when the state changes.
@@ -168,21 +179,249 @@ impl SessionManager {
         session_id: &AgentSessionId,
         attention: AgentAttention,
     ) -> anyhow::Result<()> {
-        let record = self
-            .sessions
-            .get_mut(session_id)
-            .with_context(|| format!("unknown session {}", session_id.0))?;
-        if record.attention == attention {
-            return Ok(());
+        self.apply_events([RuntimeEvent::Attention {
+            session_id: session_id.clone(),
+            attention,
+        }])
+    }
+
+    fn apply_event(&mut self, event: RuntimeEvent) -> anyhow::Result<()> {
+        match event {
+            RuntimeEvent::Lifecycle {
+                session_id,
+                lifecycle,
+            } => {
+                let changed = {
+                    let detail = self
+                        .sessions
+                        .get_mut(&session_id)
+                        .with_context(|| format!("unknown session {}", session_id.0))?;
+                    if detail.session.lifecycle == lifecycle {
+                        false
+                    } else {
+                        detail.session.lifecycle = lifecycle;
+                        detail.updated_at_ms = now_ms().or(detail.updated_at_ms);
+                        detail.completed_at_ms =
+                            is_terminal_lifecycle(lifecycle).then(now_ms).flatten();
+                        detail.revision = detail.revision.wrapping_add(1);
+                        true
+                    }
+                };
+                if changed {
+                    self.bump_revision();
+                }
+            }
+            RuntimeEvent::Attention {
+                session_id,
+                attention,
+            } => {
+                let changed = {
+                    let detail = self
+                        .sessions
+                        .get_mut(&session_id)
+                        .with_context(|| format!("unknown session {}", session_id.0))?;
+                    if detail.session.attention == attention {
+                        false
+                    } else {
+                        detail.session.attention = attention;
+                        detail.updated_at_ms = now_ms().or(detail.updated_at_ms);
+                        detail.revision = detail.revision.wrapping_add(1);
+                        true
+                    }
+                };
+                if changed {
+                    self.bump_revision();
+                }
+            }
+            RuntimeEvent::Status {
+                session_id,
+                message,
+            } => {
+                let changed = {
+                    let detail = self
+                        .sessions
+                        .get_mut(&session_id)
+                        .with_context(|| format!("unknown session {}", session_id.0))?;
+                    if detail.session.status_message == message {
+                        false
+                    } else {
+                        detail.session.status_message = message;
+                        detail.updated_at_ms = now_ms().or(detail.updated_at_ms);
+                        detail.revision = detail.revision.wrapping_add(1);
+                        true
+                    }
+                };
+                if changed {
+                    self.bump_revision();
+                }
+            }
+            RuntimeEvent::Turn { session_id, turn } => {
+                let changed = {
+                    let detail = self
+                        .sessions
+                        .get_mut(&session_id)
+                        .with_context(|| format!("unknown session {}", session_id.0))?;
+                    let changed = upsert_turn(detail, turn);
+                    if changed {
+                        detail.updated_at_ms = now_ms().or(detail.updated_at_ms);
+                        detail.revision = detail.revision.wrapping_add(1);
+                    }
+                    changed
+                };
+                if changed {
+                    self.bump_revision();
+                }
+            }
+            RuntimeEvent::ToolCall {
+                session_id,
+                tool_call,
+            } => {
+                let changed = {
+                    let detail = self
+                        .sessions
+                        .get_mut(&session_id)
+                        .with_context(|| format!("unknown session {}", session_id.0))?;
+                    let changed = upsert_tool_call(detail, tool_call);
+                    if changed {
+                        detail.updated_at_ms = now_ms().or(detail.updated_at_ms);
+                        detail.revision = detail.revision.wrapping_add(1);
+                    }
+                    changed
+                };
+                if changed {
+                    self.bump_revision();
+                }
+            }
+            RuntimeEvent::ApprovalRequest {
+                session_id,
+                approval,
+            } => {
+                let changed = {
+                    let detail = self
+                        .sessions
+                        .get_mut(&session_id)
+                        .with_context(|| format!("unknown session {}", session_id.0))?;
+                    let changed = upsert_approval(detail, approval);
+                    if changed {
+                        recompute_pending_approval_id(detail);
+                        detail.updated_at_ms = now_ms().or(detail.updated_at_ms);
+                        detail.revision = detail.revision.wrapping_add(1);
+                    }
+                    changed
+                };
+                if changed {
+                    self.bump_revision();
+                }
+            }
         }
-        record.attention = attention;
-        self.bump_revision();
         Ok(())
+    }
+
+    fn provider_for_session(
+        &self,
+        session_id: &AgentSessionId,
+    ) -> anyhow::Result<std::sync::Arc<dyn crate::provider::AgentProvider>> {
+        let profile_id = self
+            .session(session_id)
+            .map(|s| s.provider_profile_id.clone())
+            .with_context(|| format!("unknown session {}", session_id.0))?;
+        self.registry.require(&profile_id)
     }
 
     fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
     }
+}
+
+fn upsert_turn(detail: &mut AgentSessionDetail, turn: AgentTurn) -> bool {
+    if let Some(existing) = detail.timeline.iter_mut().find_map(|entry| match entry {
+        AgentTimelineEntry::Turn {
+            sequence: _,
+            turn: existing,
+        } if existing.id == turn.id => Some(existing),
+        _ => None,
+    }) {
+        if *existing == turn {
+            return false;
+        }
+        *existing = turn;
+        return true;
+    }
+    let sequence = detail.history_cursor;
+    detail.history_cursor = detail.history_cursor.wrapping_add(1);
+    detail
+        .timeline
+        .push(AgentTimelineEntry::Turn { sequence, turn });
+    true
+}
+
+fn upsert_tool_call(detail: &mut AgentSessionDetail, tool_call: AgentToolCall) -> bool {
+    if let Some(existing) = detail.timeline.iter_mut().find_map(|entry| match entry {
+        AgentTimelineEntry::ToolCall {
+            sequence: _,
+            tool_call: existing,
+        } if existing.id == tool_call.id => Some(existing),
+        _ => None,
+    }) {
+        if *existing == tool_call {
+            return false;
+        }
+        *existing = tool_call;
+        return true;
+    }
+    let sequence = detail.history_cursor;
+    detail.history_cursor = detail.history_cursor.wrapping_add(1);
+    detail
+        .timeline
+        .push(AgentTimelineEntry::ToolCall { sequence, tool_call });
+    true
+}
+
+fn upsert_approval(detail: &mut AgentSessionDetail, approval: AgentApprovalRequest) -> bool {
+    if let Some(existing) = detail.timeline.iter_mut().find_map(|entry| match entry {
+        AgentTimelineEntry::ApprovalRequest {
+            sequence: _,
+            approval: existing,
+        } if existing.id == approval.id => Some(existing),
+        _ => None,
+    }) {
+        if *existing == approval {
+            return false;
+        }
+        *existing = approval;
+        return true;
+    }
+    let sequence = detail.history_cursor;
+    detail.history_cursor = detail.history_cursor.wrapping_add(1);
+    detail
+        .timeline
+        .push(AgentTimelineEntry::ApprovalRequest { sequence, approval });
+    true
+}
+
+fn recompute_pending_approval_id(detail: &mut AgentSessionDetail) {
+    detail.pending_approval_id = detail.timeline.iter().rev().find_map(|entry| match entry {
+        AgentTimelineEntry::ApprovalRequest { approval, .. }
+            if approval.state == AgentApprovalState::Pending =>
+        {
+            Some(approval.id.clone())
+        }
+        _ => None,
+    });
+}
+
+fn is_terminal_lifecycle(lifecycle: AgentLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        AgentLifecycle::Completed | AgentLifecycle::Failed | AgentLifecycle::Cancelled
+    )
+}
+
+fn now_ms() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! Events flowing from providers into the session manager.
 
 use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionId};
+use axis_core::agent_history::{AgentApprovalRequest, AgentToolCall, AgentTurn};
 
 /// Provider-emitted update applied by [`crate::SessionManager`](crate::SessionManager).
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -21,5 +22,17 @@ pub enum RuntimeEvent {
     Status {
         session_id: AgentSessionId,
         message: String,
+    },
+    Turn {
+        session_id: AgentSessionId,
+        turn: AgentTurn,
+    },
+    ToolCall {
+        session_id: AgentSessionId,
+        tool_call: AgentToolCall,
+    },
+    ApprovalRequest {
+        session_id: AgentSessionId,
+        approval: AgentApprovalRequest,
     },
 }

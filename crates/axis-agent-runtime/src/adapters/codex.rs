@@ -4,42 +4,23 @@ use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context;
-use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionId};
+use axis_core::agent::{AgentLifecycle, AgentSessionId};
+use axis_core::agent_history::AgentSessionCapabilities;
 
+use crate::cli_protocol::{encode_axis_command, parse_axis_output_line, AxisCliCommand};
 use crate::events::RuntimeEvent;
-use crate::provider::{AgentProvider, StartAgentRequest, StartedSession};
+use crate::provider::{
+    AgentProvider, RespondApprovalRequest, ResumeRequest, SendTurnRequest, StartAgentRequest,
+    StartedSession,
+};
 use process_manager::{spawn_process_launch, ProcessLaunchSpec, TerminalGridSize, WaitOutcome};
 
 const DEFAULT_GRID: TerminalGridSize = TerminalGridSize::new(80, 24);
 /// Max bytes retained without a newline (defensive cap for marker parsing).
 const MAX_MARKER_BUFFER: usize = 64 * 1024;
-
-/// Parses one line of child output for stable axis markers. Unit-testable.
-pub(crate) fn parse_axis_line(line: &str) -> Option<ParsedAxisLine> {
-    let t = line.trim();
-    if let Some(rest) = t.strip_prefix("AXIS_ATTENTION ") {
-        let key = rest.trim();
-        if key == "needs_review" {
-            return Some(ParsedAxisLine::Attention(AgentAttention::NeedsReview));
-        }
-        if key == "needs_input" {
-            return Some(ParsedAxisLine::Attention(AgentAttention::NeedsInput));
-        }
-        return None;
-    }
-    if let Some(rest) = t.strip_prefix("AXIS_STATUS ") {
-        return Some(ParsedAxisLine::Status(rest.trim().to_string()));
-    }
-    None
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ParsedAxisLine {
-    Attention(AgentAttention),
-    Status(String),
-}
 
 pub struct CodexProvider {
     base_argv: Vec<String>,
@@ -89,6 +70,16 @@ impl Default for CodexProvider {
 }
 
 impl AgentProvider for CodexProvider {
+    fn capabilities(&self) -> AgentSessionCapabilities {
+        AgentSessionCapabilities {
+            turn_input: true,
+            tool_calls: true,
+            approvals: true,
+            resume: true,
+            terminal_attachment: false,
+        }
+    }
+
     fn start(&self, req: StartAgentRequest) -> anyhow::Result<StartedSession> {
         let argv = self.build_argv(&req);
         let launch = ProcessLaunchSpec {
@@ -174,6 +165,25 @@ impl AgentProvider for CodexProvider {
         Ok(out)
     }
 
+    fn send_turn(&self, req: SendTurnRequest) -> anyhow::Result<Vec<RuntimeEvent>> {
+        let command = encode_axis_command(&AxisCliCommand::SendTurn { text: req.text })?;
+        self.write_command(&req.session_id, &command)
+    }
+
+    fn respond_approval(&self, req: RespondApprovalRequest) -> anyhow::Result<Vec<RuntimeEvent>> {
+        let command = encode_axis_command(&AxisCliCommand::RespondApproval {
+            approval_request_id: req.approval_request_id,
+            approved: req.approved,
+            note: req.note,
+        })?;
+        self.write_command(&req.session_id, &command)
+    }
+
+    fn resume(&self, req: ResumeRequest) -> anyhow::Result<Vec<RuntimeEvent>> {
+        let command = encode_axis_command(&AxisCliCommand::Resume)?;
+        self.write_command(&req.session_id, &command)
+    }
+
     fn stop(&self, session_id: &AgentSessionId) -> anyhow::Result<()> {
         let slot = {
             let mut g = self
@@ -195,6 +205,45 @@ impl AgentProvider for CodexProvider {
             .kill()
             .context("codex stop: failed to kill child process")?;
         Ok(())
+    }
+}
+
+impl CodexProvider {
+    fn write_command(
+        &self,
+        session_id: &AgentSessionId,
+        command: &str,
+    ) -> anyhow::Result<Vec<RuntimeEvent>> {
+        let slot = {
+            let g = self
+                .inner
+                .lock()
+                .map_err(|e| anyhow::anyhow!("codex provider lock poisoned: {e}"))?;
+            g.sessions
+                .get(session_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown codex session {}", session_id.0))?
+        };
+        let mut state = slot
+            .lock()
+            .map_err(|e| anyhow::anyhow!("codex session lock poisoned: {e}"))?;
+        let mut out = Vec::new();
+        emit_boot_events_if_needed(&mut state, session_id, &mut out);
+        state
+            .spawned
+            .process
+            .write_all(command.as_bytes())
+            .context("codex command write failed")?;
+        let baseline = out.len();
+        drain_child_stdout(&mut state, session_id, &mut out)?;
+        for _ in 0..20 {
+            if out.len() > baseline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            drain_child_stdout(&mut state, session_id, &mut out)?;
+        }
+        Ok(out)
     }
 }
 
@@ -243,49 +292,11 @@ fn drain_child_stdout(
         if line.ends_with('\r') {
             line.pop();
         }
-        if let Some(parsed) = parse_axis_line(&line) {
-            match parsed {
-                ParsedAxisLine::Attention(att) => {
-                    out.push(RuntimeEvent::Lifecycle {
-                        session_id: session_id.clone(),
-                        lifecycle: AgentLifecycle::Waiting,
-                    });
-                    out.push(RuntimeEvent::Attention {
-                        session_id: session_id.clone(),
-                        attention: att,
-                    });
-                }
-                ParsedAxisLine::Status(message) => {
-                    out.push(RuntimeEvent::Status {
-                        session_id: session_id.clone(),
-                        message,
-                    });
-                }
-            }
+        if let Some(events) = parse_axis_output_line(&line, session_id) {
+            out.extend(events);
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod parse_tests {
-    use super::*;
-
-    #[test]
-    fn parses_attention_and_status_markers() {
-        assert_eq!(
-            parse_axis_line("AXIS_ATTENTION needs_review"),
-            Some(ParsedAxisLine::Attention(AgentAttention::NeedsReview))
-        );
-        assert_eq!(
-            parse_axis_line("  AXIS_ATTENTION needs_input  "),
-            Some(ParsedAxisLine::Attention(AgentAttention::NeedsInput))
-        );
-        assert_eq!(
-            parse_axis_line("AXIS_STATUS compiling"),
-            Some(ParsedAxisLine::Status("compiling".into()))
-        );
-    }
 }
 
 #[cfg(test)]
@@ -298,4 +309,23 @@ mod buffer_cap_tests {
         enforce_marker_buffer_cap(&mut buf);
         assert!(buf.len() <= MAX_MARKER_BUFFER);
     }
+}
+
+fn emit_boot_events_if_needed(
+    session: &mut CodexSession,
+    session_id: &AgentSessionId,
+    out: &mut Vec<RuntimeEvent>,
+) {
+    if session.emitted_boot {
+        return;
+    }
+    session.emitted_boot = true;
+    out.push(RuntimeEvent::Lifecycle {
+        session_id: session_id.clone(),
+        lifecycle: AgentLifecycle::Starting,
+    });
+    out.push(RuntimeEvent::Lifecycle {
+        session_id: session_id.clone(),
+        lifecycle: AgentLifecycle::Running,
+    });
 }

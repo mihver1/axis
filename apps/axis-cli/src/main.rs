@@ -1,6 +1,10 @@
 use axis_core::{
     agent::AgentSessionId,
-    automation::{AutomationRequest, AutomationResponse},
+    agent_history::AgentApprovalRequestId,
+    automation::{
+        AgentGetRequest, AgentRespondApprovalRequest, AgentResumeRequest, AgentSendTurnRequest,
+        AutomationRequest, AutomationResponse,
+    },
     paths::{axis_user_data_dir, daemon_socket_path_for, AXIS_SOCKET_PATH_ENV},
     worktree::WorktreeId,
 };
@@ -31,6 +35,10 @@ enum CommandAlias {
     Worktree,
     WorktreeStatus,
     StartAgent,
+    GetAgent,
+    SendAgentTurn,
+    RespondAgentApproval,
+    ResumeAgent,
     StopAgent,
     ListAgents,
     Review,
@@ -136,6 +144,10 @@ fn resolve_command_alias(command: &str) -> Option<CommandAlias> {
         "worktree" => Some(CommandAlias::Worktree),
         "worktree-status" => Some(CommandAlias::WorktreeStatus),
         "start-agent" => Some(CommandAlias::StartAgent),
+        "get-agent" => Some(CommandAlias::GetAgent),
+        "send-agent-turn" => Some(CommandAlias::SendAgentTurn),
+        "respond-agent-approval" => Some(CommandAlias::RespondAgentApproval),
+        "resume-agent" => Some(CommandAlias::ResumeAgent),
         "stop-agent" => Some(CommandAlias::StopAgent),
         "list-agents" => Some(CommandAlias::ListAgents),
         "review" => Some(CommandAlias::Review),
@@ -184,6 +196,49 @@ fn request_from_alias(alias: CommandAlias, args: &[String]) -> Result<Automation
                 workdesk_id: None,
                 surface_id: None,
             }
+        }
+        CommandAlias::GetAgent => {
+            let agent_session_id =
+                AgentSessionId::new(take_required_string_param(&mut params, "agent_session_id")?);
+            let after_sequence = take_optional_u64_param(&mut params, "after_sequence")?;
+            ensure_no_unknown_params(&params, "get-agent")?;
+            AutomationRequest::AgentGet(AgentGetRequest {
+                agent_session_id,
+                after_sequence,
+            })
+        }
+        CommandAlias::SendAgentTurn => {
+            let agent_session_id =
+                AgentSessionId::new(take_required_string_param(&mut params, "agent_session_id")?);
+            let text = take_required_string_param(&mut params, "text")?;
+            ensure_no_unknown_params(&params, "send-agent-turn")?;
+            AutomationRequest::AgentSendTurn(AgentSendTurnRequest {
+                agent_session_id,
+                text,
+            })
+        }
+        CommandAlias::RespondAgentApproval => {
+            let agent_session_id =
+                AgentSessionId::new(take_required_string_param(&mut params, "agent_session_id")?);
+            let approval_request_id = AgentApprovalRequestId::new(take_required_string_param(
+                &mut params,
+                "approval_request_id",
+            )?);
+            let approved = take_required_bool_param(&mut params, "approved")?;
+            let note = take_optional_string_param(&mut params, "note")?;
+            ensure_no_unknown_params(&params, "respond-agent-approval")?;
+            AutomationRequest::AgentRespondApproval(AgentRespondApprovalRequest {
+                agent_session_id,
+                approval_request_id,
+                approved,
+                note,
+            })
+        }
+        CommandAlias::ResumeAgent => {
+            let agent_session_id =
+                AgentSessionId::new(take_required_string_param(&mut params, "agent_session_id")?);
+            ensure_no_unknown_params(&params, "resume-agent")?;
+            AutomationRequest::AgentResume(AgentResumeRequest { agent_session_id })
         }
         CommandAlias::StopAgent => {
             let agent_session_id =
@@ -352,6 +407,25 @@ fn take_string_vec_param(
     }
 }
 
+fn take_optional_u64_param(params: &mut Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
+    match params.remove(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("expected `{key}` to be an unsigned integer")),
+        Some(other) => Err(format!("expected `{key}` to be an unsigned integer, got {other}")),
+    }
+}
+
+fn take_required_bool_param(params: &mut Map<String, Value>, key: &str) -> Result<bool, String> {
+    match params.remove(key) {
+        Some(Value::Bool(value)) => Ok(value),
+        Some(other) => Err(format!("expected `{key}` to be a boolean, got {other}")),
+        None => Err(format!("missing required `{key}` parameter")),
+    }
+}
+
 fn ensure_no_unknown_params(params: &Map<String, Value>, command: &str) -> Result<(), String> {
     if params.is_empty() {
         return Ok(());
@@ -428,6 +502,10 @@ Aliases:
   worktree          -> worktree.create_or_attach
   worktree-status   -> worktree.status
   start-agent       -> agent.start
+  get-agent         -> agent.get
+  send-agent-turn   -> agent.send_turn
+  respond-agent-approval -> agent.respond_approval
+  resume-agent      -> agent.resume
   stop-agent        -> agent.stop
   list-agents       -> agent.list
   review            -> review.summary
@@ -440,6 +518,10 @@ Examples:
   {APP_BINARY} worktree repo_root=/repo attach_path=/repo-demo
   {APP_BINARY} worktree-status worktree_id=wt-demo
   {APP_BINARY} start-agent worktree_id=wt-demo provider_profile_id=codex argv='[\"--danger-full-access\"]'
+  {APP_BINARY} get-agent agent_session_id=session-1 after_sequence=4
+  {APP_BINARY} send-agent-turn agent_session_id=session-1 text='Continue'
+  {APP_BINARY} respond-agent-approval agent_session_id=session-1 approval_request_id=approval-9 approved=true note='Ship it'
+  {APP_BINARY} resume-agent agent_session_id=session-1
   {APP_BINARY} stop-agent agent_session_id=session-1
   {APP_BINARY} list-agents worktree_id=wt-demo
   {APP_BINARY} review worktree_id=wt-demo
@@ -481,6 +563,22 @@ mod tests {
         assert_eq!(
             resolve_command_alias("start-agent"),
             Some(CommandAlias::StartAgent)
+        );
+        assert_eq!(
+            resolve_command_alias("get-agent"),
+            Some(CommandAlias::GetAgent)
+        );
+        assert_eq!(
+            resolve_command_alias("send-agent-turn"),
+            Some(CommandAlias::SendAgentTurn)
+        );
+        assert_eq!(
+            resolve_command_alias("respond-agent-approval"),
+            Some(CommandAlias::RespondAgentApproval)
+        );
+        assert_eq!(
+            resolve_command_alias("resume-agent"),
+            Some(CommandAlias::ResumeAgent)
         );
         assert_eq!(
             resolve_command_alias("ensure-gui"),
@@ -638,6 +736,71 @@ mod tests {
         assert_eq!(
             list.request,
             AutomationRequest::AgentList { worktree_id: None }
+        );
+    }
+
+    #[test]
+    fn parses_structured_agent_aliases_into_shared_requests() {
+        let get = parse_cli(vec![
+            "get-agent".to_string(),
+            "agent_session_id=session-1".to_string(),
+            "after_sequence=4".to_string(),
+        ])
+        .expect("get alias should parse");
+        assert_eq!(
+            get.request,
+            AutomationRequest::AgentGet(axis_core::automation::AgentGetRequest {
+                agent_session_id: AgentSessionId::new("session-1"),
+                after_sequence: Some(4),
+            })
+        );
+
+        let send_turn = parse_cli(vec![
+            "send-agent-turn".to_string(),
+            "agent_session_id=session-1".to_string(),
+            "text=Continue".to_string(),
+        ])
+        .expect("send-turn alias should parse");
+        assert_eq!(
+            send_turn.request,
+            AutomationRequest::AgentSendTurn(axis_core::automation::AgentSendTurnRequest {
+                agent_session_id: AgentSessionId::new("session-1"),
+                text: "Continue".to_string(),
+            })
+        );
+
+        let approve = parse_cli(vec![
+            "respond-agent-approval".to_string(),
+            "agent_session_id=session-1".to_string(),
+            "approval_request_id=approval-9".to_string(),
+            "approved=true".to_string(),
+            "note=Ship it".to_string(),
+        ])
+        .expect("approval alias should parse");
+        assert_eq!(
+            approve.request,
+            AutomationRequest::AgentRespondApproval(
+                axis_core::automation::AgentRespondApprovalRequest {
+                    agent_session_id: AgentSessionId::new("session-1"),
+                    approval_request_id: axis_core::agent_history::AgentApprovalRequestId::new(
+                        "approval-9",
+                    ),
+                    approved: true,
+                    note: Some("Ship it".to_string()),
+                }
+            )
+        );
+
+        let resume = parse_cli(vec![
+            "resume-agent".to_string(),
+            "agent_session_id=session-1".to_string(),
+        ])
+        .expect("resume alias should parse");
+        assert_eq!(
+            resume.request,
+            AutomationRequest::AgentResume(axis_core::automation::AgentResumeRequest {
+                agent_session_id: AgentSessionId::new("session-1"),
+            })
         );
     }
 

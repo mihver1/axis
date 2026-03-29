@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_history;
 pub mod automation;
 pub mod paths;
 pub mod review;

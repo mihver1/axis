@@ -13,6 +13,7 @@ use axis_agent_runtime::{
     ProviderProfileMetadata, ProviderRegistry, SessionManager, StartAgentRequest,
 };
 use axis_core::agent::{AgentAttention, AgentSessionId, AgentSessionRecord, AgentTransportKind};
+use axis_core::agent_history::{AgentApprovalRequestId, AgentSessionDetail, AgentTimelineEntry};
 use axis_core::workdesk::WorkdeskId;
 use axis_core::worktree::WorktreeId;
 use axis_core::SurfaceId;
@@ -55,6 +56,7 @@ struct BridgeInner {
     manager: SessionManager,
     daemon: DaemonClient,
     daemon_records: HashMap<AgentSessionId, AgentSessionRecord>,
+    daemon_details: HashMap<AgentSessionId, AgentSessionDetail>,
     daemon_revision: u64,
     desk_cwd: HashMap<u64, String>,
     surface_to_session: HashMap<SurfaceRuntimeKey, AgentSessionId>,
@@ -134,6 +136,7 @@ impl AgentRuntimeBridge {
                 manager: SessionManager::new(registry),
                 daemon: DaemonClient::default(),
                 daemon_records: HashMap::new(),
+                daemon_details: HashMap::new(),
                 daemon_revision: 0,
                 desk_cwd: HashMap::new(),
                 surface_to_session: HashMap::new(),
@@ -376,11 +379,25 @@ impl AgentRuntimeBridge {
         let sid = guard
             .surface_to_session
             .get(&Self::key(workdesk_runtime_id, surface_id))?;
-        guard
+        let inferred_attention = guard
+            .daemon_details
+            .get(sid)
+            .filter(|detail| detail.pending_approval_id.is_some())
+            .map(|_| AgentAttention::NeedsReview)
+            .or_else(|| {
+                guard
+                    .manager
+                    .session_detail(sid)
+                    .filter(|detail| detail.pending_approval_id.is_some())
+                    .map(|_| AgentAttention::NeedsReview)
+            });
+        inferred_attention.or_else(|| {
+            guard
             .daemon_records
             .get(sid)
             .map(|record| record.attention)
-            .or_else(|| guard.manager.session(sid).map(|r| r.attention))
+                .or_else(|| guard.manager.session(sid).map(|r| r.attention))
+        })
     }
 
     fn record_for_key(guard: &BridgeInner, key: SurfaceRuntimeKey) -> Option<AgentSessionRecord> {
@@ -452,6 +469,9 @@ impl AgentRuntimeBridge {
                 .map(|record| (record.id.clone(), record))
                 .collect();
             let daemon_ids = guard.daemon_records.keys().cloned().collect::<HashSet<_>>();
+            guard
+                .daemon_details
+                .retain(|session_id, _| daemon_ids.contains(session_id));
             let local_ids = guard
                 .manager
                 .sessions()
@@ -461,6 +481,10 @@ impl AgentRuntimeBridge {
                 daemon_ids.contains(existing) || local_ids.contains(existing)
             });
             guard.daemon_revision = guard.daemon_revision.wrapping_add(1);
+            if daemon_ids.contains(&sid) {
+                let detail = guard.daemon.get_agent(&sid, None)?;
+                cache_daemon_detail(&mut guard, detail);
+            }
             return Ok(());
         }
         guard.manager.poll_provider(&sid).map_err(|e| e.to_string())
@@ -478,6 +502,7 @@ impl AgentRuntimeBridge {
         if guard.daemon_records.contains_key(session_id) {
             guard.daemon.stop_agent(session_id)?;
             guard.daemon_records.remove(session_id);
+            guard.daemon_details.remove(session_id);
             if let Some(key) = matching_key {
                 guard.surface_to_session.remove(&key);
             }
@@ -487,6 +512,7 @@ impl AgentRuntimeBridge {
         if guard.manager.session(session_id).is_none() {
             guard.daemon.stop_agent(session_id)?;
             guard.daemon_records.remove(session_id);
+            guard.daemon_details.remove(session_id);
             if let Some(key) = matching_key {
                 guard.surface_to_session.remove(&key);
             }
@@ -516,15 +542,122 @@ impl AgentRuntimeBridge {
         if guard.daemon_records.contains_key(&sid) {
             let _ = guard.daemon.stop_agent(&sid);
             guard.daemon_records.remove(&sid);
+            guard.daemon_details.remove(&sid);
             guard.daemon_revision = guard.daemon_revision.wrapping_add(1);
             return;
         }
         if guard.manager.session(&sid).is_none() && guard.daemon.stop_agent(&sid).is_ok() {
             guard.daemon_records.remove(&sid);
+            guard.daemon_details.remove(&sid);
             guard.daemon_revision = guard.daemon_revision.wrapping_add(1);
             return;
         }
         let _ = guard.manager.stop_session(&sid);
+    }
+
+    pub(crate) fn session_detail(
+        &self,
+        agent_session_id: &AgentSessionId,
+        after_sequence: Option<u64>,
+    ) -> Result<AgentSessionDetail, String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?;
+        if let Some(detail) = Self::local_detail_for_session(&guard, agent_session_id) {
+            return Ok(filter_detail_after_sequence(detail, after_sequence));
+        }
+        let detail = guard.daemon.get_agent(agent_session_id, None)?;
+        cache_daemon_detail(&mut guard, detail.clone());
+        Ok(filter_detail_after_sequence(detail, after_sequence))
+    }
+
+    pub(crate) fn send_turn(
+        &self,
+        agent_session_id: &AgentSessionId,
+        text: &str,
+    ) -> Result<AgentSessionDetail, String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?;
+        if guard.manager.session(agent_session_id).is_some() {
+            guard
+                .manager
+                .send_turn(agent_session_id, text)
+                .map_err(|error| error.to_string())?;
+            return Self::local_detail_for_session(&guard, agent_session_id)
+                .ok_or_else(|| format!("unknown session {}", agent_session_id.0));
+        }
+        let detail = guard.daemon.send_agent_turn(agent_session_id, text)?;
+        cache_daemon_detail(&mut guard, detail.clone());
+        Ok(detail)
+    }
+
+    pub(crate) fn respond_approval(
+        &self,
+        agent_session_id: &AgentSessionId,
+        approval_request_id: &AgentApprovalRequestId,
+        approved: bool,
+        note: Option<String>,
+    ) -> Result<AgentSessionDetail, String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?;
+        if guard.manager.session(agent_session_id).is_some() {
+            guard
+                .manager
+                .respond_approval(agent_session_id, approval_request_id, approved, note)
+                .map_err(|error| error.to_string())?;
+            return Self::local_detail_for_session(&guard, agent_session_id)
+                .ok_or_else(|| format!("unknown session {}", agent_session_id.0));
+        }
+        let detail = guard.daemon.respond_agent_approval(
+            agent_session_id,
+            approval_request_id,
+            approved,
+            note,
+        )?;
+        cache_daemon_detail(&mut guard, detail.clone());
+        Ok(detail)
+    }
+
+    pub(crate) fn resume(
+        &self,
+        agent_session_id: &AgentSessionId,
+    ) -> Result<AgentSessionDetail, String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?;
+        if guard.manager.session(agent_session_id).is_some() {
+            guard
+                .manager
+                .resume(agent_session_id)
+                .map_err(|error| error.to_string())?;
+            return Self::local_detail_for_session(&guard, agent_session_id)
+                .ok_or_else(|| format!("unknown session {}", agent_session_id.0));
+        }
+        let detail = guard.daemon.resume_agent(agent_session_id)?;
+        cache_daemon_detail(&mut guard, detail.clone());
+        Ok(detail)
+    }
+
+    fn local_detail_for_session(
+        guard: &BridgeInner,
+        agent_session_id: &AgentSessionId,
+    ) -> Option<AgentSessionDetail> {
+        let mut detail = guard.manager.session_detail(agent_session_id)?.clone();
+        if let Some((key, _)) = guard
+            .surface_to_session
+            .iter()
+            .find(|(_, existing)| *existing == agent_session_id)
+        {
+            detail.session.workdesk_id = Some(key.workdesk_runtime_id.to_string());
+            detail.session.surface_id = Some(key.surface_id);
+        }
+        Some(detail)
     }
 }
 
@@ -534,10 +667,42 @@ impl Default for AgentRuntimeBridge {
     }
 }
 
+fn cache_daemon_detail(guard: &mut BridgeInner, detail: AgentSessionDetail) {
+    guard
+        .daemon_records
+        .insert(detail.session.id.clone(), detail.session.clone());
+    guard
+        .daemon_details
+        .insert(detail.session.id.clone(), detail);
+    guard.daemon_revision = guard.daemon_revision.wrapping_add(1);
+}
+
+fn filter_detail_after_sequence(
+    mut detail: AgentSessionDetail,
+    after_sequence: Option<u64>,
+) -> AgentSessionDetail {
+    if let Some(after_sequence) = after_sequence {
+        detail
+            .timeline
+            .retain(|entry| timeline_entry_sequence(entry) >= after_sequence);
+    }
+    detail
+}
+
+fn timeline_entry_sequence(entry: &AgentTimelineEntry) -> u64 {
+    match entry {
+        AgentTimelineEntry::Turn { sequence, .. }
+        | AgentTimelineEntry::ToolCall { sequence, .. }
+        | AgentTimelineEntry::ApprovalRequest { sequence, .. } => *sequence,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axis_agent_runtime::adapters::fake::FakeProvider;
+    use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionRecord, AgentTransportKind};
+    use axis_core::agent_history::{AgentApprovalRequestId, AgentSessionDetail};
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -640,6 +805,49 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(available_dir);
         let _ = std::fs::remove_dir_all(missing_dir);
+    }
+
+    #[test]
+    fn pending_approval_detail_elevates_surface_attention() {
+        let bridge = AgentRuntimeBridge::with_registry("fake", ProviderRegistry::new());
+        let runtime_id = 7;
+        let surface_id = SurfaceId::new(11);
+        let session_id = AgentSessionId::new("daemon-session-1");
+        let record = AgentSessionRecord {
+            id: session_id.clone(),
+            provider_profile_id: "fake".to_string(),
+            transport: AgentTransportKind::CliWrapped,
+            workdesk_id: Some(runtime_id.to_string()),
+            surface_id: Some(surface_id),
+            cwd: "/repo".to_string(),
+            lifecycle: AgentLifecycle::Waiting,
+            attention: AgentAttention::Quiet,
+            status_message: "waiting for approval".to_string(),
+        };
+        let detail = AgentSessionDetail {
+            session: record.clone(),
+            capabilities: Default::default(),
+            started_at_ms: Some(1),
+            updated_at_ms: Some(2),
+            completed_at_ms: None,
+            revision: 1,
+            history_cursor: 0,
+            pending_approval_id: Some(AgentApprovalRequestId::new("approval-1")),
+            timeline: Vec::new(),
+            truncated: false,
+        };
+        let mut guard = bridge.inner.lock().expect("bridge should lock");
+        guard
+            .surface_to_session
+            .insert(AgentRuntimeBridge::key(runtime_id, surface_id), session_id.clone());
+        guard.daemon_records.insert(session_id.clone(), record);
+        guard.daemon_details.insert(session_id, detail);
+        drop(guard);
+
+        assert_eq!(
+            bridge.attention_for_surface(runtime_id, surface_id),
+            Some(AgentAttention::NeedsReview)
+        );
     }
 
     fn temp_dir(label: &str) -> PathBuf {

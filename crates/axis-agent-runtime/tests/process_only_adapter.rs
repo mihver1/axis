@@ -7,6 +7,7 @@ use axis_agent_runtime::SessionManager;
 use axis_core::agent::{
     AgentAttention, AgentLifecycle, AgentSessionId, AgentSessionRecord, AgentTransportKind,
 };
+use axis_core::agent_history::{AgentApprovalRequestId, AgentTimelineEntry};
 
 const MAX_POLLS: u32 = 10_000;
 
@@ -94,4 +95,44 @@ fn process_only_adapter_stop_kills_child_and_drops_session() {
 
     mgr.stop_session(&id).unwrap();
     assert!(mgr.session(&id).is_none());
+}
+
+#[test]
+fn process_only_adapter_structured_approval_event_populates_detail() {
+    let mut mgr = SessionManager::new(process_only_registry_sh_c(
+        "/bin/echo 'AXIS_EVENT {\"kind\":\"approval_request\",\"approval\":{\"id\":\"approval-1\",\"kind\":\"command\",\"title\":\"Allow build?\",\"details\":\"run cargo test\",\"state\":\"pending\",\"requested_at_ms\":10}}'; while true; do sleep 60; done",
+    ));
+    let id = mgr
+        .start_session(StartAgentRequest {
+            cwd: "/".into(),
+            provider_profile_id: "claude-code".into(),
+            transport: AgentTransportKind::CliWrapped,
+            argv_suffix: vec![],
+            env: BTreeMap::new(),
+        })
+        .unwrap();
+
+    for _ in 0..MAX_POLLS {
+        mgr.poll_provider(&id).unwrap();
+        if mgr.session_detail(&id).is_some_and(|detail| {
+            detail.pending_approval_id == Some(AgentApprovalRequestId::new("approval-1"))
+        }) {
+            let detail = mgr.session_detail(&id).unwrap();
+            assert!(detail.capabilities.turn_input);
+            assert_eq!(
+                detail.pending_approval_id,
+                Some(AgentApprovalRequestId::new("approval-1"))
+            );
+            match &detail.timeline[0] {
+                AgentTimelineEntry::ApprovalRequest { approval, .. } => {
+                    assert_eq!(approval.title, "Allow build?");
+                }
+                entry => panic!("expected approval entry, got {entry:?}"),
+            }
+            return;
+        }
+        std::thread::yield_now();
+    }
+
+    panic!("structured approval event did not populate detail within {MAX_POLLS} polls");
 }

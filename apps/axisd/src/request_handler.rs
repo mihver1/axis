@@ -397,6 +397,47 @@ fn handle_request(
                 .collect::<Vec<_>>();
             AutomationResponse::success_with_result(serde_json::to_value(sessions)?)
         }
+        AutomationRequest::AgentGet(request) => {
+            let detail = state
+                .lock()
+                .map_err(|error| anyhow::anyhow!("registry lock poisoned: {error}"))?
+                .agent_runtime
+                .session_detail(&request.agent_session_id, request.after_sequence)
+                .map_err(anyhow::Error::msg)?;
+            AutomationResponse::success_with_result(serde_json::to_value(detail)?)
+        }
+        AutomationRequest::AgentSendTurn(request) => {
+            let detail = state
+                .lock()
+                .map_err(|error| anyhow::anyhow!("registry lock poisoned: {error}"))?
+                .agent_runtime
+                .send_turn(&request.agent_session_id, &request.text)
+                .map_err(anyhow::Error::msg)?;
+            AutomationResponse::success_with_result(serde_json::to_value(detail)?)
+        }
+        AutomationRequest::AgentRespondApproval(request) => {
+            let detail = state
+                .lock()
+                .map_err(|error| anyhow::anyhow!("registry lock poisoned: {error}"))?
+                .agent_runtime
+                .respond_approval(
+                    &request.agent_session_id,
+                    &request.approval_request_id,
+                    request.approved,
+                    request.note,
+                )
+                .map_err(anyhow::Error::msg)?;
+            AutomationResponse::success_with_result(serde_json::to_value(detail)?)
+        }
+        AutomationRequest::AgentResume(request) => {
+            let detail = state
+                .lock()
+                .map_err(|error| anyhow::anyhow!("registry lock poisoned: {error}"))?
+                .agent_runtime
+                .resume(&request.agent_session_id)
+                .map_err(anyhow::Error::msg)?;
+            AutomationResponse::success_with_result(serde_json::to_value(detail)?)
+        }
         AutomationRequest::DeskReviewSummary { worktree_id } => {
             let base_branch = state
                 .lock()

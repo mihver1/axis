@@ -1,5 +1,9 @@
 use axis_core::agent::{AgentSessionId, AgentSessionRecord};
-use axis_core::automation::{AutomationRequest, AutomationResponse};
+use axis_core::agent_history::{AgentApprovalRequestId, AgentSessionDetail};
+use axis_core::automation::{
+    AgentGetRequest, AgentRespondApprovalRequest, AgentResumeRequest, AgentSendTurnRequest,
+    AutomationRequest, AutomationResponse,
+};
 use axis_core::paths::daemon_socket_path;
 use axis_core::terminal::{
     TerminalSessionId, TerminalSessionRecord, TerminalSurfaceKind, TerminalTranscriptChunk,
@@ -184,6 +188,54 @@ impl DaemonClient {
         self.send_typed_request(AutomationRequest::AgentList {
             worktree_id: worktree_id.cloned(),
         })
+    }
+
+    pub fn get_agent(
+        &self,
+        agent_session_id: &AgentSessionId,
+        after_sequence: Option<u64>,
+    ) -> Result<AgentSessionDetail, String> {
+        self.send_typed_request(AutomationRequest::AgentGet(AgentGetRequest {
+            agent_session_id: agent_session_id.clone(),
+            after_sequence,
+        }))
+    }
+
+    pub fn send_agent_turn(
+        &self,
+        agent_session_id: &AgentSessionId,
+        text: &str,
+    ) -> Result<AgentSessionDetail, String> {
+        self.send_typed_request(AutomationRequest::AgentSendTurn(AgentSendTurnRequest {
+            agent_session_id: agent_session_id.clone(),
+            text: text.to_string(),
+        }))
+    }
+
+    pub fn respond_agent_approval(
+        &self,
+        agent_session_id: &AgentSessionId,
+        approval_request_id: &AgentApprovalRequestId,
+        approved: bool,
+        note: Option<String>,
+    ) -> Result<AgentSessionDetail, String> {
+        self.send_typed_request(AutomationRequest::AgentRespondApproval(
+            AgentRespondApprovalRequest {
+                agent_session_id: agent_session_id.clone(),
+                approval_request_id: approval_request_id.clone(),
+                approved,
+                note,
+            },
+        ))
+    }
+
+    pub fn resume_agent(
+        &self,
+        agent_session_id: &AgentSessionId,
+    ) -> Result<AgentSessionDetail, String> {
+        self.send_typed_request(AutomationRequest::AgentResume(AgentResumeRequest {
+            agent_session_id: agent_session_id.clone(),
+        }))
     }
 
     pub fn desk_review_summary(
