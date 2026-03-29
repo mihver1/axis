@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/branding/axis-logo.svg" alt="Axis logo" width="420" />
+</p>
+
 # axis
 
 `axis` is a native Rust workspace for spatial, agent-oriented development on macOS.
