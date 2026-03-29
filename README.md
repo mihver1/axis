@@ -106,7 +106,7 @@ just test       # cargo test -q
 just clippy     # cargo clippy --workspace --all-targets
 just run        # launch axis-app
 just smoke-acp  # run the ACP/demo smoke script
-just dmg        # build a dev DMG in dist/
+just dmg        # build a macOS DMG in dist/
 ```
 
 ## Environment Variables
@@ -123,6 +123,10 @@ These are the main knobs worth knowing first:
 | `AXIS_APP_BIN` | Override the GUI binary that `axisd` launches for `ensure-gui`. |
 | `AXIS_DAEMON_SOCKET_TIMEOUT_MS` | Override daemon client timeout in tests/debugging. |
 | `AXIS_GUI_HEARTBEAT_TTL_MS` | Override the daemon-side GUI heartbeat TTL. |
+| `AXIS_MACOS_BUNDLE_ID` | Override the app bundle identifier used by `just dmg` (defaults to `tech.artelproject.axis`). |
+| `AXIS_MACOS_TEAM_ID` | Override the Apple team ID used for notarization-oriented packaging metadata (defaults to `6DR98YW3PY`). |
+| `AXIS_MACOS_SIGN_IDENTITY` | Override the signing identity used by `just dmg`; if unset, the recipe auto-selects a single `Developer ID Application` identity when available. |
+| `AXIS_MACOS_NOTARY_PROFILE` | Optional `xcrun notarytool` keychain profile name to notarize and staple the generated DMG. |
 
 ## Troubleshooting
 
@@ -151,6 +155,19 @@ just doctor
 
 ## Packaging
 
-`just dmg` currently builds a development DMG into `dist/`.
-It is useful for local distribution and smoke testing, not as a signed/notarized
-release pipeline.
+`just dmg` builds `dist/Axis-<version>.dmg` and writes `Axis.app` with the
+default bundle identifier `tech.artelproject.axis`.
+
+If exactly one `Developer ID Application` certificate is available in the active
+keychain, the recipe signs the nested binaries, app bundle, and DMG
+automatically. If multiple matching identities exist, set
+`AXIS_MACOS_SIGN_IDENTITY` explicitly. If no Developer ID identity is
+available, the recipe falls back to a single `Apple Development` identity for
+local installs, and then to ad-hoc signing if no signing identity is available
+at all.
+
+To notarize the DMG, first create a `notarytool` keychain profile and then run
+`just dmg` with `AXIS_MACOS_NOTARY_PROFILE` set. The recipe will submit the DMG,
+wait for completion, and staple the notarized ticket to the DMG. If the profile
+is missing or the active identity is not `Developer ID Application`, the recipe
+prints a warning and skips notarization instead of failing after the build.
