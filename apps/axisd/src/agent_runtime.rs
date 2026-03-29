@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use axis_agent_runtime::adapters::codex::CodexProvider;
 use axis_agent_runtime::adapters::process_only::ProcessOnlyProvider;
@@ -7,6 +8,7 @@ use axis_agent_runtime::{
     SessionManager, StartAgentRequest,
 };
 use axis_core::agent::{AgentSessionId, AgentSessionRecord, AgentTransportKind};
+use axis_core::agent_history::{AgentApprovalRequestId, AgentSessionDetail, AgentTimelineEntry};
 use axis_core::workdesk::WorkdeskId;
 use axis_core::SurfaceId;
 
@@ -15,6 +17,9 @@ const CLAUDE_CODE_PROFILE_ID: &str = "claude-code";
 const CLAUDE_CODE_CAPABILITY_NOTE: &str = "basic lifecycle only";
 const CODEX_BIN_ENV: &str = "AXIS_CODEX_BIN";
 const CLAUDE_CODE_BIN_ENV: &str = "AXIS_CLAUDE_CODE_BIN";
+const DETAIL_PROGRESS_POLL_ATTEMPTS: usize = 100;
+const DETAIL_PROGRESS_POLL_SLEEP: Duration = Duration::from_millis(10);
+const DETAIL_PROGRESS_QUIET_WINDOW: Duration = Duration::from_millis(120);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct AgentSurfaceKey {
@@ -161,6 +166,67 @@ impl DaemonAgentRuntime {
             .collect()
     }
 
+    pub fn session_detail(
+        &mut self,
+        session_id: &AgentSessionId,
+        after_sequence: Option<u64>,
+    ) -> Result<AgentSessionDetail, String> {
+        let _ = self.manager.poll_provider(session_id);
+        let detail = self
+            .detail_for_session(session_id)
+            .ok_or_else(|| format!("unknown session {}", session_id.0))?;
+        Ok(filter_detail_after_sequence(detail, after_sequence))
+    }
+
+    pub fn send_turn(
+        &mut self,
+        session_id: &AgentSessionId,
+        text: &str,
+    ) -> Result<AgentSessionDetail, String> {
+        let before_cursor = self
+            .manager
+            .session_detail(session_id)
+            .map(|detail| detail.history_cursor)
+            .unwrap_or(0);
+        self.manager
+            .send_turn(session_id, text)
+            .map_err(|error| error.to_string())?;
+        self.wait_for_cursor_progress(session_id, before_cursor);
+        self.session_detail(session_id, None)
+    }
+
+    pub fn respond_approval(
+        &mut self,
+        session_id: &AgentSessionId,
+        approval_request_id: &AgentApprovalRequestId,
+        approved: bool,
+        note: Option<String>,
+    ) -> Result<AgentSessionDetail, String> {
+        let (before_revision, before_cursor) = self
+            .manager
+            .session_detail(session_id)
+            .map(|detail| (detail.revision, detail.history_cursor))
+            .unwrap_or((0, 0));
+        self.manager
+            .respond_approval(session_id, approval_request_id, approved, note)
+            .map_err(|error| error.to_string())?;
+        self.wait_for_detail_progress(session_id, before_revision, before_cursor);
+        self.session_detail(session_id, None)
+    }
+
+    pub fn resume(&mut self, session_id: &AgentSessionId) -> Result<AgentSessionDetail, String> {
+        let (before_revision, before_cursor) = self
+            .manager
+            .session_detail(session_id)
+            .map(|detail| (detail.revision, detail.history_cursor))
+            .unwrap_or((0, 0));
+        self.manager
+            .resume(session_id)
+            .map_err(|error| error.to_string())?;
+        self.wait_for_detail_progress(session_id, before_revision, before_cursor);
+        self.session_detail(session_id, None)
+    }
+
     pub fn poll_all(&mut self) -> Result<(), String> {
         let session_ids = self
             .manager
@@ -224,10 +290,86 @@ impl DaemonAgentRuntime {
         }
         Some(record)
     }
+
+    fn detail_for_session(&self, session_id: &AgentSessionId) -> Option<AgentSessionDetail> {
+        let mut detail = self.manager.session_detail(session_id)?.clone();
+        if let Some(binding) = self.session_bindings.get(session_id) {
+            detail.session.workdesk_id = binding.workdesk_id.clone();
+            detail.session.surface_id = binding.surface_id;
+        }
+        Some(detail)
+    }
+
+    fn wait_for_cursor_progress(&mut self, session_id: &AgentSessionId, before_cursor: u64) {
+        let mut observed_cursor = before_cursor;
+        let mut saw_progress = false;
+        let mut last_progress_at = Instant::now();
+        for _ in 0..DETAIL_PROGRESS_POLL_ATTEMPTS {
+            let _ = self.manager.poll_provider(session_id);
+            let Some(detail) = self.manager.session_detail(session_id) else {
+                return;
+            };
+            if detail.history_cursor > observed_cursor {
+                observed_cursor = detail.history_cursor;
+                saw_progress = true;
+                last_progress_at = Instant::now();
+            } else if saw_progress && last_progress_at.elapsed() >= DETAIL_PROGRESS_QUIET_WINDOW {
+                return;
+            }
+            std::thread::sleep(DETAIL_PROGRESS_POLL_SLEEP);
+        }
+    }
+
+    fn wait_for_detail_progress(
+        &mut self,
+        session_id: &AgentSessionId,
+        before_revision: u64,
+        before_cursor: u64,
+    ) {
+        let mut observed_revision = before_revision;
+        let mut observed_cursor = before_cursor;
+        let mut saw_progress = false;
+        let mut last_progress_at = Instant::now();
+        for _ in 0..DETAIL_PROGRESS_POLL_ATTEMPTS {
+            let _ = self.manager.poll_provider(session_id);
+            let Some(detail) = self.manager.session_detail(session_id) else {
+                return;
+            };
+            if detail.revision > observed_revision || detail.history_cursor > observed_cursor {
+                observed_revision = detail.revision;
+                observed_cursor = detail.history_cursor;
+                saw_progress = true;
+                last_progress_at = Instant::now();
+            } else if saw_progress && last_progress_at.elapsed() >= DETAIL_PROGRESS_QUIET_WINDOW {
+                return;
+            }
+            std::thread::sleep(DETAIL_PROGRESS_POLL_SLEEP);
+        }
+    }
 }
 
 impl Default for DaemonAgentRuntime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn filter_detail_after_sequence(
+    mut detail: AgentSessionDetail,
+    after_sequence: Option<u64>,
+) -> AgentSessionDetail {
+    if let Some(after_sequence) = after_sequence {
+        detail
+            .timeline
+            .retain(|entry| timeline_entry_sequence(entry) >= after_sequence);
+    }
+    detail
+}
+
+fn timeline_entry_sequence(entry: &AgentTimelineEntry) -> u64 {
+    match entry {
+        AgentTimelineEntry::Turn { sequence, .. }
+        | AgentTimelineEntry::ToolCall { sequence, .. }
+        | AgentTimelineEntry::ApprovalRequest { sequence, .. } => *sequence,
     }
 }

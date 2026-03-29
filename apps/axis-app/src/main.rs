@@ -2,6 +2,9 @@ use attention::{
     next_attention_pane_target, next_attention_workdesk_target, reduce_pane_attention_state,
     should_notify_attention_transition, summarize_workdesk_attention,
 };
+use agent_timeline::{
+    build_agent_timeline_view_model, AgentTimelineEntryView, PendingApprovalView,
+};
 use axis_agent_runtime::WorktreeService;
 use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionRecord, AgentTransportKind};
 use axis_core::paths::daemon_socket_path;
@@ -29,6 +32,7 @@ use review::{
 
 mod agent_provider_popup;
 mod agent_sessions;
+mod agent_timeline;
 mod attention;
 mod automation;
 mod daemon_client;
@@ -212,6 +216,7 @@ struct AxisShell {
     agent_provider_popup: Option<agent_provider_popup::AgentProviderPopupState>,
     workdesk_editor: Option<WorkdeskEditorState>,
     session_inspector: Option<AgentSessionInspectorTarget>,
+    agent_session_composer: Option<AgentSessionComposerState>,
     workspace_palette: Option<WorkspacePaletteState>,
     /// Desk index whose structured review payload is shown in the right-side review panel.
     review_panel: Option<usize>,
@@ -424,6 +429,23 @@ struct AgentSessionInspectorTarget {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentSessionComposerState {
+    target: AgentSessionInspectorTarget,
+    active: bool,
+    draft: String,
+}
+
+impl AgentSessionComposerState {
+    fn new(target: AgentSessionInspectorTarget) -> Self {
+        Self {
+            target,
+            active: false,
+            draft: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct AgentSessionInspectorView {
     session_id: String,
     provider_profile_id: String,
@@ -438,6 +460,11 @@ struct AgentSessionInspectorView {
     surface_id: SurfaceId,
     terminal_status: Option<String>,
     transcript_preview: Vec<String>,
+    can_send_turn: bool,
+    can_resume: bool,
+    can_respond_approval: bool,
+    timeline_entries: Vec<AgentTimelineEntryView>,
+    pending_approvals: Vec<PendingApprovalView>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1203,6 +1230,21 @@ fn agent_session_inspector_view(
     surface_id: SurfaceId,
 ) -> Option<AgentSessionInspectorView> {
     let record = bridge.session_for_surface(workdesk.runtime_id, surface_id)?;
+    let detail = bridge
+        .session_detail(&record.id, None)
+        .unwrap_or_else(|_| axis_core::agent_history::AgentSessionDetail {
+            session: record.clone(),
+            capabilities: Default::default(),
+            started_at_ms: None,
+            updated_at_ms: None,
+            completed_at_ms: None,
+            revision: 0,
+            history_cursor: 0,
+            pending_approval_id: None,
+            timeline: Vec::new(),
+            truncated: false,
+        });
+    let timeline = build_agent_timeline_view_model(&detail);
     let pane_title = workdesk
         .panes
         .iter()
@@ -1237,6 +1279,11 @@ fn agent_session_inspector_view(
         surface_id,
         terminal_status,
         transcript_preview,
+        can_send_turn: timeline.can_send_turn,
+        can_resume: timeline.can_resume,
+        can_respond_approval: timeline.can_respond_approval,
+        timeline_entries: timeline.timeline_entries,
+        pending_approvals: timeline.pending_approvals,
     })
 }
 
@@ -3000,6 +3047,7 @@ impl AxisShell {
             agent_provider_popup: None,
             workdesk_editor: None,
             session_inspector: None,
+            agent_session_composer: None,
             workspace_palette: None,
             review_panel: None,
             automation_rx: receiver,
@@ -4428,6 +4476,31 @@ impl AxisShell {
                         .collect::<Vec<_>>();
                     Ok(Value::Array(sessions))
                 }
+                SharedAutomationRequest::AgentGet(request) => {
+                    let detail = self
+                        .agent_runtime
+                        .session_detail(&request.agent_session_id, request.after_sequence)?;
+                    Ok(serde_json::to_value(detail).map_err(|error| error.to_string())?)
+                }
+                SharedAutomationRequest::AgentSendTurn(request) => {
+                    let detail = self
+                        .agent_runtime
+                        .send_turn(&request.agent_session_id, &request.text)?;
+                    Ok(serde_json::to_value(detail).map_err(|error| error.to_string())?)
+                }
+                SharedAutomationRequest::AgentRespondApproval(request) => {
+                    let detail = self.agent_runtime.respond_approval(
+                        &request.agent_session_id,
+                        &request.approval_request_id,
+                        request.approved,
+                        request.note,
+                    )?;
+                    Ok(serde_json::to_value(detail).map_err(|error| error.to_string())?)
+                }
+                SharedAutomationRequest::AgentResume(request) => {
+                    let detail = self.agent_runtime.resume(&request.agent_session_id)?;
+                    Ok(serde_json::to_value(detail).map_err(|error| error.to_string())?)
+                }
                 SharedAutomationRequest::DeskReviewSummary { worktree_id } => {
                     let base_for_attach = self
                         .resolve_workdesk_index_by_worktree_id(&worktree_id)
@@ -4751,20 +4824,217 @@ impl AxisShell {
         };
         if self.session_inspector == Some(target) {
             self.session_inspector = None;
+            self.agent_session_composer = None;
         } else {
             self.dismiss_workdesk_menu();
             self.dismiss_stack_surface_menu();
             self.dismiss_notifications();
             self.review_panel = None;
             self.session_inspector = Some(target);
+            self.agent_session_composer = Some(AgentSessionComposerState::new(target));
         }
         cx.notify();
     }
 
     fn close_session_inspector(&mut self, cx: &mut Context<Self>) {
         if self.session_inspector.take().is_some() {
+            self.agent_session_composer = None;
             cx.notify();
         }
+    }
+
+    fn session_record_for_inspector_target(
+        &self,
+        target: AgentSessionInspectorTarget,
+    ) -> Option<AgentSessionRecord> {
+        let workdesk = self.workdesks.get(target.desk_index)?;
+        self.agent_runtime
+            .session_for_surface(workdesk.runtime_id, target.surface_id)
+    }
+
+    fn focus_agent_session_composer(
+        &mut self,
+        target: AgentSessionInspectorTarget,
+        cx: &mut Context<Self>,
+    ) {
+        match self.agent_session_composer.as_mut() {
+            Some(composer) if composer.target == target => composer.active = true,
+            Some(composer) => {
+                *composer = AgentSessionComposerState::new(target);
+                composer.active = true;
+            }
+            None => {
+                let mut composer = AgentSessionComposerState::new(target);
+                composer.active = true;
+                self.agent_session_composer = Some(composer);
+            }
+        }
+        cx.notify();
+    }
+
+    fn submit_agent_session_composer(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(target) = self.session_inspector else {
+            return false;
+        };
+        let Some(text) = self
+            .agent_session_composer
+            .as_ref()
+            .filter(|composer| composer.target == target)
+            .map(|composer| composer.draft.trim().to_string())
+            .filter(|draft| !draft.is_empty())
+        else {
+            return false;
+        };
+        let Some(record) = self.session_record_for_inspector_target(target) else {
+            self.set_runtime_notice_for_workdesk(
+                target.desk_index,
+                "Agent session is no longer available",
+            );
+            cx.notify();
+            return true;
+        };
+        match self.agent_runtime.send_turn(&record.id, &text) {
+            Ok(_) => {
+                if let Some(composer) = self
+                    .agent_session_composer
+                    .as_mut()
+                    .filter(|composer| composer.target == target)
+                {
+                    composer.draft.clear();
+                    composer.active = true;
+                }
+                self.sync_agent_runtime_activity(cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.set_runtime_notice_for_workdesk(
+                    target.desk_index,
+                    format!("agent send failed: {error}"),
+                );
+                cx.notify();
+            }
+        }
+        true
+    }
+
+    fn respond_to_session_inspector_approval(
+        &mut self,
+        target: AgentSessionInspectorTarget,
+        approval_id: axis_core::agent_history::AgentApprovalRequestId,
+        approved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.session_record_for_inspector_target(target) else {
+            self.set_runtime_notice_for_workdesk(
+                target.desk_index,
+                "Agent session is no longer available",
+            );
+            cx.notify();
+            return;
+        };
+        match self.agent_runtime.respond_approval(
+            &record.id,
+            &approval_id,
+            approved,
+            None,
+        ) {
+            Ok(_) => {
+                self.sync_agent_runtime_activity(cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.set_runtime_notice_for_workdesk(
+                    target.desk_index,
+                    format!("agent approval failed: {error}"),
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    fn resume_session_from_inspector(
+        &mut self,
+        target: AgentSessionInspectorTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.session_record_for_inspector_target(target) else {
+            self.set_runtime_notice_for_workdesk(
+                target.desk_index,
+                "Agent session is no longer available",
+            );
+            cx.notify();
+            return;
+        };
+        match self.agent_runtime.resume(&record.id) {
+            Ok(_) => {
+                self.sync_agent_runtime_activity(cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.set_runtime_notice_for_workdesk(
+                    target.desk_index,
+                    format!("agent resume failed: {error}"),
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    fn handle_agent_session_composer_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(target) = self.session_inspector else {
+            return false;
+        };
+        let active = self
+            .agent_session_composer
+            .as_ref()
+            .is_some_and(|composer| composer.target == target && composer.active);
+        if !active {
+            return false;
+        }
+        let keystroke = &event.keystroke;
+        if keystroke.key == "escape" && !keystroke.modifiers.modified() {
+            if let Some(composer) = self
+                .agent_session_composer
+                .as_mut()
+                .filter(|composer| composer.target == target)
+            {
+                composer.active = false;
+            }
+            cx.notify();
+            return true;
+        }
+        if keystroke.key == "enter" && !keystroke.modifiers.modified() {
+            return self.submit_agent_session_composer(cx);
+        }
+        if matches!(keystroke.key.as_str(), "backspace" | "delete")
+            && !keystroke.modifiers.modified()
+        {
+            if let Some(composer) = self
+                .agent_session_composer
+                .as_mut()
+                .filter(|composer| composer.target == target)
+            {
+                composer.draft.pop();
+            }
+            cx.notify();
+            return true;
+        }
+        if let Some(text) = editable_keystroke_text(keystroke) {
+            if let Some(composer) = self
+                .agent_session_composer
+                .as_mut()
+                .filter(|composer| composer.target == target)
+            {
+                composer.draft.push_str(&text);
+            }
+            cx.notify();
+            return true;
+        }
+        true
     }
 
     fn handle_terminal_attention_transition(
@@ -6438,6 +6708,11 @@ impl AxisShell {
         cx: &mut Context<Self>,
     ) {
         if self.handle_shortcut_recording(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.handle_agent_session_composer_key_down(event, cx) {
             cx.stop_propagation();
             return;
         }
@@ -8679,7 +8954,12 @@ impl Render for AxisShell {
         let session_inspector_view = self
             .session_inspector
             .and_then(|target| self.agent_session_inspector_view_for_target(target));
-        let session_inspector_overlay = self.session_inspector.map(|_| {
+        let session_inspector_overlay = self.session_inspector.map(|target| {
+            let session_composer = self
+                .agent_session_composer
+                .clone()
+                .filter(|composer| composer.target == target)
+                .unwrap_or_else(|| AgentSessionComposerState::new(target));
             div()
                 .absolute()
                 .left(px(0.0))
@@ -8738,7 +9018,7 @@ impl Render for AxisShell {
                                                 .text_xs()
                                                 .text_color(rgb(0x90a0aa))
                                                 .child(
-                                                    "Lifecycle, routing attention, and recent replay output.",
+                                                    "Structured timeline, approvals, and recent terminal replay.",
                                                 ),
                                         ),
                                 )
@@ -8752,95 +9032,285 @@ impl Render for AxisShell {
                                 )),
                         )
                         .when_some(session_inspector_view.clone(), |panel, view| {
-                            panel
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .child(context_pill(
-                                            agent_lifecycle_label(view.lifecycle),
-                                            rgb(0x77d19a).into(),
-                                        ))
-                                        .child(context_pill(
-                                            agent_attention_label(view.attention),
-                                            attention::agent_attention_state(view.attention).tint(),
-                                        ))
-                                        .child(context_pill(
-                                            agent_transport_label(view.transport),
-                                            rgb(0x90a0aa).into(),
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .child(inspector_row("Session", view.session_id.clone()))
-                                        .child(inspector_row("Provider", view.provider_profile_id.clone()))
-                                        .when_some(view.capability_note.clone(), |rows, note| {
-                                            rows.child(inspector_row("Capability", note))
-                                        })
-                                        .child(inspector_row("Desk", view.workdesk_name.clone()))
-                                        .child(inspector_row("Pane", view.pane_title.clone()))
-                                        .child(inspector_row(
-                                            "Surface",
-                                            view.surface_id.raw().to_string(),
-                                        ))
-                                        .child(inspector_row("Cwd", view.cwd.clone()))
-                                        .child(inspector_row("Status", view.status_message.clone()))
-                                        .when_some(view.terminal_status.clone(), |rows, status| {
-                                            rows.child(inspector_row("Terminal", status))
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .child(
+                            let composer_draft = session_composer.draft.clone();
+                            let composer_active = session_composer.active;
+                            let can_submit_turn =
+                                view.can_send_turn && !composer_draft.trim().is_empty();
+                            panel.child(
+                                div()
+                                    .id("agent-session-inspector-scroll")
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_3()
+                                    .overflow_y_scroll()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .child(context_pill(
+                                                agent_lifecycle_label(view.lifecycle),
+                                                rgb(0x77d19a).into(),
+                                            ))
+                                            .child(context_pill(
+                                                agent_attention_label(view.attention),
+                                                attention::agent_attention_state(view.attention)
+                                                    .tint(),
+                                            ))
+                                            .child(context_pill(
+                                                agent_transport_label(view.transport),
+                                                rgb(0x90a0aa).into(),
+                                            ))
+                                            .when(view.can_send_turn, |row| {
+                                                row.child(context_pill(
+                                                    "Turn input",
+                                                    rgb(0x7cc7ff).into(),
+                                                ))
+                                            })
+                                            .when(view.can_resume, |row| {
+                                                row.child(context_pill(
+                                                    "Resume ready",
+                                                    rgb(0xf0d35f).into(),
+                                                ))
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x7f8a94))
+                                                    .child("Timeline"),
+                                            )
+                                            .children(
+                                                if view.timeline_entries.is_empty() {
+                                                    vec![div()
+                                                        .p_3()
+                                                        .bg(rgb(0x10171d))
+                                                        .border_1()
+                                                        .border_color(rgb(0x24313b))
+                                                        .rounded_lg()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x7f8a94))
+                                                        .child("No structured events yet.")
+                                                        .into_any_element()]
+                                                } else {
+                                                    view.timeline_entries
+                                                        .clone()
+                                                        .into_iter()
+                                                        .map(|entry| {
+                                                            agent_timeline_entry_card(entry)
+                                                                .into_any_element()
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                },
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .p_3()
+                                            .bg(rgb(0x10171d))
+                                            .border_1()
+                                            .border_color(rgb(0x24313b))
+                                            .rounded_lg()
+                                            .child(inspector_row("Session", view.session_id.clone()))
+                                            .child(inspector_row(
+                                                "Provider",
+                                                view.provider_profile_id.clone(),
+                                            ))
+                                            .when_some(view.capability_note.clone(), |rows, note| {
+                                                rows.child(inspector_row("Capability", note))
+                                            })
+                                            .child(inspector_row("Desk", view.workdesk_name.clone()))
+                                            .child(inspector_row("Pane", view.pane_title.clone()))
+                                            .child(inspector_row(
+                                                "Surface",
+                                                view.surface_id.raw().to_string(),
+                                            ))
+                                            .child(inspector_row("Cwd", view.cwd.clone()))
+                                            .child(inspector_row(
+                                                "Status",
+                                                view.status_message.clone(),
+                                            ))
+                                            .when_some(view.terminal_status.clone(), |rows, status| {
+                                                rows.child(inspector_row("Terminal", status))
+                                            }),
+                                    )
+                                    .when(
+                                        view.can_send_turn || view.can_resume,
+                                        |content| {
+                                        content.child(
                                             div()
-                                                .text_xs()
-                                                .text_color(rgb(0x7f8a94))
-                                                .child("Recent replay"),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_h(px(180.0))
-                                                .max_h(px((viewport_height - 260.0).max(180.0)))
-                                                .overflow_hidden()
-                                                .p_3()
-                                                .bg(rgb(0x10171d))
-                                                .border_1()
-                                                .border_color(rgb(0x24313b))
-                                                .rounded_lg()
-                                                .font_family(".ZedMono")
-                                                .text_xs()
-                                                .text_color(rgb(0xdce2e8))
+                                                .flex()
+                                                .flex_col()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x7f8a94))
+                                                        .child("Session actions"),
+                                                )
+                                                .when(view.can_send_turn, |section| {
+                                                    section.child(workdesk_editor_field(
+                                                        "Turn input",
+                                                        composer_draft.clone(),
+                                                        composer_active,
+                                                        rgb(0x7cc7ff).into(),
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            this.focus_agent_session_composer(
+                                                                target, cx,
+                                                            );
+                                                            cx.stop_propagation();
+                                                        }),
+                                                    ))
+                                                })
                                                 .child(
                                                     div()
                                                         .flex()
-                                                        .flex_col()
-                                                        .gap_1()
-                                                        .children(
-                                                            if view.transcript_preview.is_empty() {
-                                                                vec![div()
-                                                                    .text_color(rgb(0x7f8a94))
-                                                                    .child("No terminal output yet.")
-                                                                    .into_any_element()]
-                                                            } else {
-                                                                view.transcript_preview
-                                                                    .into_iter()
-                                                                    .map(|line| {
-                                                                        div().child(line).into_any_element()
-                                                                    })
-                                                                    .collect::<Vec<_>>()
-                                                            },
-                                                        ),
+                                                        .gap_2()
+                                                        .when(view.can_send_turn, |row| {
+                                                            row.child(agent_inspector_action_button(
+                                                                "Send turn",
+                                                                "Submit the draft prompt",
+                                                                rgb(0x7cc7ff).into(),
+                                                                can_submit_turn,
+                                                                cx.listener(|this, _, _, cx| {
+                                                                    this.submit_agent_session_composer(
+                                                                        cx,
+                                                                    );
+                                                                    cx.stop_propagation();
+                                                                }),
+                                                            ))
+                                                        })
+                                                        .when(view.can_resume, |row| {
+                                                            row.child(agent_inspector_action_button(
+                                                                "Resume",
+                                                                "Continue the active loop",
+                                                                rgb(0xf0d35f).into(),
+                                                                true,
+                                                                cx.listener(move |this, _, _, cx| {
+                                                                    this.resume_session_from_inspector(
+                                                                        target, cx,
+                                                                    );
+                                                                    cx.stop_propagation();
+                                                                }),
+                                                            ))
+                                                        }),
                                                 ),
-                                        ),
-                                )
+                                        )
+                                        },
+                                    )
+                                    .when(
+                                        !view.pending_approvals.is_empty(),
+                                        |content| {
+                                        content.child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x7f8a94))
+                                                        .child("Pending approvals"),
+                                                )
+                                                .children(
+                                                    view.pending_approvals
+                                                        .clone()
+                                                        .into_iter()
+                                                        .map(|approval| {
+                                                            let approve_id = approval.id.clone();
+                                                            let deny_id = approval.id.clone();
+                                                            agent_pending_approval_card(
+                                                                approval,
+                                                                view.can_respond_approval,
+                                                                cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.respond_to_session_inspector_approval(
+                                                                            target,
+                                                                            approve_id.clone(),
+                                                                            true,
+                                                                            cx,
+                                                                        );
+                                                                        cx.stop_propagation();
+                                                                    },
+                                                                ),
+                                                                cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.respond_to_session_inspector_approval(
+                                                                            target,
+                                                                            deny_id.clone(),
+                                                                            false,
+                                                                            cx,
+                                                                        );
+                                                                        cx.stop_propagation();
+                                                                    },
+                                                                ),
+                                                            )
+                                                            .into_any_element()
+                                                        })
+                                                        .collect::<Vec<_>>(),
+                                                ),
+                                        )
+                                        },
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x7f8a94))
+                                                    .child("Recent replay"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .min_h(px(140.0))
+                                                    .max_h(px((viewport_height - 460.0).max(140.0)))
+                                                    .overflow_hidden()
+                                                    .p_3()
+                                                    .bg(rgb(0x10171d))
+                                                    .border_1()
+                                                    .border_color(rgb(0x24313b))
+                                                    .rounded_lg()
+                                                    .font_family(".ZedMono")
+                                                    .text_xs()
+                                                    .text_color(rgb(0xdce2e8))
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap_1()
+                                                            .children(
+                                                                if view.transcript_preview.is_empty() {
+                                                                    vec![div()
+                                                                        .text_color(rgb(0x7f8a94))
+                                                                        .child("No terminal output yet.")
+                                                                        .into_any_element()]
+                                                                } else {
+                                                                    view.transcript_preview
+                                                                        .into_iter()
+                                                                        .map(|line| {
+                                                                            div()
+                                                                                .child(line)
+                                                                                .into_any_element()
+                                                                        })
+                                                                        .collect::<Vec<_>>()
+                                                                },
+                                                            ),
+                                                    ),
+                                            ),
+                                    ),
+                            )
                         })
                         .when(session_inspector_view.is_none(), |panel| {
                             panel.child(
@@ -12676,6 +13146,137 @@ fn inspector_row(label: &str, value: impl Into<String>) -> impl IntoElement {
         )
 }
 
+fn agent_timeline_state_tint(state_label: &str, pending: bool) -> gpui::Hsla {
+    if pending {
+        return rgb(0xf0d35f).into();
+    }
+    match state_label {
+        "completed" | "approved" => rgb(0x77d19a).into(),
+        "running" | "streaming" => rgb(0x7cc7ff).into(),
+        "failed" | "denied" | "cancelled" => rgb(0xff9b88).into(),
+        _ => rgb(0x90a0aa).into(),
+    }
+}
+
+fn agent_inspector_action_button(
+    label: &str,
+    detail: &str,
+    accent: gpui::Hsla,
+    enabled: bool,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let label = label.to_string();
+    let detail = detail.to_string();
+    let background = if enabled { rgb(0x16212a) } else { rgb(0x11181e) };
+    let border = if enabled { accent } else { rgb(0x293742).into() };
+    let label_tint = if enabled { accent } else { rgb(0x67737d).into() };
+    let detail_tint = if enabled {
+        rgb(0xd5dee6)
+    } else {
+        rgb(0x6f7b85)
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .bg(background)
+        .border_1()
+        .border_color(border)
+        .rounded_lg()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .when(enabled, |button| {
+            button
+                .cursor_pointer()
+                .on_mouse_up(MouseButton::Left, listener)
+        })
+        .child(div().text_sm().text_color(label_tint).child(label))
+        .child(div().text_xs().text_color(detail_tint).child(detail))
+}
+
+fn agent_timeline_entry_card(entry: AgentTimelineEntryView) -> impl IntoElement {
+    let tint = agent_timeline_state_tint(&entry.state_label, entry.pending);
+    let title = entry.title;
+    let body = if entry.body.trim().is_empty() {
+        "No details provided.".to_string()
+    } else {
+        entry.body
+    };
+    let state_label = entry.state_label;
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3()
+        .bg(rgb(0x10171d))
+        .border_1()
+        .border_color(rgb(0x24313b))
+        .rounded_lg()
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .gap_3()
+                .child(div().text_sm().text_color(rgb(0xe4ebf1)).child(title))
+                .child(context_pill(state_label, tint)),
+        )
+        .child(div().text_xs().text_color(rgb(0xc9d3dc)).child(body))
+}
+
+fn agent_pending_approval_card(
+    approval: PendingApprovalView,
+    actionable: bool,
+    approve_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    deny_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p_3()
+        .bg(rgb(0x15110f))
+        .border_1()
+        .border_color(rgb(0x5b4330))
+        .rounded_lg()
+        .child(div().text_sm().text_color(rgb(0xf0d35f)).child(approval.title))
+        .child(div().text_xs().text_color(rgb(0xe4d4c5)).child(approval.details))
+        .when(actionable, |card| {
+            card.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(agent_inspector_action_button(
+                        "Approve",
+                        "Allow this request",
+                        rgb(0x77d19a).into(),
+                        true,
+                        approve_listener,
+                    ))
+                    .child(agent_inspector_action_button(
+                        "Deny",
+                        "Reject this request",
+                        rgb(0xff9b88).into(),
+                        true,
+                        deny_listener,
+                    )),
+            )
+        })
+        .when(!actionable, |card| {
+            card.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8e9ba5))
+                    .child("Approval responses are not available for this provider."),
+            )
+        })
+}
+
 fn signal_dot(color: gpui::Hsla, filled: bool) -> impl IntoElement {
     div()
         .w(px(8.0))
@@ -15755,6 +16356,12 @@ mod tests {
             ensure_agent_runtime_for_surface(&bridge, desk.runtime_id, &mut desk, surface_id)
                 .expect("desk should start")
         );
+        let record = bridge
+            .session_for_surface(desk.runtime_id, surface_id)
+            .expect("session should exist");
+        bridge
+            .send_turn(&record.id, "Continue with the test.")
+            .expect("send_turn should succeed");
 
         let view = agent_session_inspector_view(&bridge, &desk, surface_id)
             .expect("agent session inspector view should exist");
@@ -15763,6 +16370,11 @@ mod tests {
         assert_eq!(view.pane_title, "Agent");
         assert_eq!(view.surface_id, surface_id);
         assert!(!view.session_id.is_empty());
+        assert!(view.can_send_turn);
+        assert!(view.can_resume);
+        assert_eq!(view.timeline_entries.len(), 1);
+        assert_eq!(view.timeline_entries[0].title, "User turn");
+        assert_eq!(view.timeline_entries[0].body, "Continue with the test.");
 
         shutdown_workdesk_terminals(&mut desk);
     }

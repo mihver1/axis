@@ -1,12 +1,44 @@
 //! Shared automation request/response schema for app and CLI over a local control channel.
 
 use crate::agent::AgentSessionId;
+use crate::agent_history::AgentApprovalRequestId;
 use crate::terminal::{TerminalSessionId, TerminalSurfaceKind};
 use crate::workdesk::{WorkdeskId, WorkdeskRecord};
 use crate::worktree::WorktreeId;
 use crate::SurfaceId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentGetRequest {
+    pub agent_session_id: AgentSessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentSendTurnRequest {
+    pub agent_session_id: AgentSessionId,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentRespondApprovalRequest {
+    pub agent_session_id: AgentSessionId,
+    pub approval_request_id: AgentApprovalRequestId,
+    pub approved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentResumeRequest {
+    pub agent_session_id: AgentSessionId,
+}
 
 /// Single request envelope: dotted method name plus typed parameters.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -80,6 +112,14 @@ pub enum AutomationRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktree_id: Option<WorktreeId>,
     },
+    #[serde(rename = "agent.get")]
+    AgentGet(AgentGetRequest),
+    #[serde(rename = "agent.send_turn")]
+    AgentSendTurn(AgentSendTurnRequest),
+    #[serde(rename = "agent.respond_approval")]
+    AgentRespondApproval(AgentRespondApprovalRequest),
+    #[serde(rename = "agent.resume")]
+    AgentResume(AgentResumeRequest),
     #[serde(rename = "review.summary")]
     DeskReviewSummary { worktree_id: WorktreeId },
     #[serde(rename = "attention.next")]

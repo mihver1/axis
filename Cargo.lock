@@ -487,6 +487,7 @@ dependencies = [
  "axis-core",
  "process-manager",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 

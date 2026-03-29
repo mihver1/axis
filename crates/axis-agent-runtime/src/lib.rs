@@ -2,6 +2,7 @@
 
 pub mod adapters;
 mod bin_resolver;
+pub mod cli_protocol;
 pub mod events;
 pub mod provider;
 pub mod session;
@@ -17,7 +18,8 @@ pub use bin_resolver::{
 };
 pub use events::RuntimeEvent;
 pub use provider::{
-    AgentProvider, ProviderProfileMetadata, ProviderRegistry, StartAgentRequest, StartedSession,
+    AgentProvider, ProviderProfileMetadata, ProviderRegistry, RespondApprovalRequest,
+    ResumeRequest, SendTurnRequest, StartAgentRequest, StartedSession,
 };
 pub use session::SessionManager;
 pub use worktree::WorktreeService;
