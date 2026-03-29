@@ -117,6 +117,7 @@ fn daemon_terminal_requests_spawn_write_read_and_close() {
             cwd: Some(temp.path().display().to_string()),
             cols: 80,
             rows: 24,
+            command: None,
         },
     )
     .expect("terminal ensure should succeed");
@@ -172,6 +173,7 @@ fn daemon_terminal_reuses_session_for_same_surface_after_reconnect() {
             cwd: Some(temp.path().display().to_string()),
             cols: 90,
             rows: 28,
+            command: None,
         },
     )
     .expect("first ensure should succeed");
@@ -205,6 +207,7 @@ fn daemon_terminal_reuses_session_for_same_surface_after_reconnect() {
             cwd: Some(temp.path().display().to_string()),
             cols: 90,
             rows: 28,
+            command: None,
         },
     )
     .expect("second ensure should succeed");

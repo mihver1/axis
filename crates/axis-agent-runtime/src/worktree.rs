@@ -4,7 +4,10 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{anyhow, Context};
+use axis_core::review::DeskReviewPayload;
 use axis_core::worktree::WorktreeBinding;
+
+use crate::review_diff::{build_desk_review_payload, parse_porcelain_paths, ReviewPayloadLimits};
 
 /// Helpers to create, attach, and inspect git worktrees.
 pub struct WorktreeService;
@@ -57,22 +60,27 @@ impl WorktreeService {
         Ok(parse_line_list(&out))
     }
 
-    /// Working tree paths reported by `git status --porcelain` (minimal parsing).
+    /// Working tree paths reported by `git status --porcelain -z`.
     pub fn uncommitted_changed_files(root: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
         let root = root.as_ref();
-        let porcelain = git_output(root, &["status", "--porcelain"])?;
-        let mut names = Vec::new();
-        for line in porcelain.lines() {
-            if line.len() > 3 {
-                let rest = line[3..].trim();
-                if let Some((first, _)) = rest.split_once(" -> ") {
-                    names.push(first.trim().to_string());
-                } else if !rest.is_empty() {
-                    names.push(rest.to_string());
-                }
-            }
-        }
-        Ok(names)
+        let porcelain = git_output(root, &["status", "--porcelain", "-z"])?;
+        Ok(parse_porcelain_paths(&porcelain))
+    }
+
+    /// Builds a structured desk review payload: working tree vs `merge-base(base_branch, HEAD)` when
+    /// `base_branch` resolves, otherwise vs `HEAD` (or status-only when `HEAD` is unborn).
+    pub fn review_payload(
+        root: impl AsRef<Path>,
+        base_branch: Option<&str>,
+        working_tree_dirty: bool,
+        limits: ReviewPayloadLimits,
+    ) -> anyhow::Result<DeskReviewPayload> {
+        build_desk_review_payload(
+            root.as_ref(),
+            base_branch,
+            working_tree_dirty,
+            limits,
+        )
     }
 
     fn inspect(root: &Path, base_branch: Option<String>) -> anyhow::Result<WorktreeBinding> {

@@ -4,9 +4,10 @@ use crate::persistence::{load_registry, save_registry};
 use crate::registry::{DaemonRegistry, TerminalRegistry};
 use crate::transcript_store::TranscriptStore;
 use anyhow::Context;
-use axis_agent_runtime::WorktreeService;
+use axis_agent_runtime::{ReviewPayloadLimits, WorktreeService};
+use axis_core::agent::{AgentAttention, AgentSessionRecord};
 use axis_core::automation::{AutomationRequest, AutomationResponse};
-use axis_core::worktree::ReviewSummary;
+use axis_core::workdesk::WorkdeskRecord;
 use axis_terminal::TerminalGridSize;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -181,6 +182,7 @@ fn serve(
                 let thread_state = Arc::clone(&state);
                 thread::spawn(move || {
                     let mut stream = stream;
+                    let _ = stream.set_nonblocking(false);
                     let response_payload = handle_stream(
                         &mut stream,
                         &thread_socket_path,
@@ -396,28 +398,91 @@ fn handle_request(
             AutomationResponse::success_with_result(serde_json::to_value(sessions)?)
         }
         AutomationRequest::DeskReviewSummary { worktree_id } => {
-            let binding = WorktreeService::attach(&worktree_id.0, None)?;
-            let changed_files = binding
-                .base_branch
+            let base_branch = state
+                .lock()
+                .map_err(|error| anyhow::anyhow!("registry lock poisoned: {error}"))?
+                .workdesks
+                .base_branch_for_worktree_root(&worktree_id.0)?;
+            let binding = WorktreeService::attach(&worktree_id.0, base_branch)?;
+            let payload = WorktreeService::review_payload(
+                &worktree_id.0,
+                binding.base_branch.as_deref(),
+                binding.dirty,
+                ReviewPayloadLimits::default(),
+            )?;
+            AutomationResponse::success_with_result(serde_json::to_value(payload)?)
+        }
+        AutomationRequest::AttentionNext { workdesk_id } => {
+            let mut guard = state
+                .lock()
+                .map_err(|error| anyhow::anyhow!("registry lock poisoned: {error}"))?;
+            guard.agent_runtime.poll_all().map_err(anyhow::Error::msg)?;
+            let selected_workdesk = workdesk_id
                 .as_deref()
-                .map(|base_branch| {
-                    WorktreeService::changed_files_since_base(&binding.root_path, base_branch)
+                .map(|selector| {
+                    resolve_workdesk_selector(&guard.workdesks, selector)
+                        .ok_or_else(|| anyhow::anyhow!("unknown workdesk `{selector}`"))
                 })
-                .transpose()?
-                .unwrap_or_default();
-            let uncommitted_files = WorktreeService::uncommitted_changed_files(&binding.root_path)?;
-            let summary = ReviewSummary {
-                files_changed: changed_files.len() as u32,
-                uncommitted_files: uncommitted_files.len() as u32,
-                ready_for_review: !changed_files.is_empty() || !uncommitted_files.is_empty(),
-                last_inspected_at_ms: Some(unix_time_ms()),
-            };
-            AutomationResponse::success_with_result(json!({
-                "worktree_id": worktree_id,
-                "summary": summary,
-                "changed_files": changed_files,
-                "uncommitted_files": uncommitted_files,
-            }))
+                .transpose()?;
+            let sessions = filtered_agent_sessions(
+                &guard.agent_runtime,
+                selected_workdesk
+                    .as_ref()
+                    .map(|record| record.workdesk_id.0.as_str()),
+            );
+            match next_attention_session(&sessions) {
+                Some(agent_session) => {
+                    let workdesk = agent_session
+                        .workdesk_id
+                        .as_deref()
+                        .and_then(|id| lookup_workdesk(&guard.workdesks, id));
+                    let worktree_id = workdesk.as_ref().and_then(worktree_id_from_record);
+                    AutomationResponse::success_with_result(json!({
+                        "control_plane": "axisd",
+                        "workdesk": workdesk,
+                        "worktree_id": worktree_id,
+                        "agent_session": agent_session,
+                    }))
+                }
+                None => AutomationResponse::success_with_result(Value::Null),
+            }
+        }
+        AutomationRequest::StateCurrent { workdesk_id } => {
+            let mut guard = state
+                .lock()
+                .map_err(|error| anyhow::anyhow!("registry lock poisoned: {error}"))?;
+            guard.agent_runtime.poll_all().map_err(anyhow::Error::msg)?;
+            let all_workdesks = guard.workdesks.list_workdesks(None);
+            let all_sessions = filtered_agent_sessions(&guard.agent_runtime, None);
+            match workdesk_id {
+                Some(selector) => {
+                    let workdesk = resolve_workdesk_selector_from_records(&all_workdesks, &selector)
+                        .ok_or_else(|| anyhow::anyhow!("unknown workdesk `{selector}`"))?;
+                    let sessions = all_sessions
+                        .into_iter()
+                        .filter(|record| {
+                            record.workdesk_id.as_deref()
+                                == Some(workdesk.workdesk_id.0.as_str())
+                        })
+                        .collect::<Vec<_>>();
+                    let worktree_id = worktree_id_from_record(&workdesk);
+                    AutomationResponse::success_with_result(json!({
+                        "control_plane": "axisd",
+                        "active_workdesk": Value::Null,
+                        "socket_path": socket_path.display().to_string(),
+                        "workdesk": workdesk,
+                        "worktree_id": worktree_id,
+                        "agent_sessions": sessions,
+                    }))
+                }
+                None => AutomationResponse::success_with_result(json!({
+                    "control_plane": "axisd",
+                    "active_workdesk": Value::Null,
+                    "socket_path": socket_path.display().to_string(),
+                    "workdesks": all_workdesks,
+                    "agent_sessions": all_sessions,
+                })),
+            }
         }
         AutomationRequest::TerminalEnsure {
             workdesk_id,
@@ -427,6 +492,7 @@ fn handle_request(
             cwd,
             cols,
             rows,
+            command,
         } => {
             let record = state
                 .lock()
@@ -439,6 +505,7 @@ fn handle_request(
                     title,
                     cwd,
                     TerminalGridSize::new(cols, rows),
+                    command,
                 )?;
             AutomationResponse::success_with_result(serde_json::to_value(record)?)
         }
@@ -543,7 +610,6 @@ fn handle_request(
                 }))
             }
         }
-        _ => AutomationResponse::failure("unsupported axisd automation request"),
     };
 
     Ok(response)
@@ -599,4 +665,67 @@ fn gui_heartbeat_ttl_ms() -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(5_000)
+}
+
+fn filtered_agent_sessions(
+    runtime: &DaemonAgentRuntime,
+    workdesk_id: Option<&str>,
+) -> Vec<AgentSessionRecord> {
+    let mut sessions = runtime
+        .sessions_snapshot()
+        .into_iter()
+        .filter(|record| {
+            workdesk_id
+                .map(|filter| record.workdesk_id.as_deref() == Some(filter))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+    sessions
+}
+
+fn lookup_workdesk(registry: &DaemonRegistry, workdesk_id: &str) -> Option<WorkdeskRecord> {
+    resolve_workdesk_selector(registry, workdesk_id)
+}
+
+fn resolve_workdesk_selector(registry: &DaemonRegistry, selector: &str) -> Option<WorkdeskRecord> {
+    let records = registry.list_workdesks(None);
+    resolve_workdesk_selector_from_records(&records, selector)
+}
+
+fn resolve_workdesk_selector_from_records(
+    records: &[WorkdeskRecord],
+    selector: &str,
+) -> Option<WorkdeskRecord> {
+    records
+        .iter()
+        .find(|record| record.workdesk_id.0 == selector || record.name == selector)
+        .cloned()
+}
+
+fn worktree_id_from_record(record: &WorkdeskRecord) -> Option<String> {
+    record
+        .worktree_binding
+        .as_ref()
+        .map(|binding| binding.root_path.clone())
+}
+
+fn next_attention_session(sessions: &[AgentSessionRecord]) -> Option<AgentSessionRecord> {
+    sessions
+        .iter()
+        .filter_map(|record| {
+            attention_jump_priority(record.attention)
+                .map(|priority| ((priority, record.id.0.as_str()), record))
+        })
+        .min_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, record)| record.clone())
+}
+
+fn attention_jump_priority(attention: AgentAttention) -> Option<u8> {
+    match attention {
+        AgentAttention::NeedsInput => Some(0),
+        AgentAttention::NeedsReview => Some(1),
+        AgentAttention::Error => Some(2),
+        AgentAttention::Quiet | AgentAttention::Working => None,
+    }
 }

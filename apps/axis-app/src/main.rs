@@ -3,10 +3,11 @@ use attention::{
     should_notify_attention_transition, summarize_workdesk_attention,
 };
 use axis_agent_runtime::WorktreeService;
-use axis_core::agent::AgentSessionRecord;
+use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionRecord, AgentTransportKind};
 use axis_core::paths::daemon_socket_path;
 use axis_core::workdesk::{WorkdeskId, WorkdeskRecord};
-use axis_core::worktree::{ReviewSummary, WorktreeBinding, WorktreeId};
+use axis_core::review::DeskReviewPayload;
+use axis_core::worktree::{WorktreeBinding, WorktreeId};
 use axis_core::{
     automation::{
         AutomationRequest as SharedAutomationRequest,
@@ -15,9 +16,15 @@ use axis_core::{
     PaneId, PaneKind, PaneRecord, Point as WorkdeskPoint, Size as WorkdeskSize, SurfaceId,
     SurfaceKind, SurfaceRecord,
 };
+use axis_core::review::ReviewLineKind;
 use review::{
-    build_desk_review_summary_view, merge_changed_files, refreshed_desk_review_summary_view,
-    review_changed_file_preview, review_status_label, DeskReviewSummaryView,
+    build_desk_review_summary_view, build_desk_review_summary_view_from_payload,
+    editor_jump_line_for_review_row, merge_review_local_after_fetch,
+    refreshed_desk_review_summary_view, resolve_local_desk_review_payload,
+    review_changed_file_preview, review_editor_open_failed_notice,
+    review_file_hunkless_notice, review_payload_worktree_rebound, review_status_label,
+    review_workspace_setup_notice, reusable_review_payload_cache, DeskReviewSummaryView,
+    ReviewPanelLocalState, ReviewPanelRefreshContext,
 };
 
 mod agent_provider_popup;
@@ -51,10 +58,10 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{self, Receiver},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use worktrees::{DEFAULT_AGENT_SIZE, DEFAULT_SHELL_SIZE};
 
@@ -100,9 +107,14 @@ const SHORTCUT_PANEL_WIDTH: f32 = 540.0;
 const SHORTCUT_PANEL_MARGIN: f32 = 20.0;
 const FLOATING_DOCK_MARGIN: f32 = 16.0;
 const INSPECTOR_PANEL_WIDTH: f32 = 360.0;
+const SESSION_INSPECTOR_WIDTH: f32 = 420.0;
+const WORKSPACE_PALETTE_WIDTH: f32 = 640.0;
+const WORKSPACE_PALETTE_RESULTS_LIMIT: usize = 40;
+const WORKSPACE_SEARCH_RESULTS_LIMIT: usize = 40;
 const WORKDESK_EDITOR_WIDTH: f32 = 436.0;
 const SIDEBAR_WINDOW_CONTROLS_INSET: f32 = 34.0;
 const NOTIFICATION_PANEL_WIDTH: f32 = 264.0;
+const MAX_NOTIFICATION_ITEMS: usize = 24;
 const PRODUCT_NAME: &str = "axis";
 const APP_DATA_DIR: &str = ".axis";
 const LEGACY_APP_DATA_DIR: &str = ".canvas";
@@ -161,6 +173,10 @@ struct WorkdeskState {
     worktree_binding: Option<WorktreeBinding>,
     /// Transient review summary derived from current worktree metadata.
     review_summary: Option<DeskReviewSummaryView>,
+    /// Last structured review payload from daemon/local fetch; retained when only compact summary refreshes.
+    review_payload_cache: Option<DeskReviewPayload>,
+    /// Desk-local selection, hunk markers, and review notices (not persisted).
+    review_local_state: ReviewPanelLocalState,
     panes: Vec<PaneRecord>,
     pane_attention: HashMap<PaneId, PaneAttention>,
     terminals: HashMap<SurfaceId, RemoteTerminalSession>,
@@ -195,6 +211,10 @@ struct AxisShell {
     #[allow(dead_code)]
     agent_provider_popup: Option<agent_provider_popup::AgentProviderPopupState>,
     workdesk_editor: Option<WorkdeskEditorState>,
+    session_inspector: Option<AgentSessionInspectorTarget>,
+    workspace_palette: Option<WorkspacePaletteState>,
+    /// Desk index whose structured review payload is shown in the right-side review panel.
+    review_panel: Option<usize>,
     automation_rx: Receiver<AutomationEnvelope>,
     focus_handle: FocusHandle,
     automation_socket_path: SharedString,
@@ -205,7 +225,7 @@ struct AxisShell {
     inspector_open: bool,
     sidebar_collapsed: bool,
     notifications_open: bool,
-    mock_notifications_unread: usize,
+    notifications: NotificationCenter,
     visible_terminal_surfaces: HashSet<SurfaceId>,
     cursor_blink_visible: bool,
     last_cursor_blink_at: Instant,
@@ -379,6 +399,80 @@ struct WorkdeskAttentionSummary {
     unread_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProductNotification {
+    id: u64,
+    state: AttentionState,
+    title: String,
+    detail: String,
+    context: String,
+    unread: bool,
+    workdesk_index: usize,
+    pane_id: Option<PaneId>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NotificationCenter {
+    next_id: u64,
+    items: Vec<ProductNotification>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AgentSessionInspectorTarget {
+    desk_index: usize,
+    surface_id: SurfaceId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentSessionInspectorView {
+    session_id: String,
+    provider_profile_id: String,
+    capability_note: Option<String>,
+    transport: AgentTransportKind,
+    lifecycle: AgentLifecycle,
+    attention: AgentAttention,
+    status_message: String,
+    cwd: String,
+    workdesk_name: String,
+    pane_title: String,
+    surface_id: SurfaceId,
+    terminal_status: Option<String>,
+    transcript_preview: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspacePaletteMode {
+    OpenFile,
+    SearchWorkspace,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceFileCandidate {
+    absolute_path: String,
+    relative_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorkspacePaletteResult {
+    File(WorkspaceFileCandidate),
+    SearchMatch {
+        absolute_path: String,
+        relative_path: String,
+        line_number: usize,
+        preview: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct WorkspacePaletteState {
+    mode: WorkspacePaletteMode,
+    root_path: PathBuf,
+    query: String,
+    all_files: Vec<WorkspaceFileCandidate>,
+    results: Vec<WorkspacePaletteResult>,
+    selected: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkdeskNavigationMode {
     Attention,
@@ -405,6 +499,8 @@ enum ShortcutAction {
     SpawnAgentPane,
     SpawnBrowserPane,
     SpawnEditorPane,
+    QuickOpen,
+    SearchWorkspace,
     NextSurface,
     PreviousSurface,
     CloseActivePane,
@@ -1011,6 +1107,16 @@ impl AttentionState {
     fn should_notify(self) -> bool {
         matches!(self, Self::NeedsInput | Self::NeedsReview | Self::Error)
     }
+
+    fn notification_title(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "Input requested",
+            Self::NeedsReview => "Review requested",
+            Self::Error => "Error raised",
+            Self::Idle => "Attention cleared",
+            Self::Working => "Work resumed",
+        }
+    }
 }
 
 impl WorkdeskAttentionSummary {
@@ -1023,6 +1129,373 @@ impl WorkdeskAttentionSummary {
             self.highest = attention.state;
         }
     }
+}
+
+impl NotificationCenter {
+    fn unread_count(&self) -> usize {
+        self.items.iter().filter(|item| item.unread).count()
+    }
+
+    fn mark_all_read(&mut self) -> bool {
+        let mut changed = false;
+        for item in &mut self.items {
+            if item.unread {
+                item.unread = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn push_attention_event(
+        &mut self,
+        workdesk_index: usize,
+        desk_name: &str,
+        pane_id: PaneId,
+        pane_title: &str,
+        state: AttentionState,
+        unread: bool,
+    ) {
+        self.next_id = self.next_id.saturating_add(1);
+        self.items.push(ProductNotification {
+            id: self.next_id,
+            state,
+            title: state.notification_title().to_string(),
+            detail: format!("{pane_title} on {desk_name} is {}.", state.label()),
+            context: format!("{desk_name} · {pane_title}"),
+            unread,
+            workdesk_index,
+            pane_id: Some(pane_id),
+        });
+        if self.items.len() > MAX_NOTIFICATION_ITEMS {
+            let overflow = self.items.len() - MAX_NOTIFICATION_ITEMS;
+            self.items.drain(0..overflow);
+        }
+    }
+}
+
+fn terminal_snapshot_preview_lines(snapshot: &TerminalSnapshot, max_lines: usize) -> Vec<String> {
+    let mut lines = snapshot
+        .rows
+        .iter()
+        .map(|row| {
+            row.runs
+                .iter()
+                .fold(String::new(), |mut line, run| {
+                    line.push_str(&run.text);
+                    line
+                })
+                .replace('\u{00A0}', " ")
+                .trim_end()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() > max_lines {
+        lines.drain(0..lines.len() - max_lines);
+    }
+    lines
+}
+
+fn agent_session_inspector_view(
+    bridge: &agent_sessions::AgentRuntimeBridge,
+    workdesk: &WorkdeskState,
+    surface_id: SurfaceId,
+) -> Option<AgentSessionInspectorView> {
+    let record = bridge.session_for_surface(workdesk.runtime_id, surface_id)?;
+    let pane_title = workdesk
+        .panes
+        .iter()
+        .find_map(|pane| pane.surface(surface_id).map(|surface| surface.title.clone()))
+        .unwrap_or_else(|| "Agent".to_string());
+    let capability_note = bridge
+        .provider_profile(&record.provider_profile_id)
+        .and_then(|profile| profile.capability_note);
+    let terminal_status = workdesk
+        .terminal_statuses
+        .get(&surface_id)
+        .cloned()
+        .flatten()
+        .filter(|status| !status.trim().is_empty());
+    let transcript_preview = workdesk
+        .terminals
+        .get(&surface_id)
+        .map(|terminal| terminal_snapshot_preview_lines(&terminal.snapshot(), 12))
+        .unwrap_or_default();
+
+    Some(AgentSessionInspectorView {
+        session_id: record.id.0.clone(),
+        provider_profile_id: record.provider_profile_id,
+        capability_note,
+        transport: record.transport,
+        lifecycle: record.lifecycle,
+        attention: record.attention,
+        status_message: record.status_message,
+        cwd: record.cwd,
+        workdesk_name: workdesk.name.clone(),
+        pane_title,
+        surface_id,
+        terminal_status,
+        transcript_preview,
+    })
+}
+
+fn agent_transport_label(transport: AgentTransportKind) -> &'static str {
+    match transport {
+        AgentTransportKind::CliWrapped => "CLI wrapped",
+        AgentTransportKind::NativeAcp => "Native ACP",
+    }
+}
+
+fn agent_lifecycle_label(lifecycle: AgentLifecycle) -> &'static str {
+    match lifecycle {
+        AgentLifecycle::Planned => "Planned",
+        AgentLifecycle::Starting => "Starting",
+        AgentLifecycle::Running => "Running",
+        AgentLifecycle::Waiting => "Waiting",
+        AgentLifecycle::Completed => "Completed",
+        AgentLifecycle::Failed => "Failed",
+        AgentLifecycle::Cancelled => "Cancelled",
+    }
+}
+
+fn agent_attention_label(attention: AgentAttention) -> &'static str {
+    match attention {
+        AgentAttention::Quiet => "Quiet",
+        AgentAttention::Working => "Working",
+        AgentAttention::NeedsInput => "Needs input",
+        AgentAttention::NeedsReview => "Needs review",
+        AgentAttention::Error => "Error",
+    }
+}
+
+impl WorkspacePaletteMode {
+    fn title(self) -> &'static str {
+        match self {
+            Self::OpenFile => "Quick open",
+            Self::SearchWorkspace => "Workspace search",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::OpenFile => "Jump to a file in the current worktree.",
+            Self::SearchWorkspace => "Search across files without leaving the canvas.",
+        }
+    }
+
+    fn prompt(self) -> &'static str {
+        match self {
+            Self::OpenFile => "Type a path fragment",
+            Self::SearchWorkspace => "Type a grep query",
+        }
+    }
+
+    fn empty_label(self) -> &'static str {
+        match self {
+            Self::OpenFile => "No files match the current query.",
+            Self::SearchWorkspace => "No workspace matches yet.",
+        }
+    }
+}
+
+impl WorkspacePaletteState {
+    fn new(mode: WorkspacePaletteMode, root_path: PathBuf) -> Self {
+        let all_files = load_workspace_file_candidates(&root_path);
+        let mut this = Self {
+            mode,
+            root_path,
+            query: String::new(),
+            all_files,
+            results: Vec::new(),
+            selected: 0,
+        };
+        this.refresh_results();
+        this
+    }
+
+    fn refresh_results(&mut self) {
+        self.results = match self.mode {
+            WorkspacePaletteMode::OpenFile => quick_open_results(&self.all_files, &self.query),
+            WorkspacePaletteMode::SearchWorkspace => {
+                workspace_search_results(&self.root_path, &self.query)
+            }
+        };
+        if self.results.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(self.results.len().saturating_sub(1));
+        }
+    }
+
+    fn append_query(&mut self, text: &str) {
+        self.query.push_str(text);
+        self.refresh_results();
+    }
+
+    fn pop_query(&mut self) {
+        self.query.pop();
+        self.refresh_results();
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.results.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let len = self.results.len() as isize;
+        let next = (self.selected as isize + delta).clamp(0, len - 1);
+        self.selected = next as usize;
+    }
+
+    fn selected_result(&self) -> Option<&WorkspacePaletteResult> {
+        self.results.get(self.selected)
+    }
+}
+
+fn load_workspace_file_candidates(root_path: &Path) -> Vec<WorkspaceFileCandidate> {
+    load_workspace_file_candidates_with_rg(root_path)
+        .unwrap_or_else(|| load_workspace_file_candidates_fallback(root_path))
+}
+
+fn load_workspace_file_candidates_with_rg(root_path: &Path) -> Option<Vec<WorkspaceFileCandidate>> {
+    let output = Command::new("rg")
+        .current_dir(root_path)
+        .arg("--files")
+        .arg(".")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = root_path.to_path_buf();
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let absolute = root.join(line);
+                relative_workspace_path(&root, &absolute).map(|relative_path| WorkspaceFileCandidate {
+                    absolute_path: absolute.display().to_string(),
+                    relative_path,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn load_workspace_file_candidates_fallback(root_path: &Path) -> Vec<WorkspaceFileCandidate> {
+    let mut results = Vec::new();
+    collect_workspace_files(root_path, root_path, &mut results);
+    results.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    results
+}
+
+fn collect_workspace_files(root_path: &Path, current: &Path, results: &mut Vec<WorkspaceFileCandidate>) {
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                name.as_ref(),
+                ".git" | "target" | ".axis" | "node_modules"
+            ) {
+                continue;
+            }
+            collect_workspace_files(root_path, &path, results);
+            continue;
+        }
+        if metadata.is_file() {
+            if let Some(relative_path) = relative_workspace_path(root_path, &path) {
+                results.push(WorkspaceFileCandidate {
+                    absolute_path: path.display().to_string(),
+                    relative_path,
+                });
+            }
+        }
+    }
+}
+
+fn relative_workspace_path(root_path: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root_path)
+        .ok()
+        .map(|relative| relative.display().to_string())
+}
+
+fn quick_open_results(
+    all_files: &[WorkspaceFileCandidate],
+    query: &str,
+) -> Vec<WorkspacePaletteResult> {
+    let normalized = query.trim().to_lowercase();
+    let mut matches = all_files
+        .iter()
+        .filter_map(|candidate| {
+            let relative = candidate.relative_path.to_lowercase();
+            let score = if normalized.is_empty() {
+                Some((0usize, candidate.relative_path.len()))
+            } else {
+                relative
+                    .find(&normalized)
+                    .map(|index| (index, candidate.relative_path.len()))
+            }?;
+            Some((score, WorkspacePaletteResult::File(candidate.clone())))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.0.cmp(&right.0));
+    matches
+        .into_iter()
+        .map(|(_, result)| result)
+        .take(WORKSPACE_PALETTE_RESULTS_LIMIT)
+        .collect()
+}
+
+fn workspace_search_results(root_path: &Path, query: &str) -> Vec<WorkspacePaletteResult> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(output) = Command::new("rg")
+        .current_dir(root_path)
+        .arg("--line-number")
+        .arg("--no-heading")
+        .arg("--color")
+        .arg("never")
+        .arg("--smart-case")
+        .arg(trimmed)
+        .arg(".")
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, ':');
+            let path = parts.next()?;
+            let line_number = parts.next()?.parse::<usize>().ok()?;
+            let preview = parts.next().unwrap_or_default().trim().to_string();
+            let absolute = root_path.join(path);
+            let relative_path = relative_workspace_path(root_path, &absolute)?;
+            Some(WorkspacePaletteResult::SearchMatch {
+                absolute_path: absolute.display().to_string(),
+                relative_path,
+                line_number,
+                preview,
+            })
+        })
+        .take(WORKSPACE_SEARCH_RESULTS_LIMIT)
+        .collect()
 }
 
 impl WorkdeskMetadata {
@@ -1336,7 +1809,7 @@ impl GridDirection {
     }
 }
 
-const SHORTCUT_ACTIONS: [ShortcutAction; 29] = [
+const SHORTCUT_ACTIONS: [ShortcutAction; 31] = [
     ShortcutAction::ToggleShortcutPanel,
     ShortcutAction::ToggleInspector,
     ShortcutAction::NextAttention,
@@ -1345,6 +1818,8 @@ const SHORTCUT_ACTIONS: [ShortcutAction; 29] = [
     ShortcutAction::SpawnAgentPane,
     ShortcutAction::SpawnBrowserPane,
     ShortcutAction::SpawnEditorPane,
+    ShortcutAction::QuickOpen,
+    ShortcutAction::SearchWorkspace,
     ShortcutAction::NextSurface,
     ShortcutAction::PreviousSurface,
     ShortcutAction::CloseActivePane,
@@ -1405,6 +1880,8 @@ impl ShortcutAction {
             Self::SpawnAgentPane => "spawn-agent-pane",
             Self::SpawnBrowserPane => "spawn-browser-pane",
             Self::SpawnEditorPane => "spawn-editor-pane",
+            Self::QuickOpen => "quick-open",
+            Self::SearchWorkspace => "search-workspace",
             Self::NextSurface => "next-surface",
             Self::PreviousSurface => "previous-surface",
             Self::CloseActivePane => "close-active-pane",
@@ -1446,6 +1923,8 @@ impl ShortcutAction {
             | Self::SpawnAgentPane
             | Self::SpawnBrowserPane
             | Self::SpawnEditorPane
+            | Self::QuickOpen
+            | Self::SearchWorkspace
             | Self::NextSurface
             | Self::PreviousSurface
             | Self::CloseActivePane
@@ -1477,6 +1956,8 @@ impl ShortcutAction {
             Self::SpawnAgentPane => "New agent pane",
             Self::SpawnBrowserPane => "New browser pane",
             Self::SpawnEditorPane => "Open file in editor",
+            Self::QuickOpen => "Quick open file",
+            Self::SearchWorkspace => "Search workspace",
             Self::NextSurface => "Next surface in pane",
             Self::PreviousSurface => "Previous surface in pane",
             Self::CloseActivePane => "Close active pane",
@@ -1519,6 +2000,8 @@ impl ShortcutAction {
             Self::SpawnAgentPane => "Create a new agent pane near the viewport center.",
             Self::SpawnBrowserPane => "Create a new browser pane near the viewport center.",
             Self::SpawnEditorPane => "Open a file picker and create or focus an editor surface.",
+            Self::QuickOpen => "Open the in-app file switcher for the current worktree.",
+            Self::SearchWorkspace => "Run a workspace-wide search and jump to matching files.",
             Self::NextSurface => "Cycle to the next surface stacked inside the active pane.",
             Self::PreviousSurface => {
                 "Cycle to the previous surface stacked inside the active pane."
@@ -1559,15 +2042,17 @@ impl ShortcutAction {
             Self::SpawnAgentPane => Some("cmd-alt-n"),
             Self::SpawnBrowserPane => Some("cmd-shift-b"),
             Self::SpawnEditorPane => Some("cmd-shift-e"),
+            Self::QuickOpen => Some("cmd-p"),
+            Self::SearchWorkspace => Some("cmd-shift-f"),
             Self::NextSurface => Some("ctrl-tab"),
             Self::PreviousSurface => Some("ctrl-shift-tab"),
             Self::CloseActivePane => Some("cmd-shift-w"),
             Self::SpawnWorkdesk => Some("cmd-shift-d"),
             Self::SelectPreviousWorkdesk => Some("cmd-alt-["),
             Self::SelectNextWorkdesk => Some("cmd-alt-]"),
-            Self::LayoutFree => Some("cmd-shift-f"),
-            Self::LayoutGrid => Some("cmd-shift-g"),
-            Self::LayoutSplit => Some("cmd-shift-s"),
+            Self::LayoutFree => Some("cmd-alt-1"),
+            Self::LayoutGrid => Some("cmd-alt-2"),
+            Self::LayoutSplit => Some("cmd-alt-3"),
             Self::ToggleGridExpose => Some("cmd-shift-o"),
             Self::NavigateLeft => Some("cmd-shift-left"),
             Self::NavigateRight => Some("cmd-shift-right"),
@@ -1864,6 +2349,8 @@ impl WorkdeskState {
             runtime_id: 0,
             worktree_binding: None,
             review_summary: None,
+            review_payload_cache: None,
+            review_local_state: ReviewPanelLocalState::default(),
             panes,
             pane_attention,
             terminals: HashMap::new(),
@@ -2512,6 +2999,9 @@ impl AxisShell {
             stack_surface_menu: None,
             agent_provider_popup: None,
             workdesk_editor: None,
+            session_inspector: None,
+            workspace_palette: None,
+            review_panel: None,
             automation_rx: receiver,
             focus_handle,
             automation_socket_path: SharedString::from(socket_path.display().to_string()),
@@ -2522,7 +3012,7 @@ impl AxisShell {
             inspector_open: false,
             sidebar_collapsed: false,
             notifications_open: false,
-            mock_notifications_unread: 3,
+            notifications: NotificationCenter::default(),
             visible_terminal_surfaces: HashSet::new(),
             cursor_blink_visible: true,
             last_cursor_blink_at: Instant::now(),
@@ -2729,13 +3219,63 @@ impl AxisShell {
             self.last_agent_runtime_revision = rev;
             let active_workdesk = self.active_workdesk;
             let mut attention_changed = false;
-            for (desk_index, desk) in self.workdesks.iter_mut().enumerate() {
-                attention_changed |= sync_agent_runtime_attention_for_workdesk(
-                    &self.agent_runtime,
-                    desk_index,
-                    active_workdesk,
-                    desk,
-                );
+            for desk_index in 0..self.workdesks.len() {
+                let previous_attentions = {
+                    let desk = &self.workdesks[desk_index];
+                    desk.panes
+                        .iter()
+                        .filter(|pane| pane.kind == PaneKind::Agent)
+                        .map(|pane| (pane.id, desk.pane_attention(pane.id)))
+                        .collect::<Vec<_>>()
+                };
+                let changed = {
+                    let desk = &mut self.workdesks[desk_index];
+                    sync_agent_runtime_attention_for_workdesk(
+                        &self.agent_runtime,
+                        desk_index,
+                        active_workdesk,
+                        desk,
+                    )
+                };
+                attention_changed |= changed;
+                if !changed {
+                    continue;
+                }
+                let notifications = {
+                    let desk = &self.workdesks[desk_index];
+                    previous_attentions
+                        .into_iter()
+                        .filter_map(|(pane_id, previous)| {
+                            let pane = desk.panes.iter().find(|pane| pane.id == pane_id)?;
+                            let current = desk.pane_attention(pane_id);
+                            should_notify_attention_transition(previous.state, current.state).then(
+                                || {
+                                    (
+                                        pane_id,
+                                        pane.title.clone(),
+                                        desk.name.clone(),
+                                        current.state,
+                                        current.unread,
+                                    )
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for (pane_id, pane_title, desk_name, state, unread) in notifications {
+                    self.push_attention_notification(
+                        desk_index,
+                        pane_id,
+                        &pane_title,
+                        &desk_name,
+                        state,
+                        unread,
+                    );
+                    self.set_runtime_notice_for_workdesk(
+                        desk_index,
+                        format!("{pane_title} on {desk_name} is {}", state.label()),
+                    );
+                }
             }
             if attention_changed {
                 self.request_persist(cx);
@@ -2757,14 +3297,63 @@ impl AxisShell {
         self.shortcuts.display_label(action)
     }
 
-    fn set_runtime_notice(&mut self, message: impl Into<String>) {
-        if let Some(workdesk) = self.workdesks.get_mut(self.active_workdesk) {
+    fn set_runtime_notice_for_workdesk(&mut self, desk_index: usize, message: impl Into<String>) {
+        if let Some(workdesk) = self.workdesks.get_mut(desk_index) {
             workdesk.runtime_notice = Some(SharedString::from(message.into()));
         }
     }
 
+    fn set_runtime_notice(&mut self, message: impl Into<String>) {
+        self.set_runtime_notice_for_workdesk(self.active_workdesk, message);
+    }
+
     fn dismiss_runtime_notice(&mut self) -> bool {
         dismiss_runtime_notice_for_workdesks(&mut self.workdesks, self.active_workdesk)
+    }
+
+    fn notification_unread_count(&self) -> usize {
+        self.notifications.unread_count()
+    }
+
+    fn push_attention_notification(
+        &mut self,
+        desk_index: usize,
+        pane_id: PaneId,
+        pane_title: &str,
+        desk_name: &str,
+        state: AttentionState,
+        unread: bool,
+    ) {
+        self.notifications.push_attention_event(
+            desk_index,
+            desk_name,
+            pane_id,
+            pane_title,
+            state,
+            unread && !self.notifications_open,
+        );
+    }
+
+    fn open_notification_target(&mut self, notification_id: u64, cx: &mut Context<Self>) {
+        let target = self
+            .notifications
+            .items
+            .iter_mut()
+            .find(|item| item.id == notification_id)
+            .map(|item| {
+                item.unread = false;
+                (item.workdesk_index, item.pane_id)
+            });
+        let Some((desk_index, pane_id)) = target else {
+            return;
+        };
+        self.dismiss_notifications();
+        if let Some(pane_id) = pane_id {
+            if !self.navigate_to_workdesk_pane(desk_index, pane_id, cx) {
+                self.set_runtime_notice("Notification target is no longer available");
+            }
+        }
+        cx.notify();
     }
 
     fn active_editor_ids(&self) -> Option<(PaneId, SurfaceId)> {
@@ -3222,6 +3811,9 @@ impl AxisShell {
     fn open_workdesk_creator(&mut self, cx: &mut Context<Self>) {
         self.dismiss_workdesk_menu();
         self.dismiss_stack_surface_menu();
+        self.session_inspector = None;
+        self.workspace_palette = None;
+        self.review_panel = None;
         self.workdesk_editor = Some(WorkdeskEditorState::new_create(
             WorkdeskTemplate::ShellDesk,
             self.workdesk_name_for_template(WorkdeskTemplate::ShellDesk),
@@ -3236,6 +3828,9 @@ impl AxisShell {
         self.dismiss_workdesk_menu();
         self.dismiss_stack_surface_menu();
         self.dismiss_notifications();
+        self.session_inspector = None;
+        self.workspace_palette = None;
+        self.review_panel = None;
         self.active_workdesk = index;
         self.active_workdesk_mut().drag_state = DragState::Idle;
         if self.active_workdesk().active_pane.is_none() {
@@ -3429,6 +4024,7 @@ impl AxisShell {
     fn refresh_worktree_binding_for_desk(
         &mut self,
         desk_index: usize,
+        sync_review: bool,
     ) -> Result<WorktreeBinding, String> {
         let daemon = DaemonClient::default();
         let binding = {
@@ -3461,10 +4057,12 @@ impl AxisShell {
             desk.metadata.branch = binding.branch.clone();
             desk.worktree_binding = Some(binding.clone());
         }
-        if let Err(error) = self.sync_review_summary_for_desk(desk_index) {
-            if let Some(desk) = self.workdesks.get_mut(desk_index) {
-                desk.runtime_notice =
-                    Some(SharedString::from(format!("review summary stale: {error}")));
+        if sync_review {
+            if let Err(error) = self.sync_review_summary_for_desk(desk_index) {
+                if let Some(desk) = self.workdesks.get_mut(desk_index) {
+                    desk.runtime_notice =
+                        Some(SharedString::from(format!("review summary stale: {error}")));
+                }
             }
         }
         Ok(binding)
@@ -3483,37 +4081,85 @@ impl AxisShell {
             if let Some(desk) = self.workdesks.get_mut(desk_index) {
                 desk.review_summary =
                     refreshed_desk_review_summary_view(previous.as_ref(), None, None);
+                desk.review_payload_cache = None;
+                desk.review_local_state = ReviewPanelLocalState::default();
             }
             return Ok(());
         };
 
-        let daemon = DaemonClient::default();
-        let (base_changed, uncommitted) = match daemon
-            .desk_review_summary(&WorktreeId::new(binding.root_path.clone()))
-        {
-            Ok(result) => (result.changed_files, result.uncommitted_files),
-            Err(_) => {
-                let base_changed = binding
-                    .base_branch
-                    .as_deref()
-                    .map(|base_branch| {
-                        WorktreeService::changed_files_since_base(&binding.root_path, base_branch)
-                            .map_err(|error| error.to_string())
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
-                let uncommitted = WorktreeService::uncommitted_changed_files(&binding.root_path)
-                    .map_err(|error| error.to_string())?;
-                (base_changed, uncommitted)
+        let worktree_id = WorktreeId::new(binding.root_path.clone());
+        let refreshed_binding = WorktreeService::attach(&binding.root_path, binding.base_branch.clone())
+            .map_err(|error| error.to_string())?;
+
+        if let Ok(payload) = DaemonClient::default().desk_review_summary(&worktree_id) {
+            if let Some(desk) = self.workdesks.get_mut(desk_index) {
+                desk.worktree_binding = Some(refreshed_binding.clone());
+                let summary =
+                    build_desk_review_summary_view_from_payload(&refreshed_binding, &payload);
+                Self::apply_review_payload_to_desk(
+                    desk,
+                    &refreshed_binding,
+                    payload,
+                    summary,
+                    false,
+                );
             }
-        };
-        let changed_files = merge_changed_files(&base_changed, &uncommitted);
+            return Ok(());
+        }
+
+        let cached_payload = self
+            .workdesks
+            .get(desk_index)
+            .and_then(|desk| {
+                reusable_review_payload_cache(desk.review_payload_cache.as_ref(), &refreshed_binding)
+            })
+            .cloned();
+        let resolved = resolve_local_desk_review_payload(
+            &worktree_id,
+            &refreshed_binding,
+            cached_payload.as_ref(),
+        )?;
 
         if let Some(desk) = self.workdesks.get_mut(desk_index) {
-            desk.review_summary = Some(build_desk_review_summary_view(&binding, &changed_files));
+            desk.worktree_binding = Some(refreshed_binding.clone());
+            Self::apply_review_payload_to_desk(
+                desk,
+                &refreshed_binding,
+                resolved.payload,
+                resolved.summary,
+                resolved.stale,
+            );
         }
 
         Ok(())
+    }
+
+    fn apply_review_payload_to_desk(
+        desk: &mut WorkdeskState,
+        refreshed_binding: &WorktreeBinding,
+        payload: DeskReviewPayload,
+        summary: DeskReviewSummaryView,
+        stale_rich_payload: bool,
+    ) {
+        let workdesk_id = WorkdeskId::new(desk.workdesk_id.clone());
+        let rebound = review_payload_worktree_rebound(desk.review_payload_cache.as_ref(), refreshed_binding);
+        let prev_cache = desk.review_payload_cache.as_ref();
+        let setup = review_workspace_setup_notice(refreshed_binding);
+        let (payload, local) = merge_review_local_after_fetch(
+            &workdesk_id,
+            prev_cache,
+            &desk.review_local_state,
+            payload,
+            ReviewPanelRefreshContext {
+                workdesk_id: workdesk_id.clone(),
+                worktree_rebound: rebound,
+                stale_rich_payload,
+                setup_notice: setup,
+            },
+        );
+        desk.review_payload_cache = Some(payload.clone());
+        desk.review_local_state = local;
+        desk.review_summary = Some(summary);
     }
 
     fn ensure_worktree_backed_desk(
@@ -3646,7 +4292,7 @@ impl AxisShell {
                                 .map_err(|error| error.to_string())
                         })?;
                     let desk_index = self.ensure_worktree_backed_desk(binding, cx);
-                    self.refresh_worktree_binding_for_desk(desk_index)?;
+                    self.refresh_worktree_binding_for_desk(desk_index, true)?;
                     self.request_persist(cx);
                     Ok(self.worktree_state_json(desk_index))
                 }
@@ -3783,57 +4429,70 @@ impl AxisShell {
                     Ok(Value::Array(sessions))
                 }
                 SharedAutomationRequest::DeskReviewSummary { worktree_id } => {
-                    let daemon = DaemonClient::default();
-                    let result = daemon.desk_review_summary(&worktree_id).or_else(
-                        |_| -> Result<daemon_client::DeskReviewResult, String> {
-                            let binding = WorktreeService::attach(&worktree_id.0, None)
-                                .map_err(|error| error.to_string())?;
-                            let changed_files = binding
-                                .base_branch
-                                .as_deref()
-                                .map(|base_branch| {
-                                    WorktreeService::changed_files_since_base(
-                                        &binding.root_path,
-                                        base_branch,
-                                    )
-                                    .map_err(|error| error.to_string())
-                                })
-                                .transpose()?
-                                .unwrap_or_default();
-                            let uncommitted_files =
-                                WorktreeService::uncommitted_changed_files(&binding.root_path)
-                                    .map_err(|error| error.to_string())?;
-                            Ok(daemon_client::DeskReviewResult {
-                                worktree_id: worktree_id.clone(),
-                                summary: ReviewSummary {
-                                    files_changed: changed_files.len() as u32,
-                                    uncommitted_files: uncommitted_files.len() as u32,
-                                    ready_for_review: !changed_files.is_empty()
-                                        || !uncommitted_files.is_empty(),
-                                    last_inspected_at_ms: Some(unix_time_ms()),
-                                },
-                                changed_files,
-                                uncommitted_files,
-                            })
-                        },
-                    )?;
-                    if let Ok(desk_index) = self.resolve_workdesk_index_by_worktree_id(&worktree_id)
+                    let base_for_attach = self
+                        .resolve_workdesk_index_by_worktree_id(&worktree_id)
+                        .ok()
+                        .and_then(|index| self.workdesks.get(index))
+                        .and_then(|desk| desk.worktree_binding.as_ref())
+                        .and_then(|b| b.base_branch.clone());
+                    let binding = WorktreeService::attach(&worktree_id.0, base_for_attach)
+                        .map_err(|error| error.to_string())?;
+                    let cached_payload = self
+                        .resolve_workdesk_index_by_worktree_id(&worktree_id)
+                        .ok()
+                        .and_then(|index| self.workdesks.get(index))
+                        .and_then(|desk| {
+                            reusable_review_payload_cache(desk.review_payload_cache.as_ref(), &binding)
+                        })
+                        .cloned();
+
+                    let (payload, summary, stale) = match DaemonClient::default()
+                        .desk_review_summary(&worktree_id)
                     {
-                        let binding = self.refresh_worktree_binding_for_desk(desk_index)?;
-                        let changed_files =
-                            merge_changed_files(&result.changed_files, &result.uncommitted_files);
+                        Ok(payload) => (
+                            payload.clone(),
+                            build_desk_review_summary_view_from_payload(&binding, &payload),
+                            false,
+                        ),
+                        Err(error)
+                            if !Self::daemon_review_summary_error_allows_fallback(&error) =>
+                        {
+                            return Err(error);
+                        }
+                        Err(_) => {
+                            let resolved = resolve_local_desk_review_payload(
+                                &worktree_id,
+                                &binding,
+                                cached_payload.as_ref(),
+                            )?;
+                            (resolved.payload, resolved.summary, resolved.stale)
+                        }
+                    };
+
+                    if let Ok(desk_index) = self.resolve_workdesk_index_by_worktree_id(&worktree_id) {
+                        let binding = self.refresh_worktree_binding_for_desk(desk_index, false)?;
                         if let Some(desk) = self.workdesks.get_mut(desk_index) {
-                            desk.review_summary =
-                                Some(build_desk_review_summary_view(&binding, &changed_files));
+                            let summary =
+                                build_desk_review_summary_view(&binding, &summary.changed_files);
+                            Self::apply_review_payload_to_desk(
+                                desk,
+                                &binding,
+                                payload.clone(),
+                                summary,
+                                stale,
+                            );
                         }
                         self.request_persist(cx);
                     }
-                    Ok(json!({
-                        "worktree_id": result.worktree_id,
-                        "summary": result.summary,
-                        "changed_files": result.changed_files,
-                        "uncommitted_files": result.uncommitted_files,
-                    }))
+
+                    let mut value = serde_json::to_value(&payload)
+                        .map_err(|error| format!("serialize desk review: {error}"))?;
+                    if stale {
+                        if let Some(obj) = value.as_object_mut() {
+                            obj.insert("review_payload_stale".to_string(), json!(true));
+                        }
+                    }
+                    Ok(value)
                 }
                 SharedAutomationRequest::AttentionNext { workdesk_id } => {
                     let target = if let Some(workdesk_id) = workdesk_id {
@@ -3909,6 +4568,24 @@ impl AxisShell {
         }
     }
 
+    fn daemon_review_summary_error_allows_fallback(error: &str) -> bool {
+        [
+            "connect ",
+            "set daemon read timeout:",
+            "set daemon write timeout:",
+            "serialize daemon request:",
+            "write daemon request:",
+            "write daemon request newline:",
+            "flush daemon request:",
+            "read daemon response:",
+            "parse daemon response:",
+            "decode daemon response:",
+            "daemon automation request returned no result",
+        ]
+        .iter()
+        .any(|prefix| error.starts_with(prefix))
+    }
+
     fn automation_state_json(&self) -> Value {
         json!({
             "active_workdesk": self.active_workdesk,
@@ -3944,7 +4621,7 @@ impl AxisShell {
         cx: &mut Context<Self>,
     ) -> bool {
         let active_workdesk = self.active_workdesk;
-        let (changed, previous_state, desk_name, pane_title) = {
+        let (changed, previous_state, desk_name, pane_title, effective_unread) = {
             let Some(desk) = self.workdesks.get_mut(desk_index) else {
                 return false;
             };
@@ -3960,7 +4637,13 @@ impl AxisShell {
                 unread && !(active_workdesk == desk_index && desk.active_pane == Some(pane_id));
             let previous_state = desk.pane_attention(pane_id).state;
             let changed = desk.set_pane_attention_state(pane_id, state, effective_unread);
-            (changed, previous_state, desk.name.clone(), pane_title)
+            (
+                changed,
+                previous_state,
+                desk.name.clone(),
+                pane_title,
+                effective_unread,
+            )
         };
 
         if !changed {
@@ -3968,7 +4651,18 @@ impl AxisShell {
         }
 
         if announce && should_notify_attention_transition(previous_state, state) {
-            self.set_runtime_notice(format!("{pane_title} on {desk_name} is {}", state.label()));
+            self.push_attention_notification(
+                desk_index,
+                pane_id,
+                &pane_title,
+                &desk_name,
+                state,
+                effective_unread,
+            );
+            self.set_runtime_notice_for_workdesk(
+                desk_index,
+                format!("{pane_title} on {desk_name} is {}", state.label()),
+            );
         }
 
         self.request_persist(cx);
@@ -4037,6 +4731,42 @@ impl AxisShell {
         self.navigate_to_workdesk_pane(desk_index, pane_id, cx)
     }
 
+    fn agent_session_inspector_view_for_target(
+        &self,
+        target: AgentSessionInspectorTarget,
+    ) -> Option<AgentSessionInspectorView> {
+        let workdesk = self.workdesks.get(target.desk_index)?;
+        agent_session_inspector_view(&self.agent_runtime, workdesk, target.surface_id)
+    }
+
+    fn toggle_session_inspector(
+        &mut self,
+        desk_index: usize,
+        surface_id: SurfaceId,
+        cx: &mut Context<Self>,
+    ) {
+        let target = AgentSessionInspectorTarget {
+            desk_index,
+            surface_id,
+        };
+        if self.session_inspector == Some(target) {
+            self.session_inspector = None;
+        } else {
+            self.dismiss_workdesk_menu();
+            self.dismiss_stack_surface_menu();
+            self.dismiss_notifications();
+            self.review_panel = None;
+            self.session_inspector = Some(target);
+        }
+        cx.notify();
+    }
+
+    fn close_session_inspector(&mut self, cx: &mut Context<Self>) {
+        if self.session_inspector.take().is_some() {
+            cx.notify();
+        }
+    }
+
     fn handle_terminal_attention_transition(
         &mut self,
         desk_index: usize,
@@ -4098,6 +4828,7 @@ impl AxisShell {
         }
 
         self.dismiss_stack_surface_menu();
+        self.workspace_palette = None;
         self.shortcut_editor.open = true;
         self.shortcut_editor.recording = None;
         cx.notify();
@@ -4389,6 +5120,14 @@ impl AxisShell {
             }
             ShortcutAction::SpawnEditorPane => {
                 self.open_editor_picker(cx);
+                true
+            }
+            ShortcutAction::QuickOpen => {
+                self.open_workspace_palette(WorkspacePaletteMode::OpenFile, cx);
+                true
+            }
+            ShortcutAction::SearchWorkspace => {
+                self.open_workspace_palette(WorkspacePaletteMode::SearchWorkspace, cx);
                 true
             }
             ShortcutAction::NextSurface => self.cycle_active_pane_surface(false, cx),
@@ -4842,6 +5581,9 @@ impl AxisShell {
         self.dismiss_workdesk_menu();
         self.dismiss_stack_surface_menu();
         self.dismiss_notifications();
+        self.session_inspector = None;
+        self.workspace_palette = None;
+        self.review_panel = None;
         let desk_index = self.active_workdesk;
         let cwd = Self::workdesk_agent_cwd(&self.workdesks[desk_index]);
         let options = self.agent_runtime.provider_options_for_cwd(&cwd);
@@ -4969,6 +5711,7 @@ impl AxisShell {
         target_pane_id: Option<PaneId>,
         cx: &mut Context<Self>,
     ) {
+        self.workspace_palette = None;
         let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
@@ -5010,6 +5753,320 @@ impl AxisShell {
 
     fn open_editor_picker(&mut self, cx: &mut Context<Self>) {
         self.open_editor_picker_for_target_pane(None, cx);
+    }
+
+    fn workspace_palette_root(&self) -> PathBuf {
+        worktree_id_from_desk(self.active_workdesk())
+            .map(|worktree_id| PathBuf::from(worktree_id.0))
+            .filter(|path| path.exists())
+            .unwrap_or_else(workspace_root_path)
+    }
+
+    fn open_workspace_palette(&mut self, mode: WorkspacePaletteMode, cx: &mut Context<Self>) {
+        self.dismiss_workdesk_menu();
+        self.dismiss_stack_surface_menu();
+        self.dismiss_notifications();
+        self.agent_provider_popup = None;
+        self.workdesk_editor = None;
+        self.session_inspector = None;
+        self.review_panel = None;
+        self.workspace_palette = Some(WorkspacePaletteState::new(mode, self.workspace_palette_root()));
+        cx.notify();
+    }
+
+    fn dismiss_workspace_palette(&mut self) -> bool {
+        self.workspace_palette.take().is_some()
+    }
+
+    fn move_active_editor_to_line(&mut self, surface_id: SurfaceId, line_number: usize) {
+        let Some(editor) = self.active_workdesk_mut().editors.get_mut(&surface_id) else {
+            return;
+        };
+        let line_index = line_number.saturating_sub(1);
+        let target = editor.offset_for_line_col(line_index, 0);
+        editor.move_to_offset(target, false);
+        editor.set_scroll_top_line(line_index.saturating_sub(3));
+    }
+
+    fn open_workspace_palette_result(
+        &mut self,
+        result: WorkspacePaletteResult,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (absolute_path, line_number) = match result {
+            WorkspacePaletteResult::File(file) => (file.absolute_path, None),
+            WorkspacePaletteResult::SearchMatch {
+                absolute_path,
+                line_number,
+                ..
+            } => (absolute_path, Some(line_number)),
+        };
+        let desk_index = self.active_workdesk;
+        match self.spawn_surface_on_workdesk(
+            desk_index,
+            None,
+            PaneKind::Editor,
+            None,
+            None,
+            Some(absolute_path),
+            true,
+        ) {
+            Ok((pane_id, surface_id)) => {
+                if let Some(line_number) = line_number {
+                    self.move_active_editor_to_line(surface_id, line_number);
+                    self.sync_editor_surface_metadata(pane_id, surface_id);
+                }
+                self.dismiss_workspace_palette();
+                self.request_persist(cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.set_runtime_notice(error);
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn open_selected_workspace_palette_result(&mut self, cx: &mut Context<Self>) -> bool {
+        let result = self
+            .workspace_palette
+            .as_ref()
+            .and_then(|palette| palette.selected_result())
+            .cloned();
+        let Some(result) = result else {
+            return false;
+        };
+        self.open_workspace_palette_result(result, cx)
+    }
+
+    fn open_review_panel(&mut self, desk_index: usize, cx: &mut Context<Self>) {
+        let Some(desk) = self.workdesks.get(desk_index) else {
+            return;
+        };
+        let Some(payload) = desk.review_payload_cache.as_ref() else {
+            return;
+        };
+        if payload.files.is_empty() {
+            return;
+        }
+        self.dismiss_workdesk_menu();
+        self.dismiss_stack_surface_menu();
+        self.dismiss_notifications();
+        self.agent_provider_popup = None;
+        self.workdesk_editor = None;
+        self.session_inspector = None;
+        self.workspace_palette = None;
+        self.active_workdesk = desk_index;
+        self.review_panel = Some(desk_index);
+        if let Some(desk) = self.workdesks.get_mut(desk_index) {
+            clamp_review_panel_selection(desk);
+        }
+        self.request_persist(cx);
+        cx.notify();
+    }
+
+    fn close_review_panel(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.review_panel.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_review_panel_file(&mut self, desk_index: usize, file_index: usize, cx: &mut Context<Self>) {
+        let Some(desk) = self.workdesks.get_mut(desk_index) else {
+            return;
+        };
+        let Some(file_count) = desk.review_payload_cache.as_ref().map(|p| p.files.len()) else {
+            return;
+        };
+        if file_index >= file_count {
+            return;
+        }
+        desk.review_local_state.selected_file = file_index;
+        desk.review_local_state.selected_hunk = desk
+            .review_payload_cache
+            .as_ref()
+            .and_then(|p| p.files.get(file_index))
+            .and_then(|file| {
+                if file.hunks.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                }
+            });
+        cx.notify();
+    }
+
+    fn select_review_panel_hunk(&mut self, desk_index: usize, hunk_index: usize, cx: &mut Context<Self>) {
+        let Some(desk) = self.workdesks.get_mut(desk_index) else {
+            return;
+        };
+        let Some(hunk_count) = desk
+            .review_payload_cache
+            .as_ref()
+            .and_then(|p| p.files.get(desk.review_local_state.selected_file))
+            .map(|f| f.hunks.len())
+        else {
+            return;
+        };
+        if hunk_index >= hunk_count {
+            return;
+        }
+        desk.review_local_state.selected_hunk = Some(hunk_index);
+        cx.notify();
+    }
+
+    fn review_panel_hunk_actions_enabled(&self) -> bool {
+        let Some(desk_index) = self.review_panel else {
+            return false;
+        };
+        let Some(desk) = self.workdesks.get(desk_index) else {
+            return false;
+        };
+        let Some(payload) = desk.review_payload_cache.as_ref() else {
+            return false;
+        };
+        let Some(file) = payload.files.get(desk.review_local_state.selected_file) else {
+            return false;
+        };
+        review::review_local_hunk_actions_enabled(file)
+    }
+
+    fn mark_review_selected_hunk_reviewed(&mut self, cx: &mut Context<Self>) {
+        self.set_selected_hunk_review_state(review::HunkReviewState::Reviewed, cx);
+    }
+
+    fn mark_review_selected_hunk_follow_up(&mut self, cx: &mut Context<Self>) {
+        self.set_selected_hunk_review_state(review::HunkReviewState::FollowUp, cx);
+    }
+
+    fn mark_review_clear_selected_hunk(&mut self, cx: &mut Context<Self>) {
+        let Some(desk_index) = self.review_panel else {
+            return;
+        };
+        let Some(desk) = self.workdesks.get_mut(desk_index) else {
+            return;
+        };
+        let Some(payload) = desk.review_payload_cache.as_ref() else {
+            return;
+        };
+        let Some(file) = payload.files.get(desk.review_local_state.selected_file) else {
+            return;
+        };
+        if !review::review_local_hunk_actions_enabled(file) {
+            return;
+        }
+        let Some(hunk_index) = desk.review_local_state.selected_hunk else {
+            return;
+        };
+        let Some(hunk) = file.hunks.get(hunk_index) else {
+            return;
+        };
+        let key = review::ReviewHunkKey::from_hunk(
+            &WorkdeskId::new(desk.workdesk_id.clone()),
+            &file.path,
+            hunk,
+        );
+        desk.review_local_state.hunk_states.remove(&key);
+        cx.notify();
+    }
+
+    fn set_selected_hunk_review_state(
+        &mut self,
+        state: review::HunkReviewState,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(desk_index) = self.review_panel else {
+            return;
+        };
+        let Some(desk) = self.workdesks.get_mut(desk_index) else {
+            return;
+        };
+        let Some(payload) = desk.review_payload_cache.as_ref() else {
+            return;
+        };
+        let Some(file) = payload.files.get(desk.review_local_state.selected_file) else {
+            return;
+        };
+        if !review::review_local_hunk_actions_enabled(file) {
+            return;
+        }
+        let Some(hunk_index) = desk.review_local_state.selected_hunk else {
+            return;
+        };
+        let Some(hunk) = file.hunks.get(hunk_index) else {
+            return;
+        };
+        let key = review::ReviewHunkKey::from_hunk(
+            &WorkdeskId::new(desk.workdesk_id.clone()),
+            &file.path,
+            hunk,
+        );
+        desk.review_local_state.hunk_states.insert(key, state);
+        cx.notify();
+    }
+
+    fn open_review_diff_line(
+        &mut self,
+        review_desk_index: usize,
+        file_index: usize,
+        hunk_index: usize,
+        line_index: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let resolved = {
+            let Some(desk) = self.workdesks.get(review_desk_index) else {
+                return false;
+            };
+            let Some(payload) = desk.review_payload_cache.as_ref() else {
+                return false;
+            };
+            let Some(file) = payload.files.get(file_index) else {
+                return false;
+            };
+            let Some(hunk) = file.hunks.get(hunk_index) else {
+                return false;
+            };
+            let Some(line) = hunk.lines.get(line_index) else {
+                return false;
+            };
+            let Some(line_no) = editor_jump_line_for_review_row(hunk, line) else {
+                return false;
+            };
+            let absolute_path = review_file_absolute_path(desk, &file.path);
+            (absolute_path.display().to_string(), line_no)
+        };
+        let (absolute_string, line_no) = resolved;
+        match self.spawn_surface_on_workdesk(
+            review_desk_index,
+            None,
+            PaneKind::Editor,
+            None,
+            None,
+            Some(absolute_string.clone()),
+            true,
+        ) {
+            Ok((pane_id, surface_id)) => {
+                self.move_active_editor_to_line(surface_id, line_no as usize);
+                self.sync_editor_surface_metadata(pane_id, surface_id);
+                self.request_persist(cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                if let Some(desk) = self.workdesks.get_mut(review_desk_index) {
+                    desk.runtime_notice = Some(SharedString::from(
+                        review_editor_open_failed_notice(&absolute_string, &error),
+                    ));
+                }
+                cx.notify();
+                false
+            }
+        }
     }
 
     fn close_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
@@ -5400,6 +6457,16 @@ impl AxisShell {
             return;
         }
 
+        if self.review_panel.is_some()
+            && event.keystroke.key == "escape"
+            && !event.keystroke.modifiers.modified()
+        {
+            if self.close_review_panel(cx) {
+                cx.stop_propagation();
+                return;
+            }
+        }
+
         if self.shortcut_editor.open {
             let is_escape =
                 event.keystroke.key == "escape" && !event.keystroke.modifiers.modified();
@@ -5436,6 +6503,11 @@ impl AxisShell {
             && !event.keystroke.modifiers.modified()
         {
             self.set_grid_expose(false, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.handle_workspace_palette_key_down(event, cx) {
             cx.stop_propagation();
             return;
         }
@@ -5702,6 +6774,59 @@ impl AxisShell {
             cx.stop_propagation();
             cx.notify();
         }
+    }
+
+    fn handle_workspace_palette_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(palette) = self.workspace_palette.as_mut() else {
+            return false;
+        };
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "escape" if !keystroke.modifiers.modified() => {
+                self.dismiss_workspace_palette();
+                cx.notify();
+                return true;
+            }
+            "enter" if !keystroke.modifiers.modified() => {
+                return self.open_selected_workspace_palette_result(cx);
+            }
+            "up" if !keystroke.modifiers.modified() => {
+                palette.move_selection(-1);
+                cx.notify();
+                return true;
+            }
+            "down" if !keystroke.modifiers.modified() => {
+                palette.move_selection(1);
+                cx.notify();
+                return true;
+            }
+            "pageup" if !keystroke.modifiers.modified() => {
+                palette.move_selection(-8);
+                cx.notify();
+                return true;
+            }
+            "pagedown" if !keystroke.modifiers.modified() => {
+                palette.move_selection(8);
+                cx.notify();
+                return true;
+            }
+            "backspace" | "delete" if !keystroke.modifiers.modified() => {
+                palette.pop_query();
+                cx.notify();
+                return true;
+            }
+            _ => {}
+        }
+        if let Some(text) = editable_keystroke_text(keystroke) {
+            palette.append_query(&text);
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     fn handle_editor_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
@@ -6058,9 +7183,12 @@ impl AxisShell {
     fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
         self.notifications_open = !self.notifications_open;
         if self.notifications_open {
-            self.mock_notifications_unread = 0;
+            self.notifications.mark_all_read();
             self.dismiss_workdesk_menu();
             self.dismiss_stack_surface_menu();
+            self.session_inspector = None;
+            self.workspace_palette = None;
+            self.review_panel = None;
         }
         cx.notify();
     }
@@ -6341,12 +7469,14 @@ impl AxisShell {
             .cloned()
             .unwrap_or(None)
             .filter(|status| !status.trim().is_empty());
-        let agent_provider_badge = matches!(active_surface_kind, PaneKind::Agent)
+        let active_agent_session = matches!(active_surface_kind, PaneKind::Agent)
             .then(|| {
                 self.agent_runtime
                     .session_for_surface(workdesk.runtime_id, active_surface_id)
             })
-            .flatten()
+            .flatten();
+        let agent_provider_badge = active_agent_session
+            .as_ref()
             .map(|record| {
                 self.agent_runtime
                     .provider_profile(&record.provider_profile_id)
@@ -6355,8 +7485,13 @@ impl AxisShell {
                             .capability_note
                             .map(|note| format!("{} · {}", record.provider_profile_id, note))
                     })
-                    .unwrap_or(record.provider_profile_id)
+                    .unwrap_or_else(|| record.provider_profile_id.clone())
             });
+        let session_inspector_active = matches!(
+            self.session_inspector,
+            Some(target)
+                if target.desk_index == self.active_workdesk && target.surface_id == active_surface_id
+        );
         let status_tint = if pane_attention.state == AttentionState::Idle {
             match &active_surface_kind {
                 PaneKind::Shell | PaneKind::Agent => terminal_snapshot
@@ -6427,6 +7562,7 @@ impl AxisShell {
         let header = {
             let close_surface_id = active_surface_id;
             let close_surface_count = pane.surfaces.len();
+            let inspector_desk_index = self.active_workdesk;
             let header = div()
                 .flex()
                 .items_center()
@@ -6496,6 +7632,21 @@ impl AxisShell {
                         })
                         .when_some(agent_provider_badge.clone(), |row, badge| {
                             row.child(context_pill(badge, rgb(0x7f8a94).into()))
+                        })
+                        .when(active_agent_session.is_some(), |row| {
+                            row.child(compact_toggle_button(
+                                "Info",
+                                rgb(0x7cc7ff).into(),
+                                session_inspector_active,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_session_inspector(
+                                        inspector_desk_index,
+                                        active_surface_id,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }),
+                            ))
                         })
                         .when(pane.surfaces.len() > 1, |row| {
                             row.child(context_pill(stack_count_label.clone(), accent))
@@ -7350,6 +8501,11 @@ impl Render for AxisShell {
                             this.open_workdesk_menu(index, event.position, cx);
                             cx.stop_propagation();
                         }),
+                        desk_has_review_entries(desk),
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_review_panel(index, cx);
+                            cx.stop_propagation();
+                        }),
                     )
                     .into_any_element()
                 } else {
@@ -7387,6 +8543,10 @@ impl Render for AxisShell {
                             this.toggle_workdesk_menu(index, event.position, cx);
                             cx.stop_propagation();
                         }),
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_review_panel(index, cx);
+                            cx.stop_propagation();
+                        }),
                     )
                     .into_any_element()
                 }
@@ -7398,7 +8558,55 @@ impl Render for AxisShell {
             sidebar_width + 12.0
         }
         .min((viewport_width - NOTIFICATION_PANEL_WIDTH - 16.0).max(12.0));
+        let unread_notifications = self.notification_unread_count();
+        let notification_entries = self
+            .notifications
+            .items
+            .iter()
+            .cloned()
+            .rev()
+            .collect::<Vec<_>>();
         let notification_overlay = self.notifications_open.then(|| {
+            let notification_cards = if notification_entries.is_empty() {
+                vec![
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_3()
+                        .bg(rgb(0x10171d))
+                        .border_1()
+                        .border_color(rgb(0x24313b))
+                        .rounded_lg()
+                        .child(div().text_sm().text_color(rgb(0xdce2e8)).child("No attention events yet"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x8e9ba5))
+                                .child("Agent and terminal attention changes will appear here."),
+                        )
+                        .into_any_element(),
+                ]
+            } else {
+                notification_entries
+                    .into_iter()
+                    .map(|item| {
+                        let notification_id = item.id;
+                        notification_item(
+                            &item.title,
+                            &item.detail,
+                            &item.context,
+                            item.state.tint(),
+                            item.unread,
+                            cx.listener(move |this, _, _, cx| {
+                                this.open_notification_target(notification_id, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            };
             div()
                 .absolute()
                 .left(px(notification_panel_left))
@@ -7442,12 +8650,18 @@ impl Render for AxisShell {
                                     div()
                                         .text_xs()
                                         .text_color(rgb(0x7cc7ff))
-                                        .child("Mock inbox"),
+                                        .child("Attention feed"),
                                 )
                                 .child(div().text_sm().child("Notifications"))
-                                .child(div().text_xs().text_color(rgb(0x8e9ba5)).child(
-                                    "Temporary center until real notification plumbing lands.",
-                                )),
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x8e9ba5))
+                                        .child(format!(
+                                            "{} unread attention events across workdesks.",
+                                            unread_notifications
+                                        )),
+                                ),
                         )
                         .child(control_button(
                             "Close",
@@ -7460,24 +8674,825 @@ impl Render for AxisShell {
                             }),
                         )),
                 )
-                .child(notification_item(
-                    "Agent ready",
-                    "Implement Agent finished a response and marked the pane for review.",
-                    rgb(0x7cc7ff).into(),
-                    true,
-                ))
-                .child(notification_item(
-                    "Build changed",
-                    "Implementation desk build status moved to 25% for the current branch.",
-                    rgb(0x77d19a).into(),
-                    false,
-                ))
-                .child(notification_item(
-                    "Review pending",
-                    "Shell Desk has a pane that still needs follow-up attention.",
-                    rgb(0xe59a49).into(),
-                    false,
-                ))
+                .children(notification_cards)
+        });
+        let session_inspector_view = self
+            .session_inspector
+            .and_then(|target| self.agent_session_inspector_view_for_target(target));
+        let session_inspector_overlay = self.session_inspector.map(|_| {
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(viewport_width))
+                .h(px(viewport_height))
+                .bg(rgba(0x09101660))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.close_session_inspector(cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(SHORTCUT_PANEL_MARGIN))
+                        .right(px(SHORTCUT_PANEL_MARGIN))
+                        .bottom(px(SHORTCUT_PANEL_MARGIN))
+                        .w(px(
+                            SESSION_INSPECTOR_WIDTH
+                                .min((viewport_width - SHORTCUT_PANEL_MARGIN * 2.0).max(320.0)),
+                        ))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .bg(rgb(0x0f151b))
+                        .border_l_1()
+                        .border_color(rgb(0x2c3944))
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .items_start()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x7cc7ff))
+                                                .child("Agent session"),
+                                        )
+                                        .child(div().text_lg().child("Session inspector"))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x90a0aa))
+                                                .child(
+                                                    "Lifecycle, routing attention, and recent replay output.",
+                                                ),
+                                        ),
+                                )
+                                .child(compact_dock_button(
+                                    "Close",
+                                    rgb(0xff9b88).into(),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.close_session_inspector(cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )),
+                        )
+                        .when_some(session_inspector_view.clone(), |panel, view| {
+                            panel
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .child(context_pill(
+                                            agent_lifecycle_label(view.lifecycle),
+                                            rgb(0x77d19a).into(),
+                                        ))
+                                        .child(context_pill(
+                                            agent_attention_label(view.attention),
+                                            attention::agent_attention_state(view.attention).tint(),
+                                        ))
+                                        .child(context_pill(
+                                            agent_transport_label(view.transport),
+                                            rgb(0x90a0aa).into(),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .child(inspector_row("Session", view.session_id.clone()))
+                                        .child(inspector_row("Provider", view.provider_profile_id.clone()))
+                                        .when_some(view.capability_note.clone(), |rows, note| {
+                                            rows.child(inspector_row("Capability", note))
+                                        })
+                                        .child(inspector_row("Desk", view.workdesk_name.clone()))
+                                        .child(inspector_row("Pane", view.pane_title.clone()))
+                                        .child(inspector_row(
+                                            "Surface",
+                                            view.surface_id.raw().to_string(),
+                                        ))
+                                        .child(inspector_row("Cwd", view.cwd.clone()))
+                                        .child(inspector_row("Status", view.status_message.clone()))
+                                        .when_some(view.terminal_status.clone(), |rows, status| {
+                                            rows.child(inspector_row("Terminal", status))
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x7f8a94))
+                                                .child("Recent replay"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_h(px(180.0))
+                                                .max_h(px((viewport_height - 260.0).max(180.0)))
+                                                .overflow_hidden()
+                                                .p_3()
+                                                .bg(rgb(0x10171d))
+                                                .border_1()
+                                                .border_color(rgb(0x24313b))
+                                                .rounded_lg()
+                                                .font_family(".ZedMono")
+                                                .text_xs()
+                                                .text_color(rgb(0xdce2e8))
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .gap_1()
+                                                        .children(
+                                                            if view.transcript_preview.is_empty() {
+                                                                vec![div()
+                                                                    .text_color(rgb(0x7f8a94))
+                                                                    .child("No terminal output yet.")
+                                                                    .into_any_element()]
+                                                            } else {
+                                                                view.transcript_preview
+                                                                    .into_iter()
+                                                                    .map(|line| {
+                                                                        div().child(line).into_any_element()
+                                                                    })
+                                                                    .collect::<Vec<_>>()
+                                                            },
+                                                        ),
+                                                ),
+                                        ),
+                                )
+                        })
+                        .when(session_inspector_view.is_none(), |panel| {
+                            panel.child(
+                                div()
+                                    .p_3()
+                                    .bg(rgb(0x10171d))
+                                    .border_1()
+                                    .border_color(rgb(0x24313b))
+                                    .rounded_lg()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0xdce2e8))
+                                            .child("Session no longer available."),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x8e9ba5))
+                                            .child(
+                                                "The pane or runtime session disappeared before the inspector was rendered.",
+                                            ),
+                                    ),
+                            )
+                        }),
+                )
+        });
+        let workspace_palette_overlay = self.workspace_palette.clone().map(|palette| {
+            let query = palette.query.clone();
+            let root_label = palette.root_path.display().to_string();
+            let result_rows = if palette.results.is_empty() {
+                vec![
+                    div()
+                        .p_3()
+                        .bg(rgb(0x10171d))
+                        .border_1()
+                        .border_color(rgb(0x24313b))
+                        .rounded_lg()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0xdce2e8))
+                                .child(palette.mode.empty_label()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x8e9ba5))
+                                .child(palette.mode.description()),
+                        )
+                        .into_any_element(),
+                ]
+            } else {
+                palette
+                    .results
+                    .iter()
+                    .enumerate()
+                    .map(|(index, result)| {
+                        let result = result.clone();
+                        let listener_result = result.clone();
+                        workspace_palette_result_row(
+                            &result,
+                            index == palette.selected,
+                            cx.listener(move |this, _, _, cx| {
+                                this.open_workspace_palette_result(listener_result.clone(), cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(viewport_width))
+                .h(px(viewport_height))
+                .bg(rgba(0x09101680))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        if this.dismiss_workspace_palette() {
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(((viewport_width - WORKSPACE_PALETTE_WIDTH).max(32.0) * 0.5).max(16.0)))
+                        .top(px(72.0))
+                        .w(px(WORKSPACE_PALETTE_WIDTH.min((viewport_width - 32.0).max(320.0))))
+                        .max_h(px((viewport_height - 120.0).max(220.0)))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .bg(rgb(0x0f151b))
+                        .border_1()
+                        .border_color(rgb(0x2c3944))
+                        .rounded_xl()
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .items_start()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x7cc7ff))
+                                                .child(palette.mode.title()),
+                                        )
+                                        .child(div().text_lg().child(palette.mode.prompt()))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x8e9ba5))
+                                                .child(root_label),
+                                        ),
+                                )
+                                .child(compact_dock_button(
+                                    "Close",
+                                    rgb(0xff9b88).into(),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.dismiss_workspace_palette();
+                                        cx.stop_propagation();
+                                    }),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .p_3()
+                                .bg(rgb(0x11181e))
+                                .border_1()
+                                .border_color(rgb(0x24313b))
+                                .rounded_lg()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x7f8a94))
+                                        .child("Query"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(".ZedMono")
+                                        .text_sm()
+                                        .text_color(if query.is_empty() {
+                                            rgb(0x6f7d86)
+                                        } else {
+                                            rgb(0xdce2e8)
+                                        })
+                                        .child(if query.is_empty() {
+                                            palette.mode.prompt().to_string()
+                                        } else {
+                                            query
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("workspace-palette-results")
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .overflow_y_scroll()
+                                .children(result_rows),
+                        ),
+                )
+        });
+        let review_panel_overlay = self.review_panel.and_then(|desk_index| {
+            self.workdesks.get(desk_index).map(|desk| {
+                let desk_name = desk.name.clone();
+                let payload = desk.review_payload_cache.clone();
+                let local = desk.review_local_state.clone();
+                (desk_index, desk_name, payload, local)
+            })
+        }).map(|(desk_index, desk_name, payload, local)| {
+            let panel_width = SESSION_INSPECTOR_WIDTH
+                .min((viewport_width - SHORTCUT_PANEL_MARGIN * 2.0).max(320.0));
+            let file_list_width = 148.0_f32;
+            let selected_file = payload
+                .as_ref()
+                .and_then(|p| p.files.get(local.selected_file));
+            let actions_enabled = selected_file
+                .map(|file| review::review_local_hunk_actions_enabled(file))
+                .unwrap_or(false);
+            let stale_rows = local
+                .stale_notice
+                .clone()
+                .map(|notice| {
+                    vec![div()
+                        .p_2()
+                        .bg(rgb(0x2a2410))
+                        .border_1()
+                        .border_color(rgb(0x5c4d1f))
+                        .rounded_lg()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0xf0d35f))
+                                .child(notice),
+                        )
+                        .into_any_element()]
+                })
+                .unwrap_or_default();
+            let setup_rows = local
+                .setup_notice
+                .clone()
+                .map(|notice| {
+                    vec![div()
+                        .p_2()
+                        .bg(rgb(0x1a2228))
+                        .border_1()
+                        .border_color(rgb(0x3a4a5a))
+                        .rounded_lg()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x9db4c7))
+                                .child(notice),
+                        )
+                        .into_any_element()]
+                })
+                .unwrap_or_default();
+            let truncated_row = payload.as_ref().filter(|p| p.truncated).map(|_| {
+                div()
+                    .p_2()
+                    .bg(rgb(0x221a1a))
+                    .border_1()
+                    .border_color(rgb(0x5b3434))
+                    .rounded_lg()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xff9b88))
+                            .child("Diff was truncated for size; some changes may be missing."),
+                    )
+                    .into_any_element()
+            });
+            let file_rows: Vec<gpui::AnyElement> = payload
+                .as_ref()
+                .map(|p| {
+                    p.files
+                        .iter()
+                        .enumerate()
+                        .map(|(file_index, file)| {
+                            let active = file_index == local.selected_file;
+                            let path_label = if file.truncated {
+                                format!("{} (truncated)", file.path)
+                            } else {
+                                file.path.clone()
+                            };
+                            let row_border: gpui::Hsla = if active {
+                                rgb(0x7cc7ff).into()
+                            } else {
+                                rgb(0x24313b).into()
+                            };
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(if active {
+                                    rgb(0x1c2730)
+                                } else {
+                                    rgb(0x12181e)
+                                })
+                                .border_1()
+                                .border_color(row_border)
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.select_review_panel_file(desk_index, file_index, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if active {
+                                            rgb(0xdce2e8)
+                                        } else {
+                                            rgb(0x9aa6af)
+                                        })
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .child(path_label),
+                                )
+                                .into_any_element()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let (diff_rows, hunk_tabs): (Vec<gpui::AnyElement>, Vec<gpui::AnyElement>) =
+                match payload.as_ref() {
+                    None => (
+                        vec![div()
+                            .p_3()
+                            .text_sm()
+                            .text_color(rgb(0x8e9ba5))
+                            .child("No structured review payload is cached for this desk.")
+                            .into_any_element()],
+                        vec![],
+                    ),
+                    Some(p) if p.files.is_empty() => (
+                        vec![div()
+                            .p_3()
+                            .text_sm()
+                            .text_color(rgb(0x8e9ba5))
+                            .child("No files in this review snapshot.")
+                            .into_any_element()],
+                        vec![],
+                    ),
+                    Some(p) => {
+                        if let Some(file) = p.files.get(local.selected_file) {
+                            if file.hunks.is_empty() {
+                                (
+                                    vec![div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .p_3()
+                                        .bg(rgb(0x10171d))
+                                        .border_1()
+                                        .border_color(rgb(0x24313b))
+                                        .rounded_lg()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(0xdce2e8))
+                                                .child(review_file_hunkless_notice(file)),
+                                        )
+                                        .into_any_element()],
+                                    vec![],
+                                )
+                            } else {
+                                let hunk_index =
+                                    local.selected_hunk.unwrap_or(0).min(file.hunks.len() - 1);
+                                let hunk = &file.hunks[hunk_index];
+                                let hunk_tabs = if file.hunks.len() <= 1 {
+                                    vec![]
+                                } else {
+                                    file.hunks
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(hi, h)| {
+                                            let active = hi == hunk_index;
+                                            let label = if h.header.len() > 28 {
+                                                format!("{}…", &h.header[..28])
+                                            } else {
+                                                h.header.clone()
+                                            };
+                                            let tab_border: gpui::Hsla = if active {
+                                                rgb(0x7cc7ff).into()
+                                            } else {
+                                                rgb(0x24313b).into()
+                                            };
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .bg(if active {
+                                                    rgb(0x1c2730)
+                                                } else {
+                                                    rgb(0x12181e)
+                                                })
+                                                .border_1()
+                                                .border_color(tab_border)
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                })
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.select_review_panel_hunk(
+                                                            desk_index, hi, cx,
+                                                        );
+                                                        cx.stop_propagation();
+                                                    }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(".ZedMono")
+                                                        .text_xs()
+                                                        .text_color(if active {
+                                                            rgb(0xdce2e8)
+                                                        } else {
+                                                            rgb(0x8e9ba5)
+                                                        })
+                                                        .child(label),
+                                                )
+                                                .into_any_element()
+                                        })
+                                        .collect::<Vec<_>>()
+                                };
+                                let diff_rows = vec![
+                                    div()
+                                        .mb_2()
+                                        .font_family(".ZedMono")
+                                        .text_xs()
+                                        .text_color(rgb(0x7f8a94))
+                                        .child(hunk.header.clone())
+                                        .into_any_element(),
+                                ]
+                                .into_iter()
+                                .chain(hunk.lines.iter().enumerate().map(|(line_index, line)| {
+                                    let prefix = match line.kind {
+                                        ReviewLineKind::Context => " ",
+                                        ReviewLineKind::Addition => "+",
+                                        ReviewLineKind::Removal => "-",
+                                        ReviewLineKind::Metadata => "@",
+                                    };
+                                    let text_color = match line.kind {
+                                        ReviewLineKind::Context => rgb(0xc8d1d8),
+                                        ReviewLineKind::Addition => rgb(0x77d19a),
+                                        ReviewLineKind::Removal => rgb(0xff9b88),
+                                        ReviewLineKind::Metadata => rgb(0x7f8a94),
+                                    };
+                                    let jumpable = line.jumpable
+                                        && editor_jump_line_for_review_row(hunk, line).is_some();
+                                    let mut row = div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap_2()
+                                        .font_family(".ZedMono")
+                                        .text_xs()
+                                        .text_color(text_color)
+                                        .child(div().w(px(14.0)).child(prefix))
+                                        .child(div().flex_1().child(line.text.clone()));
+                                    if jumpable {
+                                        row = row
+                                            .cursor_pointer()
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation();
+                                            })
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    let _ = this.open_review_diff_line(
+                                                        desk_index,
+                                                        local.selected_file,
+                                                        hunk_index,
+                                                        line_index,
+                                                        cx,
+                                                    );
+                                                    cx.stop_propagation();
+                                                }),
+                                            );
+                                    }
+                                    row.into_any_element()
+                                }))
+                                .collect::<Vec<_>>();
+                                (diff_rows, hunk_tabs)
+                            }
+                        } else {
+                            (
+                                vec![div()
+                                    .p_3()
+                                    .text_sm()
+                                    .text_color(rgb(0x8e9ba5))
+                                    .child("Selected file is no longer in the payload.")
+                                    .into_any_element()],
+                                vec![],
+                            )
+                        }
+                    }
+                };
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(viewport_width))
+                .h(px(viewport_height))
+                .bg(rgba(0x09101660))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        let _ = this.close_review_panel(cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(SHORTCUT_PANEL_MARGIN))
+                        .right(px(SHORTCUT_PANEL_MARGIN))
+                        .bottom(px(SHORTCUT_PANEL_MARGIN))
+                        .w(px(panel_width))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .bg(rgb(0x0f151b))
+                        .border_l_1()
+                        .border_color(rgb(0x2c3944))
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .items_start()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x7cc7ff))
+                                                .child("Desk review"),
+                                        )
+                                        .child(div().text_lg().child("Review"))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x90a0aa))
+                                                .child(desk_name),
+                                        ),
+                                )
+                                .child(compact_dock_button(
+                                    "Close",
+                                    rgb(0xff9b88).into(),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.close_review_panel(cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )),
+                        )
+                        .children(stale_rows)
+                        .children(setup_rows)
+                        .when_some(truncated_row, |panel, row| panel.child(row))
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_row()
+                                .gap_3()
+                                .min_h(px(200.0))
+                                .child(
+                                    div()
+                                        .w(px(file_list_width))
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x7f8a94))
+                                                .child("Files"),
+                                        )
+                                        .children(file_rows),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .min_w(px(0.0))
+                                        .when(!hunk_tabs.is_empty(), |col| {
+                                            col.child(
+                                                div()
+                                                    .flex()
+                                                    .flex_wrap()
+                                                    .gap_1()
+                                                    .children(hunk_tabs),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .p_2()
+                                                .bg(rgb(0x10171d))
+                                                .border_1()
+                                                .border_color(rgb(0x24313b))
+                                                .rounded_lg()
+                                                .children(diff_rows),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_wrap()
+                                                .gap_2()
+                                                .when(actions_enabled, |row| {
+                                                    row.child(compact_dock_button_stateful(
+                                                        "Mark reviewed",
+                                                        rgb(0x77d19a).into(),
+                                                        true,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.mark_review_selected_hunk_reviewed(cx);
+                                                            cx.stop_propagation();
+                                                        }),
+                                                    ))
+                                                    .child(compact_dock_button_stateful(
+                                                        "Needs follow-up",
+                                                        rgb(0xf0d35f).into(),
+                                                        true,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.mark_review_selected_hunk_follow_up(cx);
+                                                            cx.stop_propagation();
+                                                        }),
+                                                    ))
+                                                    .child(compact_dock_button_stateful(
+                                                        "Clear",
+                                                        rgb(0x7f8a94).into(),
+                                                        true,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.mark_review_clear_selected_hunk(cx);
+                                                            cx.stop_propagation();
+                                                        }),
+                                                    ))
+                                                })
+                                                .when(!actions_enabled, |row| {
+                                                    row.child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(rgb(0x6f7d86))
+                                                            .child(
+                                                                "Hunk actions are unavailable without textual hunks.",
+                                                            ),
+                                                    )
+                                                }),
+                                        ),
+                                ),
+                        ),
+                )
         });
         let shortcut_path_label = shortcut_file_path().display().to_string();
         let recording_shortcut = self
@@ -8340,7 +10355,7 @@ impl Render for AxisShell {
                                                     "Bell",
                                                     rgb(0x7cc7ff).into(),
                                                     self.notifications_open,
-                                                    Some(self.mock_notifications_unread),
+                                                    Some(unread_notifications),
                                                     cx.listener(|this, _, _, cx| {
                                                         this.toggle_notifications(cx);
                                                         cx.stop_propagation();
@@ -8381,7 +10396,7 @@ impl Render for AxisShell {
                                         "N",
                                         rgb(0x7cc7ff).into(),
                                         self.notifications_open,
-                                        Some(self.mock_notifications_unread),
+                                        Some(unread_notifications),
                                         cx.listener(|this, _, _, cx| {
                                             this.toggle_notifications(cx);
                                             cx.stop_propagation();
@@ -8494,6 +10509,28 @@ impl Render for AxisShell {
                                         rgb(0xb4a4ff).into(),
                                         cx.listener(|this, _, _, cx| {
                                             this.open_editor_picker(cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ))
+                                    .child(compact_dock_button(
+                                        "Open",
+                                        rgb(0xb4a4ff).into(),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.open_workspace_palette(
+                                                WorkspacePaletteMode::OpenFile,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        }),
+                                    ))
+                                    .child(compact_dock_button(
+                                        "Grep",
+                                        rgb(0x7cc7ff).into(),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.open_workspace_palette(
+                                                WorkspacePaletteMode::SearchWorkspace,
+                                                cx,
+                                            );
                                             cx.stop_propagation();
                                         }),
                                     )),
@@ -8649,6 +10686,9 @@ impl Render for AxisShell {
                         ),
                 )
             })
+            .when_some(session_inspector_overlay, |root, overlay| root.child(overlay))
+            .when_some(workspace_palette_overlay, |root, overlay| root.child(overlay))
+            .when_some(review_panel_overlay, |root, overlay| root.child(overlay))
             .children(shortcut_overlay)
             .when_some(workdesk_editor_overlay, |root, overlay| root.child(overlay))
             .when_some(notification_overlay, |root, overlay| root.child(overlay))
@@ -9175,6 +11215,51 @@ fn worktree_id_from_desk(desk: &WorkdeskState) -> Option<WorktreeId> {
         .map(WorktreeId::new)
 }
 
+fn review_file_absolute_path(desk: &WorkdeskState, relative_path: &str) -> PathBuf {
+    let root = desk
+        .worktree_binding
+        .as_ref()
+        .map(|binding| binding.root_path.trim())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(desk.metadata.cwd.trim()));
+    root.join(relative_path)
+}
+
+fn clamp_review_panel_selection(desk: &mut WorkdeskState) {
+    let Some(payload) = desk.review_payload_cache.as_ref() else {
+        return;
+    };
+    if payload.files.is_empty() {
+        return;
+    }
+    let file_count = payload.files.len();
+    if desk.review_local_state.selected_file >= file_count {
+        desk.review_local_state.selected_file = 0;
+    }
+    let file_index = desk.review_local_state.selected_file;
+    let Some(file) = payload.files.get(file_index) else {
+        return;
+    };
+    if file.hunks.is_empty() {
+        desk.review_local_state.selected_hunk = None;
+    } else {
+        let hunk_count = file.hunks.len();
+        let hunk_index = desk
+            .review_local_state
+            .selected_hunk
+            .unwrap_or(0)
+            .min(hunk_count - 1);
+        desk.review_local_state.selected_hunk = Some(hunk_index);
+    }
+}
+
+fn desk_has_review_entries(desk: &WorkdeskState) -> bool {
+    desk.review_payload_cache
+        .as_ref()
+        .is_some_and(|payload| !payload.files.is_empty())
+}
+
 fn workdesk_record_from_state(desk: &WorkdeskState, workspace_root: &str) -> WorkdeskRecord {
     WorkdeskRecord {
         workdesk_id: WorkdeskId::new(desk.workdesk_id.clone()),
@@ -9239,13 +11324,6 @@ fn default_worktree_path(repo_root: &str, branch: &str) -> Result<PathBuf, Strin
         .parent()
         .ok_or_else(|| format!("repo root `{}` has no parent", repo_root.display()))?;
     Ok(parent.join(format!("{repo_name}-{}", sanitize_branch_slug(branch))))
-}
-
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn assign_missing_workdesk_ids(workdesks: &mut [WorkdeskState], next_workdesk_id: &mut u64) {
@@ -9589,6 +11667,7 @@ fn workdesk_card(
     navigation_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     edit_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     menu_button_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    review_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let attention_summary = desk.workdesk_attention_summary();
     let attention_tint = if attention_summary.highest == AttentionState::Idle {
@@ -9874,6 +11953,19 @@ fn workdesk_card(
                     })),
             )
         })
+        .when(desk_has_review_entries(desk), |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .child(control_button(
+                            "Review",
+                            rgb(0x7cc7ff).into(),
+                            review_listener,
+                        )),
+                )
+            },
+        )
         .when_some(navigation_target.clone(), |card, target| {
             card.child(
                 div()
@@ -9947,6 +12039,8 @@ fn workdesk_compact_chip(
     accent: gpui::Hsla,
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     context_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    review_enabled: bool,
+    review_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let attention_summary = desk.workdesk_attention_summary();
     let border = if is_active {
@@ -9956,7 +12050,7 @@ fn workdesk_compact_chip(
     } else {
         rgb(0x24313b).into()
     };
-
+    let review_button_id = SharedString::from(format!("workdesk-compact-review-{index}"));
     div()
         .flex()
         .flex_col()
@@ -9997,6 +12091,25 @@ fn workdesk_compact_chip(
                 })
                 .child(format!("{:02}", index + 1)),
         )
+        .when(review_enabled, |chip| {
+            chip.child(
+                div()
+                    .id(review_button_id)
+                    .debug_selector(|| "workdesk-compact-review".to_string())
+                    .px_1()
+                    .py(px(1.0))
+                    .rounded_md()
+                    .bg(rgb(0x171d24))
+                    .border_1()
+                    .border_color(accent)
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_mouse_up(MouseButton::Left, review_listener)
+                    .child(div().text_xs().text_color(accent).child("R")),
+            )
+        })
 }
 
 fn workdesk_template_card(
@@ -10407,13 +12520,17 @@ fn dock_divider() -> impl IntoElement {
 fn notification_item(
     title: &str,
     detail: &str,
+    context: &str,
     accent: gpui::Hsla,
     unread: bool,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let title = title.to_string();
     let detail = detail.to_string();
+    let context = context.to_string();
 
     div()
+        .cursor_pointer()
         .flex()
         .flex_col()
         .gap_1()
@@ -10422,6 +12539,10 @@ fn notification_item(
         .border_1()
         .border_color(if unread { accent } else { rgb(0x24313b).into() })
         .rounded_lg()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, listener)
         .child(
             div()
                 .flex()
@@ -10433,7 +12554,75 @@ fn notification_item(
                     row.child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(accent))
                 }),
         )
+        .child(div().text_xs().text_color(rgb(0x7f8a94)).child(context))
         .child(div().text_xs().text_color(rgb(0x95a3ad)).child(detail))
+}
+
+fn workspace_palette_result_row(
+    result: &WorkspacePaletteResult,
+    selected: bool,
+    listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let (title, detail, meta) = match result {
+        WorkspacePaletteResult::File(file) => (
+            file.relative_path.clone(),
+            file.absolute_path.clone(),
+            "file".to_string(),
+        ),
+        WorkspacePaletteResult::SearchMatch {
+            relative_path,
+            line_number,
+            preview,
+            ..
+        } => (
+            format!("{relative_path}:{line_number}"),
+            preview.clone(),
+            "match".to_string(),
+        ),
+    };
+
+    div()
+        .cursor_pointer()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_3()
+        .bg(if selected { rgb(0x17212a) } else { rgb(0x10171d) })
+        .border_1()
+        .border_color(if selected {
+            rgb(0x7cc7ff)
+        } else {
+            rgb(0x24313b)
+        })
+        .rounded_lg()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_up(MouseButton::Left, listener)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xdce2e8))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(title),
+                )
+                .child(context_pill(meta, rgb(0x7f8a94).into())),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x8e9ba5))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(detail),
+        )
 }
 
 fn status_chip(label: &str, value: String) -> impl IntoElement {
@@ -12038,11 +14227,116 @@ fn control_input_bytes(key: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axis_core::automation::AutomationResponse;
+    use axis_core::paths::AXIS_SOCKET_PATH_ENV;
     use axis_agent_runtime::adapters::fake::FakeProvider;
     use axis_agent_runtime::ProviderRegistry;
     use gpui::TestAppContext;
     use std::cell::Cell;
+    use std::ffi::OsString;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
     use std::rc::Rc;
+    use std::sync::{Mutex, OnceLock};
+    use std::thread;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn init_repo_with_main(repo: &Path) {
+        run_git(repo, &["init", "-b", "main"]);
+        run_git(repo, &["config", "user.email", "axis-test@example.com"]);
+        run_git(repo, &["config", "user.name", "axis test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("fixture file should write");
+        run_git(repo, &["add", "README.md"]);
+        run_git(repo, &["commit", "-m", "init"]);
+    }
+
+    fn start_fake_daemon_failure_server(
+        socket_path: PathBuf,
+        error: impl Into<String>,
+    ) -> thread::JoinHandle<()> {
+        let error = error.into();
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path);
+        }
+        let listener = UnixListener::bind(&socket_path).expect("fake daemon should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("fake daemon should become nonblocking");
+        thread::spawn(move || {
+            let mut handled = 0usize;
+            let mut last_activity = std::time::Instant::now();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        handled += 1;
+                        last_activity = std::time::Instant::now();
+                        let mut line = String::new();
+                        {
+                            let mut reader = BufReader::new(&mut stream);
+                            reader
+                                .read_line(&mut line)
+                                .expect("fake daemon should read request");
+                        }
+                        let payload = serde_json::to_vec(&AutomationResponse::failure(error.clone()))
+                            .expect("fake daemon response should serialize");
+                        stream
+                            .write_all(&payload)
+                            .expect("fake daemon response should write");
+                        stream
+                            .write_all(b"\n")
+                            .expect("fake daemon newline should write");
+                        stream.flush().expect("fake daemon response should flush");
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if handled > 0 && last_activity.elapsed() > std::time::Duration::from_millis(250)
+                        {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("fake daemon accept failed: {err}"),
+                }
+            }
+            let _ = fs::remove_file(&socket_path);
+        })
+    }
 
     #[test]
     fn persisted_workdesk_round_trips_layout_state() {
@@ -12275,6 +14569,258 @@ mod tests {
         assert_eq!(workdesks[1].workdesk_id, "desk-2");
         assert_eq!(workdesks[2].workdesk_id, "desk-3");
         assert_eq!(next_workdesk_id, 4);
+    }
+
+    #[gpui::test]
+    async fn review_summary_propagates_ambiguous_daemon_error_instead_of_falling_back(
+        cx: &mut TestAppContext,
+    ) {
+        let _env_guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = std::env::temp_dir().join(format!(
+            "axis-review-daemon-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be available")
+                .as_nanos()
+        ));
+        let socket_token = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be available")
+                .as_nanos()
+        );
+        fs::create_dir_all(&temp).expect("temp root should exist");
+        let repo = temp.join("repo");
+        fs::create_dir_all(&repo).expect("repo dir should exist");
+        init_repo_with_main(&repo);
+        let repo_root = repo.display().to_string();
+
+        let daemon_socket = PathBuf::from(format!("/tmp/axisd-review-{socket_token}.sock"));
+        let _socket_guard = EnvVarGuard::set(AXIS_SOCKET_PATH_ENV, &daemon_socket);
+        let daemon = start_fake_daemon_failure_server(
+            daemon_socket,
+            format!("ambiguous review base branch for worktree `{repo_root}`"),
+        );
+
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut first = blank_workdesk("Desk A", "Summary");
+            first.workdesk_id = "desk-a".to_string();
+            first.metadata.cwd = repo_root.clone();
+            first.worktree_binding = Some(WorktreeBinding {
+                root_path: repo_root.clone(),
+                branch: "main".to_string(),
+                base_branch: Some("main".to_string()),
+                ahead: 0,
+                behind: 0,
+                dirty: false,
+            });
+
+            let mut second = blank_workdesk("Desk B", "Summary");
+            second.workdesk_id = "desk-b".to_string();
+            second.metadata.cwd = repo_root.clone();
+            second.worktree_binding = Some(WorktreeBinding {
+                root_path: repo_root.clone(),
+                branch: "main".to_string(),
+                base_branch: Some("develop".to_string()),
+                ahead: 0,
+                behind: 0,
+                dirty: false,
+            });
+
+            AxisShell::new_with_agent_runtime(
+                vec![first, second],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(PathBuf::from(format!(
+                    "/tmp/axis-app-review-{socket_token}.sock"
+                )))
+                    .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                agent_sessions::AgentRuntimeBridge::new(),
+            )
+        });
+
+        window.update(|_, cx| {
+            shell.update(cx, |shell, view_cx| {
+                for desk in &mut shell.workdesks {
+                    desk.review_payload_cache = None;
+                    desk.review_summary = None;
+                }
+                let response = shell.handle_automation_request(
+                    SharedAutomationRequest::DeskReviewSummary {
+                        worktree_id: WorktreeId::new(repo_root.clone()),
+                    },
+                    view_cx,
+                );
+
+                assert!(!response.ok, "semantic daemon errors should not fall back");
+                assert!(response.result.is_none());
+                let error = response.error.expect("failure should include error");
+                assert!(
+                    error.contains("ambiguous review base branch"),
+                    "unexpected error: {error}"
+                );
+                assert!(
+                    shell.workdesks
+                        .iter()
+                        .all(|desk| desk.review_payload_cache.is_none()),
+                    "app path should not synthesize a fallback payload on semantic daemon errors"
+                );
+                assert!(
+                    shell.workdesks
+                        .iter()
+                        .all(|desk| desk.review_summary.is_none()),
+                    "app path should not silently project a fallback review summary"
+                );
+            });
+        });
+
+        daemon.join().expect("fake daemon thread should exit");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[gpui::test]
+    async fn attention_transition_enqueues_unread_notification(cx: &mut TestAppContext) {
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut desk = WorkdeskState::new(
+                "Desk",
+                "Summary",
+                vec![
+                    single_surface_pane(
+                        1,
+                        "Build",
+                        PaneKind::Browser,
+                        WorkdeskPoint::new(0.0, 0.0),
+                        WorkdeskSize::new(720.0, 420.0),
+                    ),
+                    single_surface_pane(
+                        2,
+                        "Review Agent",
+                        PaneKind::Browser,
+                        WorkdeskPoint::new(960.0, 0.0),
+                        WorkdeskSize::new(720.0, 420.0),
+                    ),
+                ],
+            );
+            desk.active_pane = Some(PaneId::new(1));
+            AxisShell::new_with_agent_runtime(
+                vec![desk],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                    "notif-attn-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock should be available")
+                        .as_nanos()
+                )))
+                .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                agent_sessions::AgentRuntimeBridge::new(),
+            )
+        });
+
+        window.update(|_, cx| {
+            shell.update(cx, |shell, view_cx| {
+                assert!(shell.set_pane_attention(
+                    0,
+                    PaneId::new(2),
+                    AttentionState::NeedsReview,
+                    true,
+                    true,
+                    view_cx
+                ));
+                assert_eq!(shell.notification_unread_count(), 1);
+                assert_eq!(shell.notifications.items.len(), 1);
+                let notification = shell
+                    .notifications
+                    .items
+                    .last()
+                    .expect("notification should be recorded");
+                assert!(notification.unread);
+                assert_eq!(notification.state, AttentionState::NeedsReview);
+                assert_eq!(notification.workdesk_index, 0);
+                assert_eq!(notification.pane_id, Some(PaneId::new(2)));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn opening_notifications_marks_attention_events_read(cx: &mut TestAppContext) {
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut desk = WorkdeskState::new(
+                "Desk",
+                "Summary",
+                vec![
+                    single_surface_pane(
+                        1,
+                        "Build",
+                        PaneKind::Browser,
+                        WorkdeskPoint::new(0.0, 0.0),
+                        WorkdeskSize::new(720.0, 420.0),
+                    ),
+                    single_surface_pane(
+                        2,
+                        "Review Agent",
+                        PaneKind::Browser,
+                        WorkdeskPoint::new(960.0, 0.0),
+                        WorkdeskSize::new(720.0, 420.0),
+                    ),
+                ],
+            );
+            desk.active_pane = Some(PaneId::new(1));
+            AxisShell::new_with_agent_runtime(
+                vec![desk],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                    "notif-read-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock should be available")
+                        .as_nanos()
+                )))
+                .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                agent_sessions::AgentRuntimeBridge::new(),
+            )
+        });
+
+        window.update(|_, cx| {
+            shell.update(cx, |shell, view_cx| {
+                assert!(shell.set_pane_attention(
+                    0,
+                    PaneId::new(2),
+                    AttentionState::NeedsReview,
+                    true,
+                    true,
+                    view_cx
+                ));
+                assert_eq!(shell.notification_unread_count(), 1);
+
+                shell.toggle_notifications(view_cx);
+
+                assert!(shell.notifications_open);
+                assert_eq!(shell.notification_unread_count(), 0);
+                assert!(shell.notifications.items.iter().all(|item| !item.unread));
+            });
+        });
     }
 
     #[gpui::test]
@@ -13110,6 +15656,783 @@ mod tests {
         assert_eq!(next_attention_target_for_workdesk(&desk), Some(pane_id));
 
         shutdown_workdesk_terminals(&mut desk);
+    }
+
+    #[test]
+    fn terminal_snapshot_preview_lines_flattens_runs_and_trims_padding() {
+        let style = axis_terminal::TerminalTextStyle {
+            foreground: TerminalColor::new(0xd5, 0xdd, 0xe4),
+            background: None,
+            underline_color: None,
+            bold: false,
+            italic: false,
+            faint: false,
+            underline: false,
+            strikethrough: false,
+        };
+        let snapshot = TerminalSnapshot {
+            title: "Agent".to_string(),
+            rows: vec![
+                TerminalRow {
+                    runs: vec![
+                        TerminalRun {
+                            text: "cargo ".to_string(),
+                            style,
+                        },
+                        TerminalRun {
+                            text: "test".to_string(),
+                            style,
+                        },
+                    ],
+                },
+                TerminalRow {
+                    runs: vec![TerminalRun {
+                        text: "\u{00A0}\u{00A0}".to_string(),
+                        style,
+                    }],
+                },
+                TerminalRow {
+                    runs: vec![TerminalRun {
+                        text: "done  ".to_string(),
+                        style,
+                    }],
+                },
+            ],
+            theme: axis_terminal::TerminalTheme::default(),
+            cursor: (0, 0),
+            cursor_blinking: false,
+            cols: 80,
+            rows_count: 3,
+            scrollbar: axis_terminal::TerminalScrollbar::default(),
+            alternate_screen: false,
+            application_cursor: false,
+            closed: false,
+            status: None,
+        };
+
+        assert_eq!(
+            terminal_snapshot_preview_lines(&snapshot, 8),
+            vec!["cargo test".to_string(), "done".to_string()]
+        );
+    }
+
+    #[test]
+    fn agent_session_inspector_view_returns_runtime_session_details() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            "fake",
+            std::sync::Arc::new(FakeProvider::with_standard_script()),
+        );
+        let bridge = agent_sessions::AgentRuntimeBridge::with_registry("fake", registry);
+
+        let pane_id = PaneId::new(1);
+        let surface_id = SurfaceId::new(61);
+        let mut desk = WorkdeskState::new(
+            "Desk",
+            "Summary",
+            vec![single_surface_pane_with_ids(
+                pane_id,
+                surface_id,
+                "Agent",
+                PaneKind::Agent,
+                WorkdeskPoint::new(0.0, 0.0),
+                WorkdeskSize::new(720.0, 420.0),
+            )],
+        );
+        desk.runtime_id = 31;
+        desk.metadata.cwd = std::env::current_dir()
+            .expect("cwd should resolve")
+            .display()
+            .to_string();
+        desk.attach_terminal_session(
+            surface_id,
+            &PaneKind::Agent,
+            "Agent",
+            terminal_grid_size_for_pane(WorkdeskSize::new(720.0, 420.0), 1),
+        );
+
+        assert!(
+            ensure_agent_runtime_for_surface(&bridge, desk.runtime_id, &mut desk, surface_id)
+                .expect("desk should start")
+        );
+
+        let view = agent_session_inspector_view(&bridge, &desk, surface_id)
+            .expect("agent session inspector view should exist");
+        assert_eq!(view.provider_profile_id, "fake");
+        assert_eq!(view.workdesk_name, "Desk");
+        assert_eq!(view.pane_title, "Agent");
+        assert_eq!(view.surface_id, surface_id);
+        assert!(!view.session_id.is_empty());
+
+        shutdown_workdesk_terminals(&mut desk);
+    }
+
+    #[test]
+    fn quick_open_results_orders_matches_by_position_then_path_length() {
+        let files = vec![
+            WorkspaceFileCandidate {
+                absolute_path: "/tmp/project/src/main.rs".to_string(),
+                relative_path: "src/main.rs".to_string(),
+            },
+            WorkspaceFileCandidate {
+                absolute_path: "/tmp/project/docs/main-guide.md".to_string(),
+                relative_path: "docs/main-guide.md".to_string(),
+            },
+            WorkspaceFileCandidate {
+                absolute_path: "/tmp/project/src/feature_main.rs".to_string(),
+                relative_path: "src/feature_main.rs".to_string(),
+            },
+        ];
+
+        let results = quick_open_results(&files, "main");
+        let relative_paths = results
+            .into_iter()
+            .map(|result| match result {
+                WorkspacePaletteResult::File(file) => file.relative_path,
+                WorkspacePaletteResult::SearchMatch { .. } => {
+                    panic!("quick open should only return file matches")
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            relative_paths,
+            vec![
+                "src/main.rs".to_string(),
+                "docs/main-guide.md".to_string(),
+                "src/feature_main.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_search_results_collects_relative_paths_and_line_numbers() {
+        let root = std::env::temp_dir().join(format!(
+            "axis-workspace-search-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).expect("fixture directory should exist");
+        fs::write(root.join("src/lib.rs"), "alpha\nneedle here\nomega\n")
+            .expect("fixture file should write");
+        fs::write(root.join("README.md"), "needle in docs\n").expect("fixture file should write");
+
+        let results = workspace_search_results(&root, "needle");
+
+        assert!(results.iter().any(|result| matches!(
+            result,
+            WorkspacePaletteResult::SearchMatch {
+                relative_path,
+                line_number,
+                preview,
+                ..
+            } if relative_path == "src/lib.rs"
+                && *line_number == 2
+                && preview == "needle here"
+        )));
+        assert!(results.iter().any(|result| matches!(
+            result,
+            WorkspacePaletteResult::SearchMatch {
+                relative_path,
+                line_number,
+                preview,
+                ..
+            } if relative_path == "README.md"
+                && *line_number == 1
+                && preview == "needle in docs"
+        )));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn review_test_summary() -> axis_core::worktree::ReviewSummary {
+        axis_core::worktree::ReviewSummary {
+            files_changed: 1,
+            uncommitted_files: 0,
+            ready_for_review: true,
+            last_inspected_at_ms: Some(1),
+        }
+    }
+
+    fn review_payload_single_text_file(root: &str) -> DeskReviewPayload {
+        use axis_core::review::{
+            ReviewFileChangeKind, ReviewFileDiff, ReviewHunk, ReviewLine,
+        };
+        DeskReviewPayload {
+            worktree_id: WorktreeId::new(root.to_string()),
+            summary: review_test_summary(),
+            files: vec![ReviewFileDiff {
+                path: "src/demo.rs".to_string(),
+                old_path: None,
+                change_kind: ReviewFileChangeKind::Modified,
+                added_lines: 1,
+                removed_lines: 1,
+                truncated: false,
+                hunks: vec![ReviewHunk {
+                    header: "@@ -1,3 +1,3 @@".to_string(),
+                    old_start: 1,
+                    old_lines: 3,
+                    new_start: 1,
+                    new_lines: 3,
+                    anchor_new_line: Some(2),
+                    truncated: false,
+                    lines: vec![
+                        ReviewLine::context(Some(1), Some(1), true, "first line"),
+                        ReviewLine::removed(Some(2), None, true, "removed line"),
+                        ReviewLine::added(None, Some(2), true, "second line"),
+                    ],
+                }],
+            }],
+            truncated: false,
+        }
+    }
+
+    fn review_payload_hunkless_file(root: &str) -> DeskReviewPayload {
+        use axis_core::review::{ReviewFileChangeKind, ReviewFileDiff};
+        DeskReviewPayload {
+            worktree_id: WorktreeId::new(root.to_string()),
+            summary: axis_core::worktree::ReviewSummary {
+                files_changed: 1,
+                uncommitted_files: 0,
+                ready_for_review: false,
+                last_inspected_at_ms: Some(1),
+            },
+            files: vec![ReviewFileDiff {
+                path: "data.bin".to_string(),
+                old_path: None,
+                change_kind: ReviewFileChangeKind::Modified,
+                added_lines: 0,
+                removed_lines: 0,
+                truncated: false,
+                hunks: vec![],
+            }],
+            truncated: false,
+        }
+    }
+
+    fn review_payload_removal_anchor(root: &str) -> DeskReviewPayload {
+        use axis_core::review::{
+            ReviewFileChangeKind, ReviewFileDiff, ReviewHunk, ReviewLine,
+        };
+        DeskReviewPayload {
+            worktree_id: WorktreeId::new(root.to_string()),
+            summary: review_test_summary(),
+            files: vec![ReviewFileDiff {
+                path: "src/demo.rs".to_string(),
+                old_path: None,
+                change_kind: ReviewFileChangeKind::Modified,
+                added_lines: 0,
+                removed_lines: 1,
+                truncated: false,
+                hunks: vec![ReviewHunk {
+                    header: "@@ -2,1 +2,0 @@".to_string(),
+                    old_start: 2,
+                    old_lines: 1,
+                    new_start: 2,
+                    new_lines: 0,
+                    anchor_new_line: Some(3),
+                    truncated: false,
+                    lines: vec![ReviewLine::removed(Some(2), None, true, "gone")],
+                }],
+            }],
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn stale_review_fallback_updates_desk_summary_but_retains_cached_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "axis-review-stale-summary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be available")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("stale review test root should exist");
+        init_repo_with_main(&root);
+        let root_string = root.display().to_string();
+        let binding = WorktreeBinding {
+            root_path: root_string.clone(),
+            branch: "feature/stale".to_string(),
+            base_branch: Some("main".to_string()),
+            ahead: 2,
+            behind: 1,
+            dirty: false,
+        };
+        let stale_payload = review_payload_single_text_file(&root_string);
+        let fresh_summary = build_desk_review_summary_view(&binding, &[]);
+
+        let mut desk = blank_workdesk("Desk", "Summary");
+        desk.workdesk_id = "desk-review".to_string();
+        desk.metadata.cwd = root_string;
+        desk.worktree_binding = Some(binding.clone());
+        desk.review_payload_cache = Some(stale_payload.clone());
+
+        AxisShell::apply_review_payload_to_desk(
+            &mut desk,
+            &binding,
+            stale_payload.clone(),
+            fresh_summary.clone(),
+            true,
+        );
+
+        assert_eq!(desk.review_payload_cache, Some(stale_payload));
+        assert_eq!(desk.review_summary, Some(fresh_summary));
+        assert!(
+            desk.review_local_state.stale_notice.is_some(),
+            "stale payload fallback should keep the non-blocking stale notice"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    async fn review_panel_opens_from_reviewable_desk_selects_first_file(
+        cx: &mut TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "axis-review-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        let root_string = root.display().to_string();
+        let payload = review_payload_single_text_file(&root_string);
+
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = root_string.clone();
+            AxisShell::new_with_agent_runtime(
+                vec![desk],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                    "review-open-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock should be available")
+                        .as_nanos()
+                )))
+                .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                agent_sessions::AgentRuntimeBridge::new(),
+            )
+        });
+
+        window.update(|_, cx| {
+            shell.update(cx, |shell, view_cx| {
+                shell.workdesks[0].review_payload_cache = Some(payload);
+                shell.open_review_panel(0, view_cx);
+                assert_eq!(shell.review_panel, Some(0));
+                assert_eq!(shell.active_workdesk, 0);
+                let desk = &shell.workdesks[0];
+                assert_eq!(desk.review_local_state.selected_file, 0);
+                assert_eq!(
+                    desk.review_local_state
+                        .selected_file_path(desk.review_payload_cache.as_ref().unwrap()),
+                    Some("src/demo.rs")
+                );
+                assert_eq!(desk.review_local_state.selected_hunk, Some(0));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn review_panel_collapsed_sidebar_review_affordance_opens_review_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let root_string = std::env::temp_dir()
+            .join(format!(
+                "axis-review-collapsed-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock should be available")
+                    .as_nanos()
+            ))
+            .display()
+            .to_string();
+        let payload = review_payload_single_text_file(&root_string);
+
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = root_string.clone();
+            AxisShell::new_with_agent_runtime(
+                vec![desk],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                    "review-collapsed-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock should be available")
+                        .as_nanos()
+                )))
+                .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                agent_sessions::AgentRuntimeBridge::new(),
+            )
+        });
+
+        window.update(|window, cx| {
+            window.activate_window();
+            shell.update(cx, |shell, view_cx| {
+                shell.workdesks[0].review_payload_cache = Some(payload);
+                shell.sidebar_collapsed = true;
+                view_cx.notify();
+            });
+        });
+
+        window.run_until_parked();
+        let button_bounds = window
+            .debug_bounds("workdesk-compact-review")
+            .expect("collapsed review affordance should render");
+        let click_position = GpuiPoint::new(
+            button_bounds.origin.x + px(2.0),
+            button_bounds.origin.y + px(2.0),
+        );
+        window.simulate_click(click_position, gpui::Modifiers::none());
+        window.run_until_parked();
+
+        shell.read_with(window, |shell, _| {
+            assert_eq!(shell.review_panel, Some(0));
+            assert_eq!(shell.active_workdesk, 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn review_panel_jump_opens_editor_at_new_side_line(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "axis-review-jump-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).expect("fixture directory should exist");
+        let file_path = root.join("src/demo.rs");
+        fs::write(&file_path, "first line\nsecond line\nthird line\n")
+            .expect("fixture file should write");
+        let root_string = root.display().to_string();
+        let file_path_string = file_path.display().to_string();
+        let payload = review_payload_single_text_file(&root_string);
+
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = root_string.clone();
+            AxisShell::new_with_agent_runtime(
+                vec![desk],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                    "review-jump-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock should be available")
+                        .as_nanos()
+                )))
+                .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                agent_sessions::AgentRuntimeBridge::new(),
+            )
+        });
+
+        window.update(|_, cx| {
+            shell.update(cx, |shell, view_cx| {
+                shell.workdesks[0].review_payload_cache = Some(payload);
+                shell.open_review_panel(0, view_cx);
+                assert!(shell.open_review_diff_line(0, 0, 0, 2, view_cx));
+                assert_eq!(shell.review_panel, Some(0));
+
+                let editor = shell.active_editor().expect("editor should open");
+                assert_eq!(
+                    canonical_path_string(&editor.path_string()),
+                    canonical_path_string(&file_path_string)
+                );
+                let (line, column) = editor.line_col_for_offset(editor.cursor_offset());
+                assert_eq!((line, column), (1, 0));
+            });
+        });
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    async fn review_panel_mark_reviewed_sets_hunk_state(cx: &mut TestAppContext) {
+        use crate::review::{HunkReviewState, ReviewHunkKey};
+
+        let root_string = std::env::temp_dir()
+            .join(format!(
+                "axis-review-mark-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock should be available")
+                    .as_nanos()
+            ))
+            .display()
+            .to_string();
+        let payload = review_payload_single_text_file(&root_string);
+
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = root_string.clone();
+            AxisShell::new_with_agent_runtime(
+                vec![desk],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                    "review-mark-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock should be available")
+                        .as_nanos()
+                )))
+                .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                agent_sessions::AgentRuntimeBridge::new(),
+            )
+        });
+
+        window.update(|_, cx| {
+            shell.update(cx, |shell, view_cx| {
+                shell.workdesks[0].review_payload_cache = Some(payload.clone());
+                shell.open_review_panel(0, view_cx);
+                shell.mark_review_selected_hunk_reviewed(view_cx);
+                let desk = &shell.workdesks[0];
+                let file = &desk.review_payload_cache.as_ref().unwrap().files[0];
+                let hunk = &file.hunks[0];
+                let key = ReviewHunkKey::from_hunk(
+                    &WorkdeskId::new(desk.workdesk_id.clone()),
+                    &file.path,
+                    hunk,
+                );
+                assert_eq!(
+                    desk.review_local_state.hunk_states.get(&key),
+                    Some(&HunkReviewState::Reviewed)
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn review_panel_hunkless_file_disables_hunk_actions(cx: &mut TestAppContext) {
+        let root_string = std::env::temp_dir()
+            .join(format!(
+                "axis-review-hunkless-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock should be available")
+                    .as_nanos()
+            ))
+            .display()
+            .to_string();
+        let payload = review_payload_hunkless_file(&root_string);
+
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = root_string.clone();
+            AxisShell::new_with_agent_runtime(
+                vec![desk],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                    "review-hunkless-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock should be available")
+                        .as_nanos()
+                )))
+                .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                agent_sessions::AgentRuntimeBridge::new(),
+            )
+        });
+
+        window.update(|_, cx| {
+            shell.update(cx, |shell, view_cx| {
+                shell.workdesks[0].review_payload_cache = Some(payload);
+                shell.open_review_panel(0, view_cx);
+                assert!(
+                    !shell.review_panel_hunk_actions_enabled(),
+                    "hunk-level actions should be disabled without textual hunks"
+                );
+                shell.mark_review_selected_hunk_reviewed(view_cx);
+                let desk = &shell.workdesks[0];
+                assert!(
+                    desk.review_local_state.hunk_states.is_empty(),
+                    "mark reviewed should not fabricate state for hunkless entries"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn review_panel_removal_jump_uses_anchor_new_line(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "axis-review-removal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).expect("fixture directory should exist");
+        let file_path = root.join("src/demo.rs");
+        fs::write(&file_path, "one\ntwo\nthree\n")
+            .expect("fixture file should write");
+        let root_string = root.display().to_string();
+        let file_path_string = file_path.display().to_string();
+        let payload = review_payload_removal_anchor(&root_string);
+
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = root_string.clone();
+            AxisShell::new_with_agent_runtime(
+                vec![desk],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                    "review-removal-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock should be available")
+                        .as_nanos()
+                )))
+                .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                agent_sessions::AgentRuntimeBridge::new(),
+            )
+        });
+
+        window.update(|_, cx| {
+            shell.update(cx, |shell, view_cx| {
+                shell.workdesks[0].review_payload_cache = Some(payload);
+                shell.open_review_panel(0, view_cx);
+                assert!(shell.open_review_diff_line(0, 0, 0, 0, view_cx));
+                assert_eq!(shell.review_panel, Some(0));
+
+                let editor = shell.active_editor().expect("editor should open");
+                assert_eq!(
+                    canonical_path_string(&editor.path_string()),
+                    canonical_path_string(&file_path_string)
+                );
+                let (line, column) = editor.line_col_for_offset(editor.cursor_offset());
+                assert_eq!((line, column), (2, 0));
+            });
+        });
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    async fn opening_selected_workspace_search_result_focuses_requested_line(
+        cx: &mut TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "axis-workspace-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        let file_path = root.join("src/demo.rs");
+        fs::create_dir_all(file_path.parent().expect("fixture parent should exist"))
+            .expect("fixture directory should exist");
+        fs::write(&file_path, "first line\nsecond line\nthird line\n")
+            .expect("fixture file should write");
+        let root_string = root.display().to_string();
+        let file_path_string = file_path.display().to_string();
+
+        let (shell, window) = cx.add_window_view(|_, view_cx| {
+            let mut desk = blank_workdesk("Desk", "Summary");
+            desk.metadata.cwd = root_string.clone();
+            desk.worktree_binding =
+                Some(worktrees::binding_from_desk_paths(root_string.clone(), "main"));
+            AxisShell::new_with_agent_runtime(
+                vec![desk],
+                0,
+                ShortcutMap::default(),
+                None,
+                automation::start_automation_server_at(std::env::temp_dir().join(format!(
+                    "workspace-open-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock should be available")
+                        .as_nanos()
+                )))
+                .expect("automation server should start"),
+                view_cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                agent_sessions::AgentRuntimeBridge::new(),
+            )
+        });
+
+        window.update(|_, cx| {
+            shell.update(cx, |shell, view_cx| {
+                shell.workspace_palette = Some(WorkspacePaletteState {
+                    mode: WorkspacePaletteMode::SearchWorkspace,
+                    root_path: root.clone(),
+                    query: "third".to_string(),
+                    all_files: Vec::new(),
+                    results: vec![WorkspacePaletteResult::SearchMatch {
+                        absolute_path: file_path_string.clone(),
+                        relative_path: "src/demo.rs".to_string(),
+                        line_number: 3,
+                        preview: "third line".to_string(),
+                    }],
+                    selected: 0,
+                });
+
+                assert!(shell.open_selected_workspace_palette_result(view_cx));
+                assert!(shell.workspace_palette.is_none());
+
+                let editor = shell.active_editor().expect("editor should open");
+                assert_eq!(
+                    canonical_path_string(&editor.path_string()),
+                    canonical_path_string(&file_path_string)
+                );
+                let (line, column) = editor.line_col_for_offset(editor.cursor_offset());
+                assert_eq!((line, column), (2, 0));
+            });
+        });
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

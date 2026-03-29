@@ -170,7 +170,7 @@ v0 is successful if all of the following are true:
 ## Next Document
 
 The next useful artifact is the macOS bootstrap and repository plan:
-[macos-bootstrap-plan.md](/Users/mihver/Projects/canvas/docs/macos-bootstrap-plan.md)
+[macos-bootstrap-plan.md](macos-bootstrap-plan.md)
 
 The next product design artifact after bootstrap is the layout mode system:
-[workdesk-layout-modes.md](/Users/mihver/Projects/canvas/docs/workdesk-layout-modes.md)
+[workdesk-layout-modes.md](workdesk-layout-modes.md)

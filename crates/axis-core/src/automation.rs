@@ -50,6 +50,8 @@ pub enum AutomationRequest {
         cwd: Option<String>,
         cols: u16,
         rows: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<Vec<String>>,
     },
     #[serde(rename = "terminal.read")]
     TerminalRead {

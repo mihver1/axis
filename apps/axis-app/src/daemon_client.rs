@@ -5,7 +5,8 @@ use axis_core::terminal::{
     TerminalSessionId, TerminalSessionRecord, TerminalSurfaceKind, TerminalTranscriptChunk,
 };
 use axis_core::workdesk::{WorkdeskId, WorkdeskRecord};
-use axis_core::worktree::{ReviewSummary, WorktreeBinding, WorktreeId};
+use axis_core::review::DeskReviewPayload;
+use axis_core::worktree::{WorktreeBinding, WorktreeId};
 use axis_core::SurfaceId;
 use axis_terminal::TerminalGridSize;
 use serde::de::DeserializeOwned;
@@ -36,16 +37,6 @@ pub(crate) struct TerminalReadResult {
 pub(crate) struct WorktreeBindingResult {
     pub worktree_id: WorktreeId,
     pub binding: WorktreeBinding,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct DeskReviewResult {
-    pub worktree_id: WorktreeId,
-    pub summary: ReviewSummary,
-    #[serde(default)]
-    pub changed_files: Vec<String>,
-    #[serde(default)]
-    pub uncommitted_files: Vec<String>,
 }
 
 impl Default for DaemonClient {
@@ -79,6 +70,7 @@ impl DaemonClient {
             cwd: Some(cwd.to_string()),
             cols: grid.cols,
             rows: grid.rows,
+            command: None,
         })
     }
 
@@ -197,10 +189,26 @@ impl DaemonClient {
     pub fn desk_review_summary(
         &self,
         worktree_id: &WorktreeId,
-    ) -> Result<DeskReviewResult, String> {
+    ) -> Result<DeskReviewPayload, String> {
         self.send_typed_request(AutomationRequest::DeskReviewSummary {
             worktree_id: worktree_id.clone(),
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn attention_next(
+        &self,
+        workdesk_id: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        self.send_typed_request(AutomationRequest::AttentionNext { workdesk_id })
+    }
+
+    #[allow(dead_code)]
+    pub fn state_current(
+        &self,
+        workdesk_id: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        self.send_typed_request(AutomationRequest::StateCurrent { workdesk_id })
     }
 
     pub fn gui_heartbeat(

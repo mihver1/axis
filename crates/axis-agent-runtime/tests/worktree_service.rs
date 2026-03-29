@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use axis_agent_runtime::WorktreeService;
+use axis_agent_runtime::{ReviewPayloadLimits, WorktreeService};
 use tempfile::TempDir;
 
 fn run_git(repo: &Path, args: &[&str]) {
@@ -70,6 +70,42 @@ fn attach_existing_worktree_reads_branch_and_dirty_state() {
 }
 
 #[test]
+fn uncommitted_spaced_path_matches_review_payload_without_quotes() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path();
+    init_repo_with_main(repo);
+
+    fs::write(repo.join("space name.txt"), "v1\n").unwrap();
+    run_git(repo, &["add", "space name.txt"]);
+    run_git(repo, &["commit", "-m", "add spaced file"]);
+
+    let wt_dir = tmp.path().join("wt-space");
+    let binding = WorktreeService::create_worktree(repo, &wt_dir, "feature/space", "main").unwrap();
+
+    fs::write(wt_dir.join("space name.txt"), "v2\n").unwrap();
+
+    let refreshed = WorktreeService::refresh(&binding).unwrap();
+    assert!(refreshed.dirty);
+
+    let uncommitted = WorktreeService::uncommitted_changed_files(&wt_dir).unwrap();
+    let payload = WorktreeService::review_payload(
+        &wt_dir,
+        refreshed.base_branch.as_deref(),
+        refreshed.dirty,
+        ReviewPayloadLimits {
+            max_files: 256,
+            max_hunks_per_file: 64,
+            max_lines_per_hunk: 4096,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(uncommitted, vec![String::from("space name.txt")]);
+    assert_eq!(payload.files.len(), 1);
+    assert_eq!(payload.files[0].path, "space name.txt");
+}
+
+#[test]
 fn ahead_and_changed_files_reflect_commits_on_feature_branch() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path();
@@ -90,5 +126,106 @@ fn ahead_and_changed_files_reflect_commits_on_feature_branch() {
     assert!(
         names.iter().any(|n| n == "feature.md"),
         "expected feature.md in {names:?}"
+    );
+}
+
+#[test]
+fn review_payload_matches_base_and_dirty_helper_scope() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path();
+    init_repo_with_main(repo);
+
+    let wt_dir = tmp.path().join("wt-review-scope");
+    let binding =
+        WorktreeService::create_worktree(repo, &wt_dir, "feature/review-scope", "main").unwrap();
+
+    fs::write(wt_dir.join("feature.md"), "work\n").unwrap();
+    run_git(&wt_dir, &["add", "feature.md"]);
+    run_git(&wt_dir, &["commit", "-m", "feature commit"]);
+    fs::write(wt_dir.join("dirty.txt"), "scratch\n").unwrap();
+
+    let refreshed = WorktreeService::refresh(&binding).unwrap();
+    assert!(refreshed.dirty);
+
+    let changed_since_base = WorktreeService::changed_files_since_base(&wt_dir, "main").unwrap();
+    let uncommitted = WorktreeService::uncommitted_changed_files(&wt_dir).unwrap();
+    let payload = WorktreeService::review_payload(
+        &wt_dir,
+        refreshed.base_branch.as_deref(),
+        refreshed.dirty,
+        ReviewPayloadLimits {
+            max_files: 256,
+            max_hunks_per_file: 64,
+            max_lines_per_hunk: 4096,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        changed_since_base.iter().any(|path| path == "feature.md"),
+        "expected committed feature diff in {changed_since_base:?}"
+    );
+    assert!(
+        uncommitted.iter().any(|path| path == "dirty.txt"),
+        "expected dirty.txt in {uncommitted:?}"
+    );
+    assert!(
+        payload.files.iter().any(|file| file.path == "feature.md"),
+        "expected feature.md in payload: {:?}",
+        payload.files
+    );
+    assert!(
+        payload.files.iter().any(|file| file.path == "dirty.txt"),
+        "expected dirty.txt in payload: {:?}",
+        payload.files
+    );
+    assert_eq!(payload.summary.files_changed, 2);
+    assert_eq!(payload.summary.uncommitted_files, 1);
+}
+
+#[test]
+fn uncommitted_rename_uses_post_rename_path_consistently() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path();
+    init_repo_with_main(repo);
+
+    fs::write(repo.join("rename_me.txt"), "hello\n").unwrap();
+    run_git(repo, &["add", "rename_me.txt"]);
+    run_git(repo, &["commit", "-m", "add rename target"]);
+
+    let wt_dir = tmp.path().join("wt-rename");
+    let binding = WorktreeService::create_worktree(repo, &wt_dir, "feature/rename-wt", "main")
+        .unwrap();
+
+    run_git(&wt_dir, &["mv", "rename_me.txt", "renamed.txt"]);
+
+    let refreshed = WorktreeService::refresh(&binding).unwrap();
+    assert!(refreshed.dirty);
+
+    let uncommitted = WorktreeService::uncommitted_changed_files(&wt_dir).unwrap();
+    let payload = WorktreeService::review_payload(
+        &wt_dir,
+        refreshed.base_branch.as_deref(),
+        refreshed.dirty,
+        ReviewPayloadLimits {
+            max_files: 256,
+            max_hunks_per_file: 64,
+            max_lines_per_hunk: 4096,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        uncommitted.iter().any(|path| path == "renamed.txt"),
+        "expected post-rename path in {uncommitted:?}"
+    );
+    assert!(
+        !uncommitted.iter().any(|path| path == "rename_me.txt"),
+        "expected helper to avoid pre-rename path in {uncommitted:?}"
+    );
+    assert!(
+        payload.files.iter().any(|file| file.path == "renamed.txt"),
+        "expected payload to use renamed.txt: {:?}",
+        payload.files
     );
 }

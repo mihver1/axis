@@ -48,6 +48,50 @@ impl DaemonRegistry {
         records.sort_by(|left, right| left.workdesk_id.0.cmp(&right.workdesk_id.0));
         records
     }
+
+    /// Configured upstream base for a known workdesk bound to this worktree root, if any.
+    ///
+    /// Returns an error when multiple workdesks target the same worktree root but disagree on the
+    /// configured review base branch, so daemon review scope stays deterministic.
+    pub fn base_branch_for_worktree_root(&self, worktree_root: &str) -> Result<Option<String>> {
+        let mut matches = self
+            .workdesks
+            .values()
+            .filter_map(|record| {
+                record.worktree_binding.as_ref().and_then(|binding| {
+                    (binding.root_path == worktree_root)
+                        .then(|| (record.workdesk_id.0.clone(), binding.base_branch.clone()))
+                })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let Some((_, first_base_branch)) = matches.first() else {
+            return Ok(None);
+        };
+
+        if matches
+            .iter()
+            .skip(1)
+            .any(|(_, base_branch)| base_branch != first_base_branch)
+        {
+            let details = matches
+                .into_iter()
+                .map(|(workdesk_id, base_branch)| {
+                    format!(
+                        "{workdesk_id}={}",
+                        base_branch.unwrap_or_else(|| "<none>".to_string())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(anyhow!(
+                "ambiguous review base branch for worktree `{worktree_root}`: {details}"
+            ));
+        }
+
+        Ok(first_base_branch.clone())
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -86,6 +130,7 @@ impl TerminalRegistry {
         title: String,
         cwd: Option<String>,
         grid: TerminalGridSize,
+        command: Option<Vec<String>>,
     ) -> Result<TerminalSessionRecord> {
         let key = TerminalSurfaceKey {
             workdesk_id: workdesk_id.0.clone(),
@@ -110,7 +155,7 @@ impl TerminalRegistry {
         let session_id = TerminalSessionId::new(format!("term-{}", self.next_session_serial));
         self.next_session_serial = self.next_session_serial.saturating_add(1);
         let cwd = cwd.unwrap_or_default();
-        let launch = terminal_launch_spec(kind, &cwd);
+        let launch = terminal_launch_spec(kind, &cwd, command);
         let pty =
             DaemonPtySession::spawn(session_id.clone(), &launch, grid, self.transcripts.clone())?;
 
@@ -211,10 +256,17 @@ impl TerminalRegistry {
     }
 }
 
-fn terminal_launch_spec(kind: TerminalSurfaceKind, cwd: &str) -> ProcessLaunchSpec {
-    let process = match kind {
-        TerminalSurfaceKind::Shell => ProcessSpec::login_shell(),
-        TerminalSurfaceKind::Agent => ProcessSpec::agent_shell(),
+fn terminal_launch_spec(
+    kind: TerminalSurfaceKind,
+    cwd: &str,
+    command: Option<Vec<String>>,
+) -> ProcessLaunchSpec {
+    let process = match command {
+        Some(argv) if !argv.is_empty() => ProcessSpec::new(argv),
+        _ => match kind {
+            TerminalSurfaceKind::Shell => ProcessSpec::login_shell(),
+            TerminalSurfaceKind::Agent => ProcessSpec::agent_shell(),
+        },
     };
     let mut launch = ProcessLaunchSpec::new(process.argv);
     if !cwd.trim().is_empty() {

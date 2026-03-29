@@ -7,6 +7,12 @@ doctor:
 check:
     cargo check --workspace
 
+test:
+    cargo test -q
+
+clippy:
+    cargo clippy --workspace --all-targets
+
 run:
     cargo run -p axis-app
 

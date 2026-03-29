@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod automation;
 pub mod paths;
+pub mod review;
 pub mod terminal;
 pub mod workdesk;
 pub mod worktree;
