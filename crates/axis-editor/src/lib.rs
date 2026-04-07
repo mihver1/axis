@@ -6,11 +6,23 @@ use std::{
     time::SystemTime,
 };
 
+use ropey::Rope;
 use unicode_segmentation::UnicodeSegmentation;
 
 const TAB_TEXT: &str = "    ";
-const MAX_HISTORY_SNAPSHOTS: usize = 64;
-const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+
+/// A text change delta for LSP incremental sync.
+#[derive(Clone, Debug)]
+pub struct TextDelta {
+    pub range: Range<usize>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug)]
+struct UndoEntry {
+    delta: TextDelta,
+    selection: Selection,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
@@ -57,38 +69,24 @@ pub enum LanguageKind {
 }
 
 #[derive(Clone, Debug)]
-struct EditorSnapshot {
-    text: String,
-    selection: Selection,
-    marked_range: Option<Range<usize>>,
-    dirty: bool,
-    scroll_top_line: usize,
-}
-
-impl EditorSnapshot {
-    fn byte_size(&self) -> usize {
-        self.text.len()
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct EditorBuffer {
     path: PathBuf,
-    text: String,
-    saved_text: String,
+    rope: Rope,
+    saved_rope: Rope,
     dirty: bool,
     selection: Selection,
     marked_range: Option<Range<usize>>,
     preferred_column: Option<usize>,
     scroll_top_line: usize,
     search: SearchState,
-    line_starts: Vec<usize>,
     line_highlight_cache: RefCell<Vec<Option<Vec<HighlightSpan>>>>,
     language: LanguageKind,
-    undo_stack: Vec<EditorSnapshot>,
-    redo_stack: Vec<EditorSnapshot>,
+    undo_stack: Vec<UndoEntry>,
+    redo_stack: Vec<UndoEntry>,
     last_synced_modified_at: Option<SystemTime>,
     external_modified: bool,
+    document_version: u64,
+    pending_deltas: Vec<TextDelta>,
 }
 
 impl EditorBuffer {
@@ -102,34 +100,40 @@ impl EditorBuffer {
     pub fn restore(path: impl Into<PathBuf>, text: impl Into<String>, dirty: bool) -> Self {
         let path = path.into();
         let text = text.into();
-        let saved_text = if dirty {
-            fs::read_to_string(&path).unwrap_or_default()
+        let saved_rope = if dirty {
+            Rope::from_str(&fs::read_to_string(&path).unwrap_or_default())
         } else {
-            text.clone()
+            Rope::from_str(&text)
         };
         let language = detect_language(&path);
+        let rope = Rope::from_str(&text);
+        let line_count = rope_line_count(&rope);
         let mut this = Self {
             path,
-            text,
-            saved_text,
+            rope,
+            saved_rope,
             dirty,
             selection: Selection::default(),
             marked_range: None,
             preferred_column: None,
             scroll_top_line: 0,
             search: SearchState::default(),
-            line_starts: vec![0],
-            line_highlight_cache: RefCell::new(Vec::new()),
+            line_highlight_cache: RefCell::new(vec![None; line_count.max(1)]),
             language,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_synced_modified_at: None,
             external_modified: false,
+            document_version: 0,
+            pending_deltas: Vec::new(),
         };
-        this.rebuild_line_starts();
         this.selection.range = 0..0;
         this.last_synced_modified_at = file_modified_at(&this.path);
         this
+    }
+
+    pub fn from_text(path: PathBuf, text: String) -> Self {
+        Self::restore(path, text, false)
     }
 
     pub fn path(&self) -> &Path {
@@ -148,12 +152,12 @@ impl EditorBuffer {
             .to_string()
     }
 
-    pub fn text(&self) -> &str {
-        &self.text
+    pub fn text(&self) -> String {
+        self.rope.to_string()
     }
 
-    pub fn persisted_buffer_text(&self) -> Option<&str> {
-        self.dirty.then_some(self.text.as_str())
+    pub fn persisted_buffer_text(&self) -> Option<String> {
+        self.dirty.then(|| self.rope.to_string())
     }
 
     pub fn dirty(&self) -> bool {
@@ -177,7 +181,7 @@ impl EditorBuffer {
     }
 
     pub fn line_count(&self) -> usize {
-        self.line_starts.len().max(1)
+        rope_line_count(&self.rope)
     }
 
     pub fn scroll_top_line(&self) -> usize {
@@ -212,20 +216,28 @@ impl EditorBuffer {
         start..end
     }
 
-    pub fn line_text(&self, line_index: usize) -> &str {
-        let range = self.line_range(line_index);
-        &self.text[range]
+    pub fn line_text(&self, line_index: usize) -> String {
+        let line_index = line_index.min(self.line_count().saturating_sub(1));
+        let line_slice = self.rope.line(line_index);
+        let s = line_slice.to_string();
+        // Strip trailing newline
+        if s.ends_with('\n') {
+            s[..s.len() - 1].to_string()
+        } else {
+            s
+        }
     }
 
     pub fn line_range(&self, line_index: usize) -> Range<usize> {
         let line_index = line_index.min(self.line_count().saturating_sub(1));
-        let start = self.line_starts[line_index];
-        let end = self
-            .line_starts
-            .get(line_index + 1)
-            .copied()
-            .unwrap_or(self.text.len());
-        let end = if end > start && self.text.as_bytes().get(end - 1) == Some(&b'\n') {
+        let start = self.rope.line_to_byte(line_index);
+        let end = if line_index + 1 < self.rope.len_lines() {
+            self.rope.line_to_byte(line_index + 1)
+        } else {
+            self.rope.len_bytes()
+        };
+        // Strip trailing newline from range
+        let end = if end > start && self.rope.byte(end - 1) == b'\n' {
             end - 1
         } else {
             end
@@ -245,25 +257,37 @@ impl EditorBuffer {
         }
     }
 
-    pub fn selected_text(&self) -> Option<&str> {
-        (!self.selection.range.is_empty()).then_some(&self.text[self.selection.range.clone()])
+    pub fn selected_text(&self) -> Option<String> {
+        if self.selection.range.is_empty() {
+            return None;
+        }
+        let start = self.selection.range.start;
+        let end = self.selection.range.end;
+        if end > self.rope.len_bytes() {
+            return None;
+        }
+        let start_char = self.rope.byte_to_char(start);
+        let end_char = self.rope.byte_to_char(end);
+        Some(self.rope.slice(start_char..end_char).to_string())
     }
 
     pub fn move_left(&mut self, selecting: bool) {
+        let text = self.rope.to_string();
         if !selecting && !self.selection.range.is_empty() {
             self.move_to(self.selection.range.start, false);
             return;
         }
-        let target = previous_boundary(&self.text, self.cursor_offset());
+        let target = previous_boundary(&text, self.cursor_offset());
         self.move_to(target, selecting);
     }
 
     pub fn move_right(&mut self, selecting: bool) {
+        let text = self.rope.to_string();
         if !selecting && !self.selection.range.is_empty() {
             self.move_to(self.selection.range.end, false);
             return;
         }
-        let target = next_boundary(&self.text, self.cursor_offset());
+        let target = next_boundary(&text, self.cursor_offset());
         self.move_to(target, selecting);
     }
 
@@ -320,7 +344,7 @@ impl EditorBuffer {
 
     pub fn select_all(&mut self) {
         self.selection = Selection {
-            range: 0..self.text.len(),
+            range: 0..self.rope.len_bytes(),
             reversed: false,
         };
         self.preferred_column = None;
@@ -328,7 +352,8 @@ impl EditorBuffer {
 
     pub fn backspace(&mut self) -> bool {
         if self.selection.range.is_empty() {
-            let previous = previous_boundary(&self.text, self.cursor_offset());
+            let text = self.rope.to_string();
+            let previous = previous_boundary(&text, self.cursor_offset());
             self.selection.range = previous..self.cursor_offset();
             self.selection.reversed = false;
         }
@@ -337,7 +362,8 @@ impl EditorBuffer {
 
     pub fn delete_forward(&mut self) -> bool {
         if self.selection.range.is_empty() {
-            let next = next_boundary(&self.text, self.cursor_offset());
+            let text = self.rope.to_string();
+            let next = next_boundary(&text, self.cursor_offset());
             self.selection.range = self.cursor_offset()..next;
             self.selection.reversed = false;
         }
@@ -353,12 +379,20 @@ impl EditorBuffer {
     }
 
     pub fn replace_selection(&mut self, replacement: &str) -> bool {
-        self.record_undo_state();
+        let range = self.selection.range.clone();
+        let old_text = self.get_byte_range_text(range.clone());
         let changed = self.replace_internal(None, replacement, None);
         if changed {
+            // Record undo entry
+            let undo_entry = UndoEntry {
+                delta: TextDelta {
+                    range: range.start..range.start + replacement.len(),
+                    text: old_text,
+                },
+                selection: self.selection.clone(),
+            };
+            self.undo_stack.push(undo_entry);
             self.redo_stack.clear();
-        } else {
-            self.undo_stack.pop();
         }
         changed
     }
@@ -368,12 +402,24 @@ impl EditorBuffer {
         range_utf16: Option<Range<usize>>,
         replacement: &str,
     ) -> bool {
-        self.record_undo_state();
+        let text = self.rope.to_string();
+        let range = range_utf16
+            .as_ref()
+            .map(|r| range_from_utf16_str(&text, r))
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selection.range.clone());
+        let old_text = self.get_byte_range_text(range.clone());
         let changed = self.replace_internal(range_utf16, replacement, None);
         if changed {
+            let undo_entry = UndoEntry {
+                delta: TextDelta {
+                    range: range.start..range.start + replacement.len(),
+                    text: old_text,
+                },
+                selection: self.selection.clone(),
+            };
+            self.undo_stack.push(undo_entry);
             self.redo_stack.clear();
-        } else {
-            self.undo_stack.pop();
         }
         changed
     }
@@ -384,40 +430,105 @@ impl EditorBuffer {
         replacement: &str,
         selected_range_utf16: Option<Range<usize>>,
     ) -> bool {
-        self.record_undo_state();
+        let text = self.rope.to_string();
+        let range = range_utf16
+            .as_ref()
+            .map(|r| range_from_utf16_str(&text, r))
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selection.range.clone());
+        let old_text = self.get_byte_range_text(range.clone());
         let changed = self.replace_internal(range_utf16, replacement, selected_range_utf16);
         if changed {
+            let undo_entry = UndoEntry {
+                delta: TextDelta {
+                    range: range.start..range.start + replacement.len(),
+                    text: old_text,
+                },
+                selection: self.selection.clone(),
+            };
+            self.undo_stack.push(undo_entry);
             self.redo_stack.clear();
-        } else {
-            self.undo_stack.pop();
         }
         changed
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(snapshot) = self.undo_stack.pop() else {
+        let Some(entry) = self.undo_stack.pop() else {
             return false;
         };
-        self.redo_stack.push(self.snapshot());
-        Self::prune_history(&mut self.redo_stack);
-        self.restore_snapshot(snapshot);
+        // The entry.delta.range is the range of new text that was inserted.
+        // entry.delta.text is the old text that was replaced.
+        // To undo: remove the new text at entry.delta.range, insert old text at entry.delta.range.start.
+        let new_range = entry.delta.range.clone();
+        let new_text = self.get_byte_range_text(new_range.clone());
+        let old_text = entry.delta.text.clone();
+        let current_selection = self.selection.clone();
+
+        // Apply the inverse
+        let start_char = self.rope.byte_to_char(new_range.start);
+        let end_char = self.rope.byte_to_char(new_range.end);
+        self.rope.remove(start_char..end_char);
+        let insert_char = self.rope.byte_to_char(new_range.start);
+        self.rope.insert(insert_char, &old_text);
+
+        // Push redo entry (inverse of what we just did)
+        let redo_entry = UndoEntry {
+            delta: TextDelta {
+                range: new_range.start..new_range.start + old_text.len(),
+                text: new_text,
+            },
+            selection: current_selection,
+        };
+        self.redo_stack.push(redo_entry);
+
+        // Restore selection from entry
+        self.selection = entry.selection;
+        self.dirty = self.rope.to_string() != self.saved_rope.to_string();
+        self.preferred_column = None;
+        self.invalidate_line_cache();
+        self.recompute_search_matches(false);
+        self.document_version += 1;
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(snapshot) = self.redo_stack.pop() else {
+        let Some(entry) = self.redo_stack.pop() else {
             return false;
         };
-        self.undo_stack.push(self.snapshot());
-        Self::prune_history(&mut self.undo_stack);
-        self.restore_snapshot(snapshot);
+        let new_range = entry.delta.range.clone();
+        let new_text = self.get_byte_range_text(new_range.clone());
+        let old_text = entry.delta.text.clone();
+        let current_selection = self.selection.clone();
+
+        let start_char = self.rope.byte_to_char(new_range.start);
+        let end_char = self.rope.byte_to_char(new_range.end);
+        self.rope.remove(start_char..end_char);
+        let insert_char = self.rope.byte_to_char(new_range.start);
+        self.rope.insert(insert_char, &old_text);
+
+        let undo_entry = UndoEntry {
+            delta: TextDelta {
+                range: new_range.start..new_range.start + old_text.len(),
+                text: new_text,
+            },
+            selection: current_selection,
+        };
+        self.undo_stack.push(undo_entry);
+
+        self.selection = entry.selection;
+        self.dirty = self.rope.to_string() != self.saved_rope.to_string();
+        self.preferred_column = None;
+        self.invalidate_line_cache();
+        self.recompute_search_matches(false);
+        self.document_version += 1;
         true
     }
 
     pub fn save(&mut self) -> Result<(), String> {
-        fs::write(&self.path, &self.text)
+        let text = self.rope.to_string();
+        fs::write(&self.path, &text)
             .map_err(|error| format!("write {}: {error}", self.path.display()))?;
-        self.saved_text = self.text.clone();
+        self.saved_rope = self.rope.clone();
         self.dirty = false;
         self.external_modified = false;
         self.last_synced_modified_at = file_modified_at(&self.path);
@@ -427,8 +538,8 @@ impl EditorBuffer {
     pub fn reload(&mut self) -> Result<(), String> {
         let reloaded = fs::read_to_string(&self.path)
             .map_err(|error| format!("read {}: {error}", self.path.display()))?;
-        self.text = reloaded.clone();
-        self.saved_text = reloaded;
+        self.rope = Rope::from_str(&reloaded);
+        self.saved_rope = Rope::from_str(&reloaded);
         self.dirty = false;
         self.selection.range = 0..0;
         self.selection.reversed = false;
@@ -436,8 +547,9 @@ impl EditorBuffer {
         self.preferred_column = None;
         self.external_modified = false;
         self.last_synced_modified_at = file_modified_at(&self.path);
-        self.rebuild_line_starts();
+        self.invalidate_line_cache();
         self.recompute_search_matches(false);
+        self.document_version += 1;
         Ok(())
     }
 
@@ -535,7 +647,7 @@ impl EditorBuffer {
         }
 
         let text = self.line_text(line_index);
-        let spans = lexical_highlight_line(self.language, text);
+        let spans = lexical_highlight_line(self.language, &text);
         let mut cache = self.line_highlight_cache.borrow_mut();
         if cache.len() < self.line_count() {
             cache.resize(self.line_count(), None);
@@ -549,11 +661,13 @@ impl EditorBuffer {
     }
 
     pub fn offset_to_utf16(&self, offset: usize) -> usize {
-        offset_to_utf16(&self.text, offset)
+        let text = self.rope.to_string();
+        offset_to_utf16(&text, offset)
     }
 
     pub fn offset_from_utf16(&self, offset: usize) -> usize {
-        offset_from_utf16(&self.text, offset)
+        let text = self.rope.to_string();
+        offset_from_utf16(&text, offset)
     }
 
     pub fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
@@ -565,12 +679,9 @@ impl EditorBuffer {
     }
 
     pub fn line_col_for_offset(&self, offset: usize) -> (usize, usize) {
-        let offset = offset.min(self.text.len());
-        let line = self
-            .line_starts
-            .partition_point(|start| *start <= offset)
-            .saturating_sub(1);
-        let line_start = self.line_starts[line];
+        let offset = offset.min(self.rope.len_bytes());
+        let line = self.rope.byte_to_line(offset);
+        let line_start = self.rope.line_to_byte(line);
         (line, offset.saturating_sub(line_start))
     }
 
@@ -579,8 +690,16 @@ impl EditorBuffer {
         (range.start + column).min(range.end)
     }
 
+    pub fn document_version(&self) -> u64 {
+        self.document_version
+    }
+
+    pub fn take_pending_deltas(&mut self) -> Vec<TextDelta> {
+        std::mem::take(&mut self.pending_deltas)
+    }
+
     fn move_to(&mut self, offset: usize, selecting: bool) {
-        let offset = offset.min(self.text.len());
+        let offset = offset.min(self.rope.len_bytes());
         if selecting {
             if self.selection.reversed {
                 self.selection.range.start = offset;
@@ -609,7 +728,8 @@ impl EditorBuffer {
     }
 
     fn recompute_search_matches(&mut self, snap_to_first: bool) {
-        self.search.matches = compute_search_matches(&self.text, &self.search.query);
+        let text = self.rope.to_string();
+        self.search.matches = compute_search_matches(&text, &self.search.query);
         if self.search.matches.is_empty() {
             self.search.active_match = None;
             return;
@@ -630,41 +750,62 @@ impl EditorBuffer {
         }
     }
 
+    fn get_byte_range_text(&self, range: Range<usize>) -> String {
+        if range.is_empty() || range.start >= self.rope.len_bytes() {
+            return String::new();
+        }
+        let end = range.end.min(self.rope.len_bytes());
+        let start_char = self.rope.byte_to_char(range.start);
+        let end_char = self.rope.byte_to_char(end);
+        self.rope.slice(start_char..end_char).to_string()
+    }
+
     fn replace_internal(
         &mut self,
         range_utf16: Option<Range<usize>>,
         replacement: &str,
         selected_range_utf16: Option<Range<usize>>,
     ) -> bool {
+        let text = self.rope.to_string();
         let range = range_utf16
             .as_ref()
-            .map(|range| self.range_from_utf16(range))
+            .map(|r| range_from_utf16_str(&text, r))
             .or_else(|| self.marked_range.clone())
             .unwrap_or_else(|| self.selection.range.clone());
 
-        if range.start > self.text.len() || range.end > self.text.len() || range.start > range.end {
+        let len = self.rope.len_bytes();
+        if range.start > len || range.end > len || range.start > range.end {
             return false;
         }
 
-        let mut next_text = String::with_capacity(
-            self.text.len().saturating_sub(range.end - range.start) + replacement.len(),
-        );
-        next_text.push_str(&self.text[..range.start]);
-        next_text.push_str(replacement);
-        next_text.push_str(&self.text[range.end..]);
+        // Check if this would actually change anything
+        let old_text = self.get_byte_range_text(range.clone());
+        let changed = old_text != replacement;
 
-        let changed = next_text != self.text;
-        self.text = next_text;
-        self.dirty = self.text != self.saved_text;
+        // Apply the edit via rope operations
+        if !range.is_empty() {
+            let start_char = self.rope.byte_to_char(range.start);
+            let end_char = self.rope.byte_to_char(range.end);
+            self.rope.remove(start_char..end_char);
+        }
+        if !replacement.is_empty() {
+            let insert_char = self.rope.byte_to_char(range.start);
+            self.rope.insert(insert_char, replacement);
+        }
+
+        self.dirty = self.rope.to_string() != self.saved_rope.to_string();
         self.external_modified = false;
         self.marked_range = if replacement.is_empty() {
             None
         } else {
             Some(range.start..range.start + replacement.len())
         };
+
+        // Compute new selection, handling utf16 selected_range if provided
+        let new_text = self.rope.to_string();
         self.selection.range = selected_range_utf16
             .as_ref()
-            .map(|selection| self.range_from_utf16(selection))
+            .map(|selection| range_from_utf16_str(&new_text, selection))
             .map(|selection| {
                 range.start + selection.start..range.start + selection.end.min(replacement.len())
             })
@@ -677,65 +818,46 @@ impl EditorBuffer {
             self.marked_range = None;
         }
         self.preferred_column = None;
-        self.rebuild_line_starts();
+        self.invalidate_line_cache();
         self.recompute_search_matches(false);
+
+        if changed {
+            // Record delta for LSP
+            self.document_version += 1;
+            self.pending_deltas.push(TextDelta {
+                range: range.clone(),
+                text: replacement.to_string(),
+            });
+        }
+
         changed
     }
 
-    fn record_undo_state(&mut self) {
-        self.undo_stack.push(self.snapshot());
-        Self::prune_history(&mut self.undo_stack);
-    }
-
-    fn snapshot(&self) -> EditorSnapshot {
-        EditorSnapshot {
-            text: self.text.clone(),
-            selection: self.selection.clone(),
-            marked_range: self.marked_range.clone(),
-            dirty: self.dirty,
-            scroll_top_line: self.scroll_top_line,
-        }
-    }
-
-    fn prune_history(history: &mut Vec<EditorSnapshot>) {
-        while history.len() > MAX_HISTORY_SNAPSHOTS
-            || history.iter().map(EditorSnapshot::byte_size).sum::<usize>() > MAX_HISTORY_BYTES
-        {
-            if history.is_empty() {
-                break;
-            }
-            history.remove(0);
-        }
-    }
-
-    fn restore_snapshot(&mut self, snapshot: EditorSnapshot) {
-        self.text = snapshot.text;
-        self.selection = snapshot.selection;
-        self.marked_range = snapshot.marked_range;
-        self.dirty = snapshot.dirty;
-        self.scroll_top_line = snapshot.scroll_top_line;
-        self.preferred_column = None;
-        self.rebuild_line_starts();
-        self.recompute_search_matches(false);
-    }
-
-    fn rebuild_line_starts(&mut self) {
-        self.line_starts.clear();
-        self.line_starts.push(0);
-        for (index, ch) in self.text.char_indices() {
-            if ch == '\n' && index + 1 <= self.text.len() {
-                self.line_starts.push(index + 1);
-            }
-        }
-        if self.line_starts.is_empty() {
-            self.line_starts.push(0);
-        }
+    fn invalidate_line_cache(&mut self) {
+        let line_count = self.line_count();
         self.line_highlight_cache
-            .replace(vec![None; self.line_count().max(1)]);
+            .replace(vec![None; line_count.max(1)]);
         self.scroll_top_line = self
             .scroll_top_line
             .min(self.line_count().saturating_sub(1));
     }
+}
+
+/// Compute the "logical" line count, collapsing the phantom trailing line
+/// that ropey reports when the text ends with `\n`.
+fn rope_line_count(rope: &Rope) -> usize {
+    let raw = rope.len_lines();
+    if raw > 1 && rope.len_bytes() > 0 && rope.byte(rope.len_bytes() - 1) == b'\n' {
+        // ropey counts the empty trailing line after a final newline;
+        // the old line_starts model did not.
+        raw - 1
+    } else {
+        raw.max(1)
+    }
+}
+
+fn range_from_utf16_str(text: &str, range: &Range<usize>) -> Range<usize> {
+    offset_from_utf16(text, range.start)..offset_from_utf16(text, range.end)
 }
 
 fn compute_search_matches(text: &str, query: &str) -> Vec<Range<usize>> {
@@ -1050,19 +1172,65 @@ mod tests {
     }
 
     #[test]
-    fn history_is_pruned_by_count_and_bytes() {
-        let history_entry = EditorSnapshot {
-            text: "x".repeat((MAX_HISTORY_BYTES / 10).max(32)),
-            selection: Selection::default(),
-            marked_range: None,
-            dirty: true,
-            scroll_top_line: 0,
-        };
-        let mut history = vec![history_entry; MAX_HISTORY_SNAPSHOTS + 12];
-        EditorBuffer::prune_history(&mut history);
+    fn from_text_creates_buffer() {
+        let editor = EditorBuffer::from_text("/tmp/test.rs".into(), "hello world".to_string());
+        assert_eq!(editor.text(), "hello world");
+        assert_eq!(editor.line_count(), 1);
+        assert!(!editor.dirty());
+    }
 
-        assert!(history.len() <= MAX_HISTORY_SNAPSHOTS);
-        let retained_bytes = history.iter().map(EditorSnapshot::byte_size).sum::<usize>();
-        assert!(retained_bytes <= MAX_HISTORY_BYTES);
+    #[test]
+    fn document_version_increments_on_edit() {
+        let mut editor = EditorBuffer::restore("/tmp/test.rs", "hello", false);
+        assert_eq!(editor.document_version(), 0);
+        editor.move_to_offset(5, false);
+        editor.replace_selection(" world");
+        assert_eq!(editor.document_version(), 1);
+        editor.replace_selection("!");
+        assert_eq!(editor.document_version(), 2);
+    }
+
+    #[test]
+    fn pending_deltas_are_recorded() {
+        let mut editor = EditorBuffer::restore("/tmp/test.rs", "hello", false);
+        editor.move_to_offset(5, false);
+        editor.replace_selection(" world");
+        let deltas = editor.take_pending_deltas();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].range, 5..5);
+        assert_eq!(deltas[0].text, " world");
+        // After taking, should be empty
+        assert!(editor.take_pending_deltas().is_empty());
+    }
+
+    #[test]
+    fn line_operations_work() {
+        let editor = EditorBuffer::restore("/tmp/test.rs", "line1\nline2\nline3", false);
+        assert_eq!(editor.line_count(), 3);
+        assert_eq!(editor.line_text(0), "line1");
+        assert_eq!(editor.line_text(1), "line2");
+        assert_eq!(editor.line_text(2), "line3");
+        assert_eq!(editor.line_range(0), 0..5);
+        assert_eq!(editor.line_range(1), 6..11);
+        assert_eq!(editor.line_range(2), 12..17);
+    }
+
+    #[test]
+    fn line_count_with_trailing_newline() {
+        let editor = EditorBuffer::restore("/tmp/test.rs", "line1\nline2\n", false);
+        // Should be 2 lines (the old model didn't count the empty trailing line)
+        assert_eq!(editor.line_count(), 2);
+    }
+
+    #[test]
+    fn line_col_conversions() {
+        let editor = EditorBuffer::restore("/tmp/test.rs", "abc\ndef\nghi", false);
+        assert_eq!(editor.line_col_for_offset(0), (0, 0));
+        assert_eq!(editor.line_col_for_offset(3), (0, 3));
+        assert_eq!(editor.line_col_for_offset(4), (1, 0));
+        assert_eq!(editor.line_col_for_offset(7), (1, 3));
+        assert_eq!(editor.offset_for_line_col(0, 2), 2);
+        assert_eq!(editor.offset_for_line_col(1, 1), 5);
+        assert_eq!(editor.offset_for_line_col(2, 0), 8);
     }
 }
