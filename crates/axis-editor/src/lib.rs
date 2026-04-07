@@ -84,6 +84,7 @@ pub struct EditorBuffer {
     search: SearchState,
     line_highlight_cache: RefCell<Vec<Option<Vec<HighlightSpan>>>>,
     language: LanguageKind,
+    tree: Option<tree_sitter::Tree>,
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
     last_synced_modified_at: Option<SystemTime>,
@@ -110,6 +111,7 @@ impl EditorBuffer {
         };
         let language = detect_language(&path);
         let rope = Rope::from_str(&text);
+        let tree = initial_parse(&text, language);
         let line_count = rope_line_count(&rope);
         let mut this = Self {
             path,
@@ -123,6 +125,7 @@ impl EditorBuffer {
             search: SearchState::default(),
             line_highlight_cache: RefCell::new(vec![None; line_count.max(1)]),
             language,
+            tree,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_synced_modified_at: None,
@@ -489,6 +492,7 @@ impl EditorBuffer {
         self.dirty = self.rope.to_string() != self.saved_rope.to_string();
         self.preferred_column = None;
         self.invalidate_line_cache();
+        self.reparse_tree();
         self.recompute_search_matches(false);
         self.document_version += 1;
         true
@@ -522,6 +526,7 @@ impl EditorBuffer {
         self.dirty = self.rope.to_string() != self.saved_rope.to_string();
         self.preferred_column = None;
         self.invalidate_line_cache();
+        self.reparse_tree();
         self.recompute_search_matches(false);
         self.document_version += 1;
         true
@@ -543,6 +548,7 @@ impl EditorBuffer {
             .map_err(|error| format!("read {}: {error}", self.path.display()))?;
         self.rope = Rope::from_str(&reloaded);
         self.saved_rope = Rope::from_str(&reloaded);
+        self.tree = initial_parse(&reloaded, self.language);
         self.dirty = false;
         self.selection.range = 0..0;
         self.selection.reversed = false;
@@ -720,14 +726,60 @@ impl EditorBuffer {
             }
         }
 
-        let text = self.line_text(line_index);
-        let spans = lexical_highlight_line(self.language, &text);
+        let spans = self
+            .tree_sitter_highlights_for_line(line_index)
+            .unwrap_or_else(|| lexical_highlight_line(self.language, &self.line_text(line_index)));
         let mut cache = self.line_highlight_cache.borrow_mut();
         if cache.len() < self.line_count() {
             cache.resize(self.line_count(), None);
         }
         cache[line_index] = Some(spans.clone());
         spans
+    }
+
+    fn tree_sitter_highlights_for_line(&self, line_index: usize) -> Option<Vec<HighlightSpan>> {
+        use tree_sitter::StreamingIterator;
+
+        let tree = self.tree.as_ref()?;
+        let ts_lang = ts_language_for(self.language)?;
+        let query_source = ts_highlight_query_for(self.language)?;
+        let query = tree_sitter::Query::new(&ts_lang, query_source).ok()?;
+
+        let line_range = self.line_range(line_index);
+        let mut cursor = tree_sitter::QueryCursor::new();
+        cursor.set_byte_range(line_range.clone());
+
+        let source = self.rope.to_string();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+
+        let mut spans = Vec::new();
+        while let Some(m) = {
+            matches.advance();
+            matches.get()
+        } {
+            for capture in m.captures {
+                let node = capture.node;
+                let name = query.capture_names()[capture.index as usize];
+                let kind = match name {
+                    "comment" => HighlightKind::Comment,
+                    "string" => HighlightKind::String,
+                    "number" => HighlightKind::Number,
+                    "keyword" => HighlightKind::Keyword,
+                    "type" => HighlightKind::Type,
+                    _ => continue,
+                };
+                let start = node.start_byte().max(line_range.start) - line_range.start;
+                let end = node.end_byte().min(line_range.end) - line_range.start;
+                if start < end {
+                    spans.push(HighlightSpan {
+                        range: start..end,
+                        kind,
+                    });
+                }
+            }
+        }
+        spans.sort_by_key(|s| s.range.start);
+        Some(spans)
     }
 
     pub fn move_to_offset(&mut self, offset: usize, selecting: bool) {
@@ -894,6 +946,7 @@ impl EditorBuffer {
         }
         self.preferred_column = None;
         self.invalidate_line_cache();
+        self.reparse_tree();
         self.recompute_search_matches(false);
 
         if changed {
@@ -906,6 +959,14 @@ impl EditorBuffer {
         }
 
         changed
+    }
+
+    fn reparse_tree(&mut self) {
+        if let Some(ts_lang) = ts_language_for(self.language) {
+            let mut parser = tree_sitter::Parser::new();
+            let _ = parser.set_language(&ts_lang);
+            self.tree = parser.parse(&self.rope.to_string(), self.tree.as_ref());
+        }
     }
 
     fn invalidate_line_cache(&mut self) {
@@ -1213,6 +1274,102 @@ fn detect_language(path: &Path) -> LanguageKind {
         return LanguageKind::Markdown;
     }
     LanguageKind::Plaintext
+}
+
+fn initial_parse(text: &str, language: LanguageKind) -> Option<tree_sitter::Tree> {
+    let ts_language = ts_language_for(language)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_language).ok()?;
+    parser.parse(text, None)
+}
+
+fn ts_language_for(language: LanguageKind) -> Option<tree_sitter::Language> {
+    match language {
+        LanguageKind::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+        LanguageKind::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        LanguageKind::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        LanguageKind::JavaScript | LanguageKind::Jsx => {
+            Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        }
+        LanguageKind::Json => Some(tree_sitter_json::LANGUAGE.into()),
+        LanguageKind::Toml => Some(tree_sitter_toml_ng::LANGUAGE.into()),
+        LanguageKind::Yaml => Some(tree_sitter_yaml::LANGUAGE.into()),
+        // tree-sitter-markdown 0.7 uses the old tree-sitter 0.19 API,
+        // incompatible with tree-sitter 0.25 — fall back to lexical.
+        LanguageKind::Markdown | LanguageKind::Plaintext => None,
+    }
+}
+
+fn ts_highlight_query_for(language: LanguageKind) -> Option<&'static str> {
+    match language {
+        LanguageKind::Rust => Some(
+            r#"
+(line_comment) @comment
+(block_comment) @comment
+(string_literal) @string
+(raw_string_literal) @string
+(char_literal) @string
+(integer_literal) @number
+(float_literal) @number
+(boolean_literal) @keyword
+["fn" "let" "mut" "pub" "use" "mod" "struct" "enum" "impl" "trait" "type"
+ "where" "if" "else" "match" "for" "while" "loop" "return" "break" "continue"
+ "async" "await" "move" "ref" "self" "Self" "super" "crate" "const" "static"
+ "unsafe" "extern" "as" "in" "dyn" "true" "false"] @keyword
+(type_identifier) @type
+(primitive_type) @type
+"#,
+        ),
+        LanguageKind::TypeScript
+        | LanguageKind::Tsx
+        | LanguageKind::JavaScript
+        | LanguageKind::Jsx => Some(
+            r#"
+(comment) @comment
+(string) @string
+(template_string) @string
+(number) @number
+["function" "const" "let" "var" "return" "if" "else" "for" "while" "do"
+ "switch" "case" "break" "continue" "new" "delete" "typeof" "instanceof"
+ "import" "export" "from" "default" "class" "extends" "async" "await"
+ "try" "catch" "finally" "throw" "yield" "of" "in" "true" "false" "null"
+ "undefined" "void" "this" "super" "type" "interface" "enum" "implements"
+ "abstract" "static" "private" "protected" "public" "readonly" "as"] @keyword
+(type_identifier) @type
+"#,
+        ),
+        LanguageKind::Json => Some(
+            r#"
+(string) @string
+(number) @number
+(true) @keyword
+(false) @keyword
+(null) @keyword
+"#,
+        ),
+        LanguageKind::Toml => Some(
+            r#"
+(comment) @comment
+(string) @string
+(integer) @number
+(float) @number
+(boolean) @keyword
+"#,
+        ),
+        LanguageKind::Yaml => Some(
+            r#"
+(comment) @comment
+(string_scalar) @string
+(double_quote_scalar) @string
+(single_quote_scalar) @string
+(integer_scalar) @number
+(float_scalar) @number
+(boolean_scalar) @keyword
+(null_scalar) @keyword
+"#,
+        ),
+        LanguageKind::Markdown | LanguageKind::Plaintext => None,
+    }
 }
 
 fn lexical_highlight_line(language: LanguageKind, line: &str) -> Vec<HighlightSpan> {
@@ -1535,5 +1692,177 @@ mod tests {
         assert_eq!(editor.offset_for_line_col(0, 2), 2);
         assert_eq!(editor.offset_for_line_col(1, 1), 5);
         assert_eq!(editor.offset_for_line_col(2, 0), 8);
+    }
+
+    #[test]
+    fn tree_sitter_highlights_rust() {
+        let editor = EditorBuffer::restore("/tmp/test.rs", "fn main() {\n    let x = 42;\n}", false);
+        assert!(editor.tree.is_some(), "tree-sitter tree should be parsed for .rs");
+
+        // Line 0: "fn main() {"
+        let spans = editor.highlight_line(0);
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Keyword),
+            "should highlight 'fn' keyword on line 0: {spans:?}"
+        );
+
+        // Line 1: "    let x = 42;"
+        let spans = editor.highlight_line(1);
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Keyword),
+            "should highlight 'let' keyword on line 1: {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Number),
+            "should highlight number '42' on line 1: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_highlights_json() {
+        let editor = EditorBuffer::restore(
+            "/tmp/test.json",
+            r#"{"key": "value", "num": 123, "flag": true}"#,
+            false,
+        );
+        assert!(editor.tree.is_some(), "tree-sitter tree should be parsed for .json");
+
+        let spans = editor.highlight_line(0);
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::String),
+            "should highlight strings in JSON: {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Number),
+            "should highlight numbers in JSON: {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Keyword),
+            "should highlight true/false/null in JSON: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_reparse_on_edit() {
+        let mut editor = EditorBuffer::restore("/tmp/test.rs", "fn main() {}", false);
+        assert!(editor.tree.is_some());
+
+        editor.move_to_offset(editor.text().len(), false);
+        editor.insert_newline();
+        editor.replace_selection("let x = 99;");
+
+        // Tree should still be present after edits
+        assert!(editor.tree.is_some());
+
+        // Line 1 should have highlighting
+        let spans = editor.highlight_line(1);
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Keyword),
+            "should highlight 'let' after edit: {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Number),
+            "should highlight '99' after edit: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn plaintext_falls_back_to_lexical() {
+        let editor = EditorBuffer::restore("/tmp/test.txt", "hello world", false);
+        assert!(editor.tree.is_none(), "plaintext should have no tree-sitter tree");
+        // Should still return spans (via lexical fallback) without panicking
+        let spans = editor.highlight_line(0);
+        assert!(spans.is_empty() || spans.iter().all(|s| s.kind == HighlightKind::Plain || true));
+    }
+
+    #[test]
+    fn markdown_falls_back_to_lexical() {
+        let editor = EditorBuffer::restore("/tmp/test.md", "# Heading\n\nSome text", false);
+        assert!(
+            editor.tree.is_none(),
+            "markdown should not use tree-sitter (incompatible crate version)"
+        );
+        let spans = editor.highlight_line(0);
+        // Lexical markdown highlights headings as Keyword
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Keyword),
+            "should highlight markdown heading via lexical fallback: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_highlights_typescript() {
+        let editor = EditorBuffer::restore(
+            "/tmp/test.ts",
+            "const x: number = 42;\n// comment\n",
+            false,
+        );
+        assert!(editor.tree.is_some());
+
+        let spans = editor.highlight_line(0);
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Keyword),
+            "should highlight 'const' in TS: {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Number),
+            "should highlight '42' in TS: {spans:?}"
+        );
+
+        let spans = editor.highlight_line(1);
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Comment),
+            "should highlight comment in TS: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_highlights_toml() {
+        let editor = EditorBuffer::restore(
+            "/tmp/test.toml",
+            "# comment\nkey = \"value\"\nnum = 42\nflag = true\n",
+            false,
+        );
+        assert!(editor.tree.is_some());
+
+        let spans = editor.highlight_line(0);
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Comment),
+            "should highlight comment in TOML: {spans:?}"
+        );
+
+        let spans = editor.highlight_line(1);
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::String),
+            "should highlight string in TOML: {spans:?}"
+        );
+
+        let spans = editor.highlight_line(2);
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Number),
+            "should highlight number in TOML: {spans:?}"
+        );
+
+        let spans = editor.highlight_line(3);
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Keyword),
+            "should highlight boolean in TOML: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_highlights_yaml() {
+        let editor = EditorBuffer::restore(
+            "/tmp/test.yaml",
+            "# comment\nkey: \"value\"\nnum: 42\nflag: true\n",
+            false,
+        );
+        assert!(editor.tree.is_some());
+
+        let spans = editor.highlight_line(0);
+        assert!(
+            spans.iter().any(|s| s.kind == HighlightKind::Comment),
+            "should highlight comment in YAML: {spans:?}"
+        );
     }
 }

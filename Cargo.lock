@@ -539,6 +539,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "axis-lsp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "axis-terminal"
 version = "0.1.0"
 dependencies = [
