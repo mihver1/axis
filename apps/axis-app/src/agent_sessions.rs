@@ -9,9 +9,8 @@ use parking_lot::Mutex;
 use axis_agent_runtime::adapters::codex::CodexProvider;
 use axis_agent_runtime::adapters::process_only::ProcessOnlyProvider;
 use axis_agent_runtime::{
-    resolve_provider_command_from_env_or_default,
-    resolve_provider_command_from_env_or_default_for_cwd, ProviderProfileMetadata,
-    ProviderRegistry, SessionManager, StartAgentRequest,
+    resolve_provider_command_from_env_or_default, resolve_provider_command_from_env_or_default_for_cwd,
+    AgentError, ProviderProfileMetadata, ProviderRegistry, SessionManager, StartAgentRequest,
 };
 use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionId, AgentSessionRecord, AgentTransportKind};
 use axis_core::agent_history::{AgentApprovalRequestId, AgentSessionDetail, AgentTimelineEntry};
@@ -647,7 +646,13 @@ impl AgentRuntimeBridge {
             guard
                 .manager
                 .send_turn(agent_session_id, text)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    if let Some(agent_err) = error.downcast_ref::<AgentError>() {
+                        agent_err.to_string()
+                    } else {
+                        error.to_string()
+                    }
+                })?;
             return Self::local_detail_for_session(&guard, agent_session_id)
                 .ok_or_else(|| format!("unknown session {}", agent_session_id.0));
         }
@@ -668,7 +673,13 @@ impl AgentRuntimeBridge {
             guard
                 .manager
                 .respond_approval(agent_session_id, approval_request_id, approved, note)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    if let Some(agent_err) = error.downcast_ref::<AgentError>() {
+                        agent_err.to_string()
+                    } else {
+                        error.to_string()
+                    }
+                })?;
             return Self::local_detail_for_session(&guard, agent_session_id)
                 .ok_or_else(|| format!("unknown session {}", agent_session_id.0));
         }
@@ -691,7 +702,13 @@ impl AgentRuntimeBridge {
             guard
                 .manager
                 .resume(agent_session_id)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    if let Some(agent_err) = error.downcast_ref::<AgentError>() {
+                        agent_err.to_string()
+                    } else {
+                        error.to_string()
+                    }
+                })?;
             return Self::local_detail_for_session(&guard, agent_session_id)
                 .ok_or_else(|| format!("unknown session {}", agent_session_id.0));
         }

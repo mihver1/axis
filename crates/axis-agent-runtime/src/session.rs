@@ -10,6 +10,7 @@ use axis_core::agent_history::{
     AgentTimelineEntry, AgentToolCall, AgentTurn,
 };
 
+use crate::error::AgentError;
 use crate::events::RuntimeEvent;
 use crate::provider::{
     validate_start_request, ProviderProfileMetadata, ProviderRegistry, RespondApprovalRequest,
@@ -120,12 +121,13 @@ impl SessionManager {
         let detail = self
             .sessions
             .get(session_id)
-            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id.0))?;
+            .ok_or_else(|| AgentError::SessionNotFound(session_id.0.clone()))?;
         if !detail.capabilities.turn_input {
-            anyhow::bail!(
-                "provider '{}' does not support turn_input",
-                detail.session.provider_profile_id
-            );
+            return Err(AgentError::UnsupportedOperation {
+                provider: detail.session.provider_profile_id.clone(),
+                operation: "turn_input".to_string(),
+            }
+            .into());
         }
         let provider = self.provider_for_session(session_id)?;
         let events = provider.send_turn(SendTurnRequest {
@@ -145,12 +147,13 @@ impl SessionManager {
         let detail = self
             .sessions
             .get(session_id)
-            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id.0))?;
+            .ok_or_else(|| AgentError::SessionNotFound(session_id.0.clone()))?;
         if !detail.capabilities.approvals {
-            anyhow::bail!(
-                "provider '{}' does not support approvals",
-                detail.session.provider_profile_id
-            );
+            return Err(AgentError::UnsupportedOperation {
+                provider: detail.session.provider_profile_id.clone(),
+                operation: "approvals".to_string(),
+            }
+            .into());
         }
         let provider = self.provider_for_session(session_id)?;
         let events = provider.respond_approval(RespondApprovalRequest {
@@ -166,12 +169,13 @@ impl SessionManager {
         let detail = self
             .sessions
             .get(session_id)
-            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id.0))?;
+            .ok_or_else(|| AgentError::SessionNotFound(session_id.0.clone()))?;
         if !detail.capabilities.resume {
-            anyhow::bail!(
-                "provider '{}' does not support resume",
-                detail.session.provider_profile_id
-            );
+            return Err(AgentError::UnsupportedOperation {
+                provider: detail.session.provider_profile_id.clone(),
+                operation: "resume".to_string(),
+            }
+            .into());
         }
         let provider = self.provider_for_session(session_id)?;
         let events = provider.resume(ResumeRequest {
@@ -208,11 +212,11 @@ impl SessionManager {
             return Ok(()); // noop — skip revision bump
         }
         if !is_valid_lifecycle_transition(current, lifecycle) {
-            return Err(anyhow!(
-                "invalid lifecycle transition {:?} → {:?}",
-                current,
-                lifecycle
-            ));
+            return Err(AgentError::InvalidTransition {
+                from: format!("{current:?}"),
+                to: format!("{lifecycle:?}"),
+            }
+            .into());
         }
         self.apply_events([RuntimeEvent::Lifecycle {
             session_id: session_id.clone(),

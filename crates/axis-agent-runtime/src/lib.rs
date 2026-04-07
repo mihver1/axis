@@ -2,6 +2,7 @@
 
 pub mod adapters;
 mod bin_resolver;
+pub mod error;
 pub mod cli_protocol;
 pub mod events;
 pub mod provider;
@@ -9,6 +10,7 @@ mod review_diff;
 pub mod session;
 pub mod worktree;
 
+pub use error::AgentError;
 pub use review_diff::ReviewPayloadLimits;
 
 pub use bin_resolver::{
