@@ -162,11 +162,28 @@ impl SessionManager {
     }
 
     /// Local lifecycle transition (e.g. UI or host-driven); bumps revision when the state changes.
+    ///
+    /// Returns `Ok` without bumping the revision if `lifecycle` equals the current state (noop).
+    /// Returns an error if the transition is not valid per the lifecycle state machine.
     pub fn transition_lifecycle(
         &mut self,
         session_id: &AgentSessionId,
         lifecycle: AgentLifecycle,
     ) -> anyhow::Result<()> {
+        let current = self
+            .session(session_id)
+            .with_context(|| format!("unknown session {}", session_id.0))?
+            .lifecycle;
+        if current == lifecycle {
+            return Ok(()); // noop — skip revision bump
+        }
+        if !is_valid_lifecycle_transition(current, lifecycle) {
+            return Err(anyhow!(
+                "invalid lifecycle transition {:?} → {:?}",
+                current,
+                lifecycle
+            ));
+        }
         self.apply_events([RuntimeEvent::Lifecycle {
             session_id: session_id.clone(),
             lifecycle,
@@ -197,6 +214,15 @@ impl SessionManager {
                         .get_mut(&session_id)
                         .with_context(|| format!("unknown session {}", session_id.0))?;
                     if detail.session.lifecycle == lifecycle {
+                        false
+                    } else if !is_valid_lifecycle_transition(detail.session.lifecycle, lifecycle) {
+                        // Provider events may be stale or out-of-order — warn and skip rather
+                        // than hard-erroring so one bad event does not abort the entire poll.
+                        eprintln!(
+                            "[axis-agent-runtime] WARN: skipping invalid lifecycle transition \
+                             {:?} → {:?} for session {}",
+                            detail.session.lifecycle, lifecycle, session_id.0
+                        );
                         false
                     } else {
                         detail.session.lifecycle = lifecycle;
@@ -409,6 +435,29 @@ fn recompute_pending_approval_id(detail: &mut AgentSessionDetail) {
         }
         _ => None,
     });
+}
+
+/// Returns true if transitioning from `current` to `next` is valid.
+fn is_valid_lifecycle_transition(current: AgentLifecycle, next: AgentLifecycle) -> bool {
+    if current == next {
+        return true; // noop
+    }
+    use AgentLifecycle::*;
+    matches!(
+        (current, next),
+        (Planned, Starting)
+            | (Starting, Running)
+            | (Starting, Failed)
+            | (Starting, Cancelled)
+            | (Running, Waiting)
+            | (Running, Completed)
+            | (Running, Failed)
+            | (Running, Cancelled)
+            | (Waiting, Running)
+            | (Waiting, Completed)
+            | (Waiting, Failed)
+            | (Waiting, Cancelled)
+    )
 }
 
 fn is_terminal_lifecycle(lifecycle: AgentLifecycle) -> bool {

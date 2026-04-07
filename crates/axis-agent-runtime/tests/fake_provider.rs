@@ -84,9 +84,10 @@ fn with_steps_drives_custom_lifecycle_event() {
     let mut reg = ProviderRegistry::new();
     reg.register(
         "fake",
-        Arc::new(FakeProvider::with_steps(vec![FakeScriptStep::Lifecycle(
-            AgentLifecycle::Failed,
-        )])),
+        Arc::new(FakeProvider::with_steps(vec![
+            FakeScriptStep::Lifecycle(AgentLifecycle::Starting),
+            FakeScriptStep::Lifecycle(AgentLifecycle::Failed),
+        ])),
     );
     let mut mgr = SessionManager::new(reg);
     let id = mgr
@@ -98,6 +99,12 @@ fn with_steps_drives_custom_lifecycle_event() {
             env: BTreeMap::new(),
         })
         .unwrap();
+
+    mgr.poll_provider(&id).unwrap();
+    assert_eq!(
+        mgr.session(&id).unwrap().lifecycle,
+        AgentLifecycle::Starting
+    );
 
     mgr.poll_provider(&id).unwrap();
     assert_eq!(mgr.session(&id).unwrap().lifecycle, AgentLifecycle::Failed);

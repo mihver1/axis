@@ -85,10 +85,16 @@ fn transition_lifecycle_and_attention_bump_revision_when_changed() {
             env: BTreeMap::new(),
         })
         .unwrap();
-    mgr.apply_events([RuntimeEvent::Lifecycle {
-        session_id: id.clone(),
-        lifecycle: AgentLifecycle::Running,
-    }])
+    mgr.apply_events([
+        RuntimeEvent::Lifecycle {
+            session_id: id.clone(),
+            lifecycle: AgentLifecycle::Starting,
+        },
+        RuntimeEvent::Lifecycle {
+            session_id: id.clone(),
+            lifecycle: AgentLifecycle::Running,
+        },
+    ])
     .unwrap();
     let mid = mgr.revision();
 
