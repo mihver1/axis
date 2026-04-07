@@ -1,6 +1,9 @@
 default:
     @just --list
 
+setup *FLAGS:
+    bash scripts/setup-worktree.sh {{FLAGS}}
+
 doctor:
     @bash scripts/bootstrap-macos.sh --doctor
 
