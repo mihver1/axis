@@ -210,6 +210,7 @@ struct AxisShell {
     next_workdesk_runtime_id: u64,
     agent_runtime: agent_sessions::AgentRuntimeBridge,
     last_agent_runtime_revision: u64,
+    daemon_connected: bool,
     workdesk_menu: Option<WorkdeskContextMenu>,
     stack_surface_menu: Option<StackSurfaceMenu>,
     // Popup UI and shortcuts land in follow-up tasks; state is wired here for Task 2.
@@ -3058,6 +3059,7 @@ impl AxisShell {
             next_workdesk_runtime_id: 1,
             agent_runtime,
             last_agent_runtime_revision: 0,
+            daemon_connected: false,
             workdesk_menu: None,
             stack_surface_menu: None,
             agent_provider_popup: None,
@@ -5600,6 +5602,14 @@ impl AxisShell {
                                     let _ = this.sync_review_summary_for_desk(desk_index);
                                 }
                             }
+                        }
+                        if tick % 50 == 0 {
+                            let was_connected = this.daemon_connected;
+                            let now_connected = this.agent_runtime.check_daemon_health();
+                            if !was_connected && now_connected {
+                                this.agent_runtime.resync_daemon_sessions();
+                            }
+                            this.daemon_connected = now_connected;
                         }
                         let agent_changed = this.sync_agent_runtime_activity(cx);
                         if agent_changed {
@@ -9331,6 +9341,7 @@ impl Render for AxisShell {
         };
         let show_inspector = cfg!(debug_assertions) && self.inspector_open;
         let inspector_toggle_label = self.shortcut_label(ShortcutAction::ToggleInspector);
+        let daemon_connected = self.daemon_connected;
         let sidebar_header_inset = if cfg!(target_os = "macos") {
             SIDEBAR_WINDOW_CONTROLS_INSET
         } else {
@@ -11831,7 +11842,9 @@ impl Render for AxisShell {
                                         cx.stop_propagation();
                                     }),
                                 ))
-                            }),
+                            })
+                            .child(dock_divider())
+                            .child(daemon_status_indicator(daemon_connected)),
                     ),
             )
             .when(show_inspector, |root| {
@@ -13845,6 +13858,31 @@ fn compact_toggle_button(
 
 fn dock_divider() -> impl IntoElement {
     div().w(px(1.0)).h(px(20.0)).bg(shell_border())
+}
+
+fn daemon_status_indicator(daemon_connected: bool) -> impl IntoElement {
+    let (dot_color, label) = if daemon_connected {
+        (rgb(0x77d19a), "daemon")
+    } else {
+        (rgb(0x697680), "local")
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .w(px(6.0))
+                .h(px(6.0))
+                .rounded_full()
+                .bg(dot_color),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x586470))
+                .child(label),
+        )
 }
 
 fn notification_item(

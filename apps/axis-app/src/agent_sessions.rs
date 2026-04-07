@@ -25,6 +25,17 @@ const CLAUDE_CODE_CAPABILITY_NOTE: &str = "basic lifecycle only";
 const CODEX_BIN_ENV: &str = "AXIS_CODEX_BIN";
 const CLAUDE_CODE_BIN_ENV: &str = "AXIS_CLAUDE_CODE_BIN";
 
+/// Current connectivity status with the axisd daemon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonStatus {
+    /// Daemon is reachable and responding.
+    Connected,
+    /// Daemon was configured but is not currently reachable.
+    Disconnected,
+    /// No daemon is configured (local-only mode).
+    LocalOnly,
+}
+
 /// UI-facing snapshot of a registered provider profile and whether its CLI appears launchable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderProfileOption {
@@ -226,6 +237,58 @@ impl AgentRuntimeBridge {
     pub fn revision(&self) -> u64 {
         let g = self.inner.lock();
         g.manager.revision().max(g.daemon_revision)
+    }
+
+    /// Check if the daemon is currently reachable by attempting a lightweight call.
+    /// Returns `true` if the daemon responds successfully.
+    pub fn check_daemon_health(&self) -> bool {
+        let guard = self.inner.lock();
+        guard.daemon.daemon_health().is_ok()
+    }
+
+    /// Return the current daemon connectivity status.
+    pub fn daemon_status(&self) -> DaemonStatus {
+        let guard = self.inner.lock();
+        // If daemon socket path doesn't exist, treat as LocalOnly.
+        if !guard.daemon.socket_path_exists() {
+            return DaemonStatus::LocalOnly;
+        }
+        if guard.daemon.daemon_health().is_ok() {
+            DaemonStatus::Connected
+        } else {
+            DaemonStatus::Disconnected
+        }
+    }
+
+    /// Re-fetch all daemon sessions. Call when daemon comes back after a disconnect.
+    /// Clears stale daemon records and refreshes from the live daemon.
+    pub fn resync_daemon_sessions(&self) {
+        let mut guard = self.inner.lock();
+        match guard.daemon.list_agents(None) {
+            Ok(sessions) => {
+                let daemon_ids: HashSet<AgentSessionId> =
+                    sessions.iter().map(|r| r.id.clone()).collect();
+                guard.daemon_records = sessions
+                    .into_iter()
+                    .map(|record| (record.id.clone(), record))
+                    .collect();
+                guard
+                    .daemon_details
+                    .retain(|session_id, _| daemon_ids.contains(session_id));
+                let local_ids = guard
+                    .manager
+                    .sessions()
+                    .map(|record| record.id.clone())
+                    .collect::<HashSet<_>>();
+                guard.surface_to_session.retain(|_, existing| {
+                    daemon_ids.contains(existing) || local_ids.contains(existing)
+                });
+                guard.daemon_revision = guard.daemon_revision.wrapping_add(1);
+            }
+            Err(_) => {
+                // Daemon still not available; leave existing cached state intact.
+            }
+        }
     }
 
     fn key(workdesk_runtime_id: u64, surface_id: SurfaceId) -> SurfaceRuntimeKey {
