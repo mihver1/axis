@@ -353,12 +353,7 @@ mod tests {
         let env_name = "AXIS_TEST_PROVIDER_COMMAND_NE";
         let _guard = EnvVarGuard::set(env_name, Some(bad_path.to_str().expect("utf8 path")));
 
-        let res = resolve_provider_command_from_path_and_dirs(
-            env_name,
-            "codex",
-            None,
-            &[],
-        );
+        let res = resolve_provider_command_from_path_and_dirs(env_name, "codex", None, &[]);
 
         assert!(!res.available);
         assert_eq!(res.argv, vec![bad_path.to_string_lossy().into_owned()]);

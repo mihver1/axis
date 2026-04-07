@@ -1,5 +1,7 @@
 #[path = "../src/agent_runtime.rs"]
 mod agent_runtime;
+#[path = "../../axis-app/src/review.rs"]
+mod app_review;
 #[path = "../src/gui_launcher.rs"]
 mod gui_launcher;
 #[path = "../src/persistence.rs"]
@@ -12,8 +14,6 @@ mod registry;
 mod request_handler;
 #[path = "../src/transcript_store.rs"]
 mod transcript_store;
-#[path = "../../axis-app/src/review.rs"]
-mod app_review;
 
 mod support;
 
@@ -58,10 +58,7 @@ fn workdesk_record_with_base_branch(
     record
 }
 
-fn desk_review_from_daemon(
-    socket_path: &Path,
-    worktree_id: &WorktreeId,
-) -> serde_json::Value {
+fn desk_review_from_daemon(socket_path: &Path, worktree_id: &WorktreeId) -> serde_json::Value {
     let response = send_request(
         socket_path,
         &AutomationRequest::DeskReviewSummary {
@@ -181,7 +178,9 @@ fn review_surface_parity_includes_hunks_for_textual_changes() {
         .find(|f| f.path == "a.txt")
         .expect("a.txt");
     assert!(
-        a.hunks.iter().any(|h| h.lines.iter().any(|l| !l.text.is_empty())),
+        a.hunks
+            .iter()
+            .any(|h| h.lines.iter().any(|l| !l.text.is_empty())),
         "expected non-empty hunk lines: {:?}",
         a.hunks
     );
@@ -449,11 +448,10 @@ fn review_surface_parity_deleted_file_has_removal_hunks() {
         .expect("gone.txt");
     assert_eq!(entry.change_kind, ReviewFileChangeKind::Deleted);
     assert!(
-        entry.hunks.iter().any(|h| {
-            h.lines
-                .iter()
-                .any(|l| l.kind == ReviewLineKind::Removal)
-        }),
+        entry
+            .hunks
+            .iter()
+            .any(|h| { h.lines.iter().any(|l| l.kind == ReviewLineKind::Removal) }),
         "expected removal lines: {:?}",
         entry.hunks
     );

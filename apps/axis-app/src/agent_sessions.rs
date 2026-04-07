@@ -9,8 +9,9 @@ use std::sync::Mutex;
 use axis_agent_runtime::adapters::codex::CodexProvider;
 use axis_agent_runtime::adapters::process_only::ProcessOnlyProvider;
 use axis_agent_runtime::{
-    resolve_provider_command_from_env_or_default, resolve_provider_command_from_env_or_default_for_cwd,
-    ProviderProfileMetadata, ProviderRegistry, SessionManager, StartAgentRequest,
+    resolve_provider_command_from_env_or_default,
+    resolve_provider_command_from_env_or_default_for_cwd, ProviderProfileMetadata,
+    ProviderRegistry, SessionManager, StartAgentRequest,
 };
 use axis_core::agent::{AgentAttention, AgentSessionId, AgentSessionRecord, AgentTransportKind};
 use axis_core::agent_history::{AgentApprovalRequestId, AgentSessionDetail, AgentTimelineEntry};
@@ -393,9 +394,9 @@ impl AgentRuntimeBridge {
             });
         inferred_attention.or_else(|| {
             guard
-            .daemon_records
-            .get(sid)
-            .map(|record| record.attention)
+                .daemon_records
+                .get(sid)
+                .map(|record| record.attention)
                 .or_else(|| guard.manager.session(sid).map(|r| r.attention))
         })
     }
@@ -701,7 +702,9 @@ fn timeline_entry_sequence(entry: &AgentTimelineEntry) -> u64 {
 mod tests {
     use super::*;
     use axis_agent_runtime::adapters::fake::FakeProvider;
-    use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionRecord, AgentTransportKind};
+    use axis_core::agent::{
+        AgentAttention, AgentLifecycle, AgentSessionRecord, AgentTransportKind,
+    };
     use axis_core::agent_history::{AgentApprovalRequestId, AgentSessionDetail};
     use std::ffi::OsString;
     #[cfg(unix)]
@@ -717,10 +720,7 @@ mod tests {
             Arc::new(FakeProvider::with_standard_script()),
             Some("alpha note"),
         );
-        registry.register(
-            "beta",
-            Arc::new(FakeProvider::with_standard_script()),
-        );
+        registry.register("beta", Arc::new(FakeProvider::with_standard_script()));
 
         let bridge = AgentRuntimeBridge::with_registry("alpha", registry);
 
@@ -746,14 +746,8 @@ mod tests {
     #[test]
     fn provider_options_keep_unavailable_profiles_visible() {
         let mut registry = ProviderRegistry::new();
-        registry.register(
-            "p1",
-            Arc::new(FakeProvider::with_standard_script()),
-        );
-        registry.register(
-            "p2",
-            Arc::new(FakeProvider::with_standard_script()),
-        );
+        registry.register("p1", Arc::new(FakeProvider::with_standard_script()));
+        registry.register("p2", Arc::new(FakeProvider::with_standard_script()));
         let provider_options = vec![
             ProviderProfileOption {
                 profile_id: "p1".to_string(),
@@ -837,9 +831,10 @@ mod tests {
             truncated: false,
         };
         let mut guard = bridge.inner.lock().expect("bridge should lock");
-        guard
-            .surface_to_session
-            .insert(AgentRuntimeBridge::key(runtime_id, surface_id), session_id.clone());
+        guard.surface_to_session.insert(
+            AgentRuntimeBridge::key(runtime_id, surface_id),
+            session_id.clone(),
+        );
         guard.daemon_records.insert(session_id.clone(), record);
         guard.daemon_details.insert(session_id, detail);
         drop(guard);

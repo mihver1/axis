@@ -1,7 +1,9 @@
 //! Desk review summary projection, payload resolution, and local review state (selection + hunk markers).
 
 use axis_agent_runtime::{ReviewPayloadLimits, WorktreeService};
-use axis_core::review::{DeskReviewPayload, ReviewFileDiff, ReviewHunk, ReviewLine, ReviewLineKind};
+use axis_core::review::{
+    DeskReviewPayload, ReviewFileDiff, ReviewHunk, ReviewLine, ReviewLineKind,
+};
 use axis_core::workdesk::WorkdeskId;
 use axis_core::worktree::{ReviewSummary, WorktreeBinding, WorktreeId};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -93,7 +95,10 @@ pub(crate) fn resolve_local_desk_review_payload(
                 .unwrap_or_default();
             let uncommitted = WorktreeService::uncommitted_changed_files(&binding.root_path)
                 .map_err(|error| error.to_string())?;
-            Ok((merge_changed_files(&base_changed, &uncommitted), uncommitted.len()))
+            Ok((
+                merge_changed_files(&base_changed, &uncommitted),
+                uncommitted.len(),
+            ))
         },
         unix_time_ms(),
     )
@@ -281,7 +286,10 @@ impl ReviewPanelState {
     }
 
     pub(crate) fn selected_file_path(&self) -> Option<&str> {
-        self.payload.files.get(self.selected_file).map(|f| f.path.as_str())
+        self.payload
+            .files
+            .get(self.selected_file)
+            .map(|f| f.path.as_str())
     }
 
     pub(crate) fn selected_hunk_header(&self) -> Option<&str> {
@@ -311,7 +319,11 @@ pub(crate) fn file_review_aggregate(
     let mut all_reviewed = true;
     for hunk in &file.hunks {
         let key = ReviewHunkKey::from_hunk(workdesk_id, &file.path, hunk);
-        match hunk_states.get(&key).copied().unwrap_or(HunkReviewState::Todo) {
+        match hunk_states
+            .get(&key)
+            .copied()
+            .unwrap_or(HunkReviewState::Todo)
+        {
             HunkReviewState::Todo => all_reviewed = false,
             HunkReviewState::FollowUp => {
                 has_follow_up = true;
@@ -431,11 +443,15 @@ fn find_file_index_by_path(payload: &DeskReviewPayload, path: &str) -> Option<us
     payload.files.iter().position(|f| f.path == path)
 }
 
-fn find_hunk_index_by_key(payload: &DeskReviewPayload, file_index: usize, key: &ReviewHunkKey) -> Option<usize> {
+fn find_hunk_index_by_key(
+    payload: &DeskReviewPayload,
+    file_index: usize,
+    key: &ReviewHunkKey,
+) -> Option<usize> {
     let file = payload.files.get(file_index)?;
-    file.hunks.iter().position(|h| {
-        ReviewHunkKey::from_hunk(&key.workdesk_id, &file.path, h) == *key
-    })
+    file.hunks
+        .iter()
+        .position(|h| ReviewHunkKey::from_hunk(&key.workdesk_id, &file.path, h) == *key)
 }
 
 pub(crate) fn reusable_review_payload_cache<'a>(
@@ -455,7 +471,8 @@ pub(crate) fn review_payload_worktree_rebound(
     binding: &WorktreeBinding,
 ) -> bool {
     cached_payload.is_some_and(|cached| {
-        normalized_worktree_root(&cached.worktree_id.0) != normalized_worktree_root(&binding.root_path)
+        normalized_worktree_root(&cached.worktree_id.0)
+            != normalized_worktree_root(&binding.root_path)
     })
 }
 
@@ -572,12 +589,18 @@ pub(crate) fn refresh_review_panel_state(
         selected_file,
         selected_hunk,
         hunk_states,
-        stale_notice: stale_notice_for_refresh(previous.stale_notice.as_deref(), ctx.stale_rich_payload),
+        stale_notice: stale_notice_for_refresh(
+            previous.stale_notice.as_deref(),
+            ctx.stale_rich_payload,
+        ),
         setup_notice: ctx.setup_notice.clone(),
     }
 }
 
-fn valid_hunk_keys(workdesk_id: &WorkdeskId, payload: &DeskReviewPayload) -> HashSet<ReviewHunkKey> {
+fn valid_hunk_keys(
+    workdesk_id: &WorkdeskId,
+    payload: &DeskReviewPayload,
+) -> HashSet<ReviewHunkKey> {
     let mut keys = HashSet::new();
     for file in &payload.files {
         for hunk in &file.hunks {
@@ -589,14 +612,9 @@ fn valid_hunk_keys(workdesk_id: &WorkdeskId, payload: &DeskReviewPayload) -> Has
 
 fn stale_notice_for_refresh(previous: Option<&str>, stale_rich_payload: bool) -> Option<String> {
     if stale_rich_payload {
-        Some(
-            previous
-                .map(String::from)
-                .unwrap_or_else(|| {
-                    "Diff details may be out of date; file list reflects the latest summary."
-                        .to_string()
-                }),
-        )
+        Some(previous.map(String::from).unwrap_or_else(|| {
+            "Diff details may be out of date; file list reflects the latest summary.".to_string()
+        }))
     } else {
         None
     }
@@ -643,7 +661,10 @@ pub(crate) struct ReviewPanelLocalState {
 
 impl ReviewPanelLocalState {
     pub(crate) fn selected_file_path<'a>(&self, payload: &'a DeskReviewPayload) -> Option<&'a str> {
-        payload.files.get(self.selected_file).map(|f| f.path.as_str())
+        payload
+            .files
+            .get(self.selected_file)
+            .map(|f| f.path.as_str())
     }
 
     pub(crate) fn refresh_from_payload(
@@ -775,7 +796,10 @@ mod tests {
             !resolved.payload.summary.ready_for_review,
             "synthetic payload with no files must not report ready_for_review"
         );
-        assert_eq!(resolved.summary.changed_files, vec!["src/lib.rs".to_string()]);
+        assert_eq!(
+            resolved.summary.changed_files,
+            vec!["src/lib.rs".to_string()]
+        );
         assert!(
             resolved.summary.ready_for_review,
             "desk card should still reflect the successful compact refresh"
@@ -812,8 +836,10 @@ mod tests {
     #[test]
     fn truncated_payload_summary_view_uses_visible_file_list() {
         let payload = payload(&["src/a.rs", "src/b.rs"], true);
-        let summary =
-            build_desk_review_summary_view_from_payload(&binding("feature/truncated", false), &payload);
+        let summary = build_desk_review_summary_view_from_payload(
+            &binding("feature/truncated", false),
+            &payload,
+        );
 
         assert_eq!(
             summary.changed_files,
@@ -840,7 +866,10 @@ mod tests {
 
         assert!(resolved.stale);
         assert_eq!(resolved.payload.files, cached.files);
-        assert_eq!(resolved.payload.summary.files_changed, resolved.payload.files.len() as u32);
+        assert_eq!(
+            resolved.payload.summary.files_changed,
+            resolved.payload.files.len() as u32
+        );
         assert_eq!(resolved.payload.summary.files_changed, 1);
         assert_eq!(resolved.payload.summary.uncommitted_files, 0);
         assert!(resolved.summary.changed_files.is_empty());
@@ -883,7 +912,10 @@ mod tests {
         assert_eq!(resolved.payload.summary.files_changed, 1);
         assert_eq!(resolved.payload.summary.uncommitted_files, 1);
         assert!(!resolved.payload.summary.ready_for_review);
-        assert_eq!(resolved.summary.changed_files, vec!["src/new.rs".to_string()]);
+        assert_eq!(
+            resolved.summary.changed_files,
+            vec!["src/new.rs".to_string()]
+        );
         assert!(resolved.summary.ready_for_review);
     }
 
@@ -891,7 +923,13 @@ mod tests {
         WorkdeskId::new("desk-test")
     }
 
-    fn sample_hunk(header: &str, old_start: u32, old_lines: u32, new_start: u32, new_lines: u32) -> ReviewHunk {
+    fn sample_hunk(
+        header: &str,
+        old_start: u32,
+        old_lines: u32,
+        new_start: u32,
+        new_lines: u32,
+    ) -> ReviewHunk {
         ReviewHunk {
             header: header.to_string(),
             old_start,
@@ -938,7 +976,10 @@ mod tests {
     #[test]
     fn review_state_preserves_selected_hunk_when_refresh_keeps_same_identity() {
         let wid = desk_id();
-        let previous = ReviewPanelState::for_payload(wid.clone(), sample_payload("src/lib.rs", "@@ -4,2 +4,2 @@"));
+        let previous = ReviewPanelState::for_payload(
+            wid.clone(),
+            sample_payload("src/lib.rs", "@@ -4,2 +4,2 @@"),
+        );
         let refreshed = refresh_review_panel_state(
             Some(&previous),
             sample_payload("src/lib.rs", "@@ -4,2 +4,2 @@"),
@@ -952,7 +993,10 @@ mod tests {
     #[test]
     fn review_state_falls_back_to_first_hunk_when_ranges_change() {
         let wid = desk_id();
-        let previous = ReviewPanelState::for_payload(wid.clone(), sample_payload("src/lib.rs", "@@ -4,2 +4,2 @@"));
+        let previous = ReviewPanelState::for_payload(
+            wid.clone(),
+            sample_payload("src/lib.rs", "@@ -4,2 +4,2 @@"),
+        );
         let refreshed = refresh_review_panel_state(
             Some(&previous),
             sample_payload("src/lib.rs", "@@ -10,3 +10,4 @@"),
@@ -988,7 +1032,10 @@ mod tests {
     #[test]
     fn review_state_applies_and_clears_local_hunk_state() {
         let wid = desk_id();
-        let mut panel = ReviewPanelState::for_payload(wid.clone(), sample_payload("src/lib.rs", "@@ -4,2 +4,2 @@"));
+        let mut panel = ReviewPanelState::for_payload(
+            wid.clone(),
+            sample_payload("src/lib.rs", "@@ -4,2 +4,2 @@"),
+        );
         let key = ReviewHunkKey::from_hunk(&wid, "src/lib.rs", &panel.payload.files[0].hunks[0]);
         panel.set_hunk_state(key.clone(), HunkReviewState::Reviewed);
         assert_eq!(
@@ -1005,7 +1052,10 @@ mod tests {
     #[test]
     fn review_state_preserves_stale_notice_text_across_refresh() {
         let wid = desk_id();
-        let previous = ReviewPanelState::for_payload(wid.clone(), sample_payload("src/lib.rs", "@@ -4,2 +4,2 @@"));
+        let previous = ReviewPanelState::for_payload(
+            wid.clone(),
+            sample_payload("src/lib.rs", "@@ -4,2 +4,2 @@"),
+        );
         let mut previous = previous;
         previous.stale_notice = Some("custom stale".to_string());
         let refreshed = refresh_review_panel_state(
@@ -1026,7 +1076,10 @@ mod tests {
     #[test]
     fn review_state_resets_hunk_markers_on_worktree_rebind() {
         let wid = desk_id();
-        let mut previous = ReviewPanelState::for_payload(wid.clone(), sample_payload("src/lib.rs", "@@ -4,2 +4,2 @@"));
+        let mut previous = ReviewPanelState::for_payload(
+            wid.clone(),
+            sample_payload("src/lib.rs", "@@ -4,2 +4,2 @@"),
+        );
         let key = ReviewHunkKey::from_hunk(&wid, "src/lib.rs", &previous.payload.files[0].hunks[0]);
         previous.set_hunk_state(key, HunkReviewState::FollowUp);
         let refreshed = refresh_review_panel_state(
@@ -1102,7 +1155,10 @@ mod tests {
             lines: vec![ReviewLine::context(Some(4), Some(4), true, "context")],
         };
 
-        assert_eq!(editor_jump_line_for_review_row(&hunk, &hunk.lines[0]), Some(4));
+        assert_eq!(
+            editor_jump_line_for_review_row(&hunk, &hunk.lines[0]),
+            Some(4)
+        );
     }
 
     #[test]
@@ -1139,8 +1195,7 @@ mod tests {
             stale_notice: Some("stale".to_string()),
             setup_notice: None,
         };
-        let key =
-            ReviewHunkKey::from_hunk(&wid, "src/lib.rs", &previous_payload.files[0].hunks[0]);
+        let key = ReviewHunkKey::from_hunk(&wid, "src/lib.rs", &previous_payload.files[0].hunks[0]);
         local.hunk_states.insert(key, HunkReviewState::Reviewed);
 
         let next_payload = sample_payload("src/other.rs", "@@ -8,1 +8,1 @@");
@@ -1154,7 +1209,10 @@ mod tests {
 
         assert_eq!(merged_payload, next_payload);
         assert!(merged_local.hunk_states.is_empty());
-        assert_eq!(merged_local.selected_file_path(&merged_payload), Some("src/other.rs"));
+        assert_eq!(
+            merged_local.selected_file_path(&merged_payload),
+            Some("src/other.rs")
+        );
         assert_eq!(merged_local.selected_hunk, Some(0));
         assert!(merged_local.stale_notice.is_none());
     }

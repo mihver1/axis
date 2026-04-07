@@ -75,12 +75,7 @@ impl WorktreeService {
         working_tree_dirty: bool,
         limits: ReviewPayloadLimits,
     ) -> anyhow::Result<DeskReviewPayload> {
-        build_desk_review_payload(
-            root.as_ref(),
-            base_branch,
-            working_tree_dirty,
-            limits,
-        )
+        build_desk_review_payload(root.as_ref(), base_branch, working_tree_dirty, limits)
     }
 
     fn inspect(root: &Path, base_branch: Option<String>) -> anyhow::Result<WorktreeBinding> {

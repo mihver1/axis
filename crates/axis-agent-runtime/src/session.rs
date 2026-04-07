@@ -371,9 +371,10 @@ fn upsert_tool_call(detail: &mut AgentSessionDetail, tool_call: AgentToolCall) -
     }
     let sequence = detail.history_cursor;
     detail.history_cursor = detail.history_cursor.wrapping_add(1);
-    detail
-        .timeline
-        .push(AgentTimelineEntry::ToolCall { sequence, tool_call });
+    detail.timeline.push(AgentTimelineEntry::ToolCall {
+        sequence,
+        tool_call,
+    });
     true
 }
 

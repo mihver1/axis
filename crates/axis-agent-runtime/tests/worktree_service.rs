@@ -194,8 +194,8 @@ fn uncommitted_rename_uses_post_rename_path_consistently() {
     run_git(repo, &["commit", "-m", "add rename target"]);
 
     let wt_dir = tmp.path().join("wt-rename");
-    let binding = WorktreeService::create_worktree(repo, &wt_dir, "feature/rename-wt", "main")
-        .unwrap();
+    let binding =
+        WorktreeService::create_worktree(repo, &wt_dir, "feature/rename-wt", "main").unwrap();
 
     run_git(&wt_dir, &["mv", "rename_me.txt", "renamed.txt"]);
 

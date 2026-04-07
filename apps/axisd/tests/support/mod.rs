@@ -104,7 +104,10 @@ pub fn poll_until_attention(
         let sessions: Vec<AgentSessionRecord> =
             serde_json::from_value(response.result.expect("sessions payload should exist"))
                 .expect("sessions should decode");
-        if let Some(record) = sessions.into_iter().find(|record| record.attention == expected) {
+        if let Some(record) = sessions
+            .into_iter()
+            .find(|record| record.attention == expected)
+        {
             return record;
         }
     }

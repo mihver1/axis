@@ -149,7 +149,10 @@ fn codex_adapter_send_turn_writes_shared_cli_command_and_parses_structured_statu
     poll_until(&mut mgr, &id, |s| s.status_message == "turn received");
 
     let line = fs::read_to_string(&capture_path).unwrap();
-    assert!(line.contains(r#""kind":"send_turn""#), "unexpected command: {line}");
+    assert!(
+        line.contains(r#""kind":"send_turn""#),
+        "unexpected command: {line}"
+    );
     assert!(
         line.contains(r#""text":"Continue with the summary.""#),
         "unexpected command: {line}"

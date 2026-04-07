@@ -1,10 +1,10 @@
 //! Desk review payload construction from real git repos.
 
+use axis_agent_runtime::{ReviewPayloadLimits, WorktreeService};
+use axis_core::review::{ReviewFileChangeKind, ReviewLineKind};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use axis_agent_runtime::{ReviewPayloadLimits, WorktreeService};
-use axis_core::review::{ReviewFileChangeKind, ReviewLineKind};
 use tempfile::TempDir;
 
 fn run_git(repo: &Path, args: &[&str]) {
@@ -123,14 +123,24 @@ fn review_payload_normalizes_spaced_paths_without_duplicates() {
         .map(|file| file.path.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(payload.files.len(), 2, "expected exactly two entries: {paths:?}");
     assert_eq!(
-        paths.iter().filter(|path| **path == "space name.txt").count(),
+        payload.files.len(),
+        2,
+        "expected exactly two entries: {paths:?}"
+    );
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| **path == "space name.txt")
+            .count(),
         1,
         "expected one normalized spaced path entry: {paths:?}"
     );
     assert_eq!(
-        paths.iter().filter(|path| **path == "odd b/file.txt").count(),
+        paths
+            .iter()
+            .filter(|path| **path == "odd b/file.txt")
+            .count(),
         1,
         "expected one normalized odd b path entry: {paths:?}"
     );
@@ -204,8 +214,7 @@ fn review_payload_parses_no_newline_metadata_line() {
 
     let has_no_newline = entry.hunks.iter().any(|h| {
         h.lines.iter().any(|line| {
-            line.kind == ReviewLineKind::Metadata
-                && line.text.contains("No newline at end of file")
+            line.kind == ReviewLineKind::Metadata && line.text.contains("No newline at end of file")
         })
     });
     assert!(
@@ -281,7 +290,10 @@ fn deleted_file_keeps_identity_with_removal_hunks() {
         .expect("gone.txt");
     assert_eq!(entry.change_kind, ReviewFileChangeKind::Deleted);
     assert!(
-        entry.hunks.iter().any(|h| h.lines.iter().any(|l| l.kind == ReviewLineKind::Removal)),
+        entry
+            .hunks
+            .iter()
+            .any(|h| h.lines.iter().any(|l| l.kind == ReviewLineKind::Removal)),
         "expected removal lines"
     );
 }
@@ -427,13 +439,9 @@ fn truncation_sets_flags_when_hunk_line_cap_is_tight() {
         max_hunks_per_file: 64,
         max_lines_per_hunk: 8,
     };
-    let payload = WorktreeService::review_payload(
-        repo,
-        Some("main"),
-        working_tree_dirty(repo),
-        tight,
-    )
-    .unwrap();
+    let payload =
+        WorktreeService::review_payload(repo, Some("main"), working_tree_dirty(repo), tight)
+            .unwrap();
     assert!(payload.truncated, "payload should be marked truncated");
     let entry = payload.files.iter().find(|f| f.path == "big.txt").unwrap();
     assert!(
@@ -550,13 +558,9 @@ fn summary_uncommitted_count_matches_visible_files_when_payload_truncated_by_fil
         max_hunks_per_file: 64,
         max_lines_per_hunk: 4096,
     };
-    let payload = WorktreeService::review_payload(
-        repo,
-        Some("main"),
-        working_tree_dirty(repo),
-        tight,
-    )
-    .unwrap();
+    let payload =
+        WorktreeService::review_payload(repo, Some("main"), working_tree_dirty(repo), tight)
+            .unwrap();
 
     assert!(payload.truncated, "expected file-cap truncation");
     assert_eq!(
@@ -616,24 +620,40 @@ fn two_file_committed_diff_maps_each_path_to_its_own_hunks() {
     )
     .unwrap();
 
-    let aaa = payload.files.iter().find(|f| f.path == "aaa.txt").expect("aaa.txt");
-    let zzz = payload.files.iter().find(|f| f.path == "zzz.txt").expect("zzz.txt");
+    let aaa = payload
+        .files
+        .iter()
+        .find(|f| f.path == "aaa.txt")
+        .expect("aaa.txt");
+    let zzz = payload
+        .files
+        .iter()
+        .find(|f| f.path == "zzz.txt")
+        .expect("zzz.txt");
     assert!(
-        aaa.hunks.iter().any(|h| h.lines.iter().any(|l| l.text.contains("aaa"))),
+        aaa.hunks
+            .iter()
+            .any(|h| h.lines.iter().any(|l| l.text.contains("aaa"))),
         "aaa entry should carry aaa hunk text, got {:?}",
         aaa.hunks
     );
     assert!(
-        zzz.hunks.iter().any(|h| h.lines.iter().any(|l| l.text.contains("zzz"))),
+        zzz.hunks
+            .iter()
+            .any(|h| h.lines.iter().any(|l| l.text.contains("zzz"))),
         "zzz entry should carry zzz hunk text, got {:?}",
         zzz.hunks
     );
     assert!(
-        !aaa.hunks.iter().any(|h| h.lines.iter().any(|l| l.text.contains("zzz"))),
+        !aaa.hunks
+            .iter()
+            .any(|h| h.lines.iter().any(|l| l.text.contains("zzz"))),
         "aaa entry must not receive zzz diff lines"
     );
     assert!(
-        !zzz.hunks.iter().any(|h| h.lines.iter().any(|l| l.text.contains("aaa"))),
+        !zzz.hunks
+            .iter()
+            .any(|h| h.lines.iter().any(|l| l.text.contains("aaa"))),
         "zzz entry must not receive aaa diff lines"
     );
 }
@@ -683,7 +703,9 @@ fn existing_non_commit_base_ref_does_not_silently_fall_back_to_head() {
         .output()
         .unwrap();
     assert!(tree_hash.status.success(), "expected tree hash");
-    let tree_hash = String::from_utf8_lossy(&tree_hash.stdout).trim().to_string();
+    let tree_hash = String::from_utf8_lossy(&tree_hash.stdout)
+        .trim()
+        .to_string();
     run_git(repo, &["update-ref", "refs/tags/tree-base", &tree_hash]);
 
     let err = WorktreeService::review_payload(

@@ -133,13 +133,19 @@ fn apply_events_upserts_structured_timeline_and_pending_approval() {
     .unwrap();
 
     let detail = mgr.session_detail(&id).unwrap();
-    assert_eq!(detail.history_cursor, 3, "updating an existing entry should not append");
+    assert_eq!(
+        detail.history_cursor, 3,
+        "updating an existing entry should not append"
+    );
     assert_eq!(detail.pending_approval_id, None);
     match &detail.timeline[2] {
         AgentTimelineEntry::ApprovalRequest { sequence, approval } => {
             assert_eq!(*sequence, 2);
             assert_eq!(approval.state, AgentApprovalState::Approved);
-            assert_eq!(approval.decision.as_ref().unwrap().note.as_deref(), Some("Proceed."));
+            assert_eq!(
+                approval.decision.as_ref().unwrap().note.as_deref(),
+                Some("Proceed.")
+            );
         }
         entry => panic!("expected approval entry, got {entry:?}"),
     }
