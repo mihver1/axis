@@ -54,6 +54,7 @@ fn codex_adapter_successful_launch_reaches_running() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -76,6 +77,7 @@ fn codex_adapter_needs_review_sets_waiting_and_attention() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -96,6 +98,7 @@ fn codex_adapter_unexpected_exit_emits_failed() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -114,6 +117,7 @@ fn codex_adapter_stop_kills_child_and_drops_session() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -139,6 +143,7 @@ fn codex_adapter_send_turn_writes_shared_cli_command_and_parses_structured_statu
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -177,6 +182,7 @@ fn codex_adapter_smoke_real_binary() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec!["--help".into()],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
     poll_until(&mut mgr, &id, |s| s.lifecycle != AgentLifecycle::Planned);

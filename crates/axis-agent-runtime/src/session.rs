@@ -72,7 +72,7 @@ impl SessionManager {
             id: id.clone(),
             provider_profile_id: req.provider_profile_id.clone(),
             transport: req.transport,
-            workdesk_id: None,
+            workdesk_id: req.workdesk_id.clone(),
             surface_id: None,
             cwd: req.cwd,
             lifecycle: AgentLifecycle::Planned,
@@ -530,6 +530,7 @@ mod tests {
                 transport: AgentTransportKind::CliWrapped,
                 argv_suffix: vec![],
                 env: BTreeMap::new(),
+                workdesk_id: None,
             })
             .unwrap();
         let after_start = mgr.revision();

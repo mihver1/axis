@@ -21,6 +21,7 @@ fn fake_emits_starting_running_needs_review_completed_sequence() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -67,6 +68,7 @@ fn stop_session_teardown_prevents_further_polls_on_fake() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -97,6 +99,7 @@ fn with_steps_drives_custom_lifecycle_event() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 

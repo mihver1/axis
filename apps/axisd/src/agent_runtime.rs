@@ -127,6 +127,7 @@ impl DaemonAgentRuntime {
                 transport: AgentTransportKind::CliWrapped,
                 argv_suffix,
                 env: Default::default(),
+                workdesk_id: workdesk_id.map(|id| id.0),
             })
             .map_err(|error| error.to_string())?;
 

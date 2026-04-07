@@ -26,6 +26,7 @@ fn make_manager() -> (SessionManager, axis_core::agent::AgentSessionId) {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
     (mgr, id)

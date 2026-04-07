@@ -23,6 +23,7 @@ fn start_session_registers_planned_session_and_bumps_revision() {
             transport: AgentTransportKind::NativeAcp,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -44,6 +45,7 @@ fn apply_events_update_lifecycle_attention_and_status() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
     let after_start = mgr.revision();
@@ -83,6 +85,7 @@ fn transition_lifecycle_and_attention_bump_revision_when_changed() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
     mgr.apply_events([
@@ -138,6 +141,7 @@ fn stop_session_calls_provider_and_drops_local_record() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
     let rev_before = mgr.revision();

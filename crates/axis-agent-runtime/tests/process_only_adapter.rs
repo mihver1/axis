@@ -50,6 +50,7 @@ fn process_only_adapter_successful_launch_reaches_running() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -70,6 +71,7 @@ fn process_only_adapter_successful_exit_sets_completed_and_last_status() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -88,6 +90,7 @@ fn process_only_adapter_stop_kills_child_and_drops_session() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -109,6 +112,7 @@ fn process_only_adapter_structured_approval_event_populates_detail() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 

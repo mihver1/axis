@@ -51,6 +51,7 @@ fn new_manager_with_nocap() -> (SessionManager, AgentSessionId) {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
     (mgr, id)

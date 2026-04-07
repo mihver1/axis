@@ -299,6 +299,7 @@ impl AgentRuntimeBridge {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix,
             env: Default::default(),
+            workdesk_id: Some(workdesk_runtime_id.to_string()),
         };
         let id = guard
             .manager
@@ -389,7 +390,6 @@ impl AgentRuntimeBridge {
             return Some(record.clone());
         }
         let mut record = guard.manager.session(sid)?.clone();
-        record.workdesk_id = Some(key.workdesk_runtime_id.to_string());
         record.surface_id = Some(key.surface_id);
         Some(record)
     }
@@ -727,7 +727,6 @@ impl AgentRuntimeBridge {
             .iter()
             .find(|(_, existing)| *existing == agent_session_id)
         {
-            detail.session.workdesk_id = Some(key.workdesk_runtime_id.to_string());
             detail.session.surface_id = Some(key.surface_id);
         }
         Some(detail)
