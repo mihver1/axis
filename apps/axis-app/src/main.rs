@@ -22,11 +22,12 @@ use axis_core::{
 };
 use review::{
     build_desk_review_summary_view, build_desk_review_summary_view_from_payload,
-    editor_jump_line_for_review_row, merge_review_local_after_fetch,
-    refreshed_desk_review_summary_view, resolve_local_desk_review_payload,
-    reusable_review_payload_cache, review_changed_file_preview, review_editor_open_failed_notice,
-    review_file_hunkless_notice, review_payload_worktree_rebound, review_status_label,
-    review_workspace_setup_notice, DeskReviewSummaryView, ReviewPanelLocalState,
+    editor_jump_line_for_review_row, file_review_aggregate, file_status_color,
+    merge_review_local_after_fetch, refreshed_desk_review_summary_view,
+    resolve_local_desk_review_payload, review_changed_file_preview,
+    review_editor_open_failed_notice, review_file_hunkless_notice,
+    review_payload_worktree_rebound, review_status_label, review_workspace_setup_notice,
+    reusable_review_payload_cache, DeskReviewSummaryView, ReviewPanelLocalState,
     ReviewPanelRefreshContext,
 };
 
@@ -5588,6 +5589,18 @@ impl AxisShell {
                         if tick % 30 == 0 {
                             this.agent_runtime.prune_expired_sessions(std::time::Duration::from_secs(30));
                         }
+                        if tick % 25 == 0 {
+                            for desk_index in 0..this.workdesks.len() {
+                                let stale = this
+                                    .workdesks
+                                    .get(desk_index)
+                                    .map(|desk| desk.review_local_state.stale_notice.is_some())
+                                    .unwrap_or(false);
+                                if stale {
+                                    let _ = this.sync_review_summary_for_desk(desk_index);
+                                }
+                            }
+                        }
                         let agent_changed = this.sync_agent_runtime_activity(cx);
                         if agent_changed {
                             cx.notify();
@@ -10210,11 +10223,12 @@ impl Render for AxisShell {
         let review_panel_overlay = self.review_panel.and_then(|desk_index| {
             self.workdesks.get(desk_index).map(|desk| {
                 let desk_name = desk.name.clone();
+                let workdesk_id = WorkdeskId::new(desk.workdesk_id.clone());
                 let payload = desk.review_payload_cache.clone();
                 let local = desk.review_local_state.clone();
-                (desk_index, desk_name, payload, local)
+                (desk_index, desk_name, workdesk_id, payload, local)
             })
-        }).map(|(desk_index, desk_name, payload, local)| {
+        }).map(|(desk_index, desk_name, workdesk_id, payload, local)| {
             let panel_width = SESSION_INSPECTOR_WIDTH
                 .min((viewport_width - SHORTCUT_PANEL_MARGIN * 2.0).max(320.0));
             let file_list_width = 148.0_f32;
@@ -10295,6 +10309,12 @@ impl Render for AxisShell {
                             } else {
                                 shell_border()
                             };
+                            let aggregate = file_review_aggregate(
+                                &workdesk_id,
+                                file,
+                                &local.hunk_states,
+                            );
+                            let dot_color = rgb(file_status_color(aggregate));
                             div()
                                 .px_2()
                                 .py_1()
@@ -10319,15 +10339,30 @@ impl Render for AxisShell {
                                 )
                                 .child(
                                     div()
-                                        .text_xs()
-                                        .text_color(if active {
-                                            shell_text_primary()
-                                        } else {
-                                            shell_text_secondary()
-                                        })
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .child(path_label),
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .w(px(6.0))
+                                                .h(px(6.0))
+                                                .rounded_full()
+                                                .bg(dot_color)
+                                                .flex_shrink_0(),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(if active {
+                                                    rgb(0xdce2e8)
+                                                } else {
+                                                    rgb(0x9aa6af)
+                                                })
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .child(path_label),
+                                        ),
                                 )
                                 .into_any_element()
                         })
@@ -10388,11 +10423,14 @@ impl Render for AxisShell {
                                         .enumerate()
                                         .map(|(hi, h)| {
                                             let active = hi == hunk_index;
-                                            let label = if h.header.len() > 28 {
+                                            let header_label = if h.header.len() > 28 {
                                                 format!("{}…", &h.header[..28])
                                             } else {
                                                 h.header.clone()
                                             };
+                                            let additions = h.lines.iter().filter(|l| l.kind == ReviewLineKind::Addition).count();
+                                            let removals = h.lines.iter().filter(|l| l.kind == ReviewLineKind::Removal).count();
+                                            let counts_label = format!("+{}/−{}", additions, removals);
                                             let tab_border: gpui::Hsla = if active {
                                                 rgb(0x7cc7ff).into()
                                             } else {
@@ -10424,6 +10462,10 @@ impl Render for AxisShell {
                                                 )
                                                 .child(
                                                     div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap_1()
                                                         .font_family(".ZedMono")
                                                         .text_xs()
                                                         .text_color(if active {
@@ -10431,7 +10473,12 @@ impl Render for AxisShell {
                                                         } else {
                                                             shell_text_secondary()
                                                         })
-                                                        .child(label),
+                                                        .child(header_label)
+                                                        .child(
+                                                            div()
+                                                                .text_color(rgb(0x7f8a94))
+                                                                .child(counts_label),
+                                                        ),
                                                 )
                                                 .into_any_element()
                                         })
