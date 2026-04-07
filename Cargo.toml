@@ -12,6 +12,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.dependencies]
+parking_lot = "0.12"
+
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"

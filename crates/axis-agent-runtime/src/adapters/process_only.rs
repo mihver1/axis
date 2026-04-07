@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -92,10 +93,7 @@ impl AgentProvider for ProcessOnlyProvider {
             lifecycle_terminal: false,
         }));
 
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{} provider lock poisoned: {e}", self.profile_id))?;
+        let mut guard = self.inner.lock();
         let id = AgentSessionId::new(format!("{}-session-{}", self.profile_id, guard.next_id));
         guard.next_id += 1;
         guard.sessions.insert(id.clone(), slot);
@@ -104,18 +102,13 @@ impl AgentProvider for ProcessOnlyProvider {
 
     fn poll_events(&self, session_id: &AgentSessionId) -> anyhow::Result<Vec<RuntimeEvent>> {
         let slot = {
-            let guard = self
-                .inner
-                .lock()
-                .map_err(|e| anyhow::anyhow!("{} provider lock poisoned: {e}", self.profile_id))?;
+            let guard = self.inner.lock();
             guard.sessions.get(session_id).cloned().ok_or_else(|| {
                 anyhow::anyhow!("unknown {} session {}", self.profile_id, session_id.0)
             })?
         };
 
-        let mut session = slot
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{} session lock poisoned: {e}", self.profile_id))?;
+        let mut session = slot.lock();
 
         if session.lifecycle_terminal {
             return Ok(vec![]);
@@ -171,19 +164,14 @@ impl AgentProvider for ProcessOnlyProvider {
 
     fn stop(&self, session_id: &AgentSessionId) -> anyhow::Result<()> {
         let slot = {
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|e| anyhow::anyhow!("{} provider lock poisoned: {e}", self.profile_id))?;
+            let mut guard = self.inner.lock();
             guard.sessions.remove(session_id).ok_or_else(|| {
                 anyhow::anyhow!("unknown {} session {}", self.profile_id, session_id.0)
             })?
         };
 
         let process = {
-            let session = slot
-                .lock()
-                .map_err(|e| anyhow::anyhow!("{} session lock poisoned: {e}", self.profile_id))?;
+            let session = slot.lock();
             session.spawned.process.clone()
         };
         process
@@ -200,17 +188,12 @@ impl ProcessOnlyProvider {
         command: &str,
     ) -> anyhow::Result<Vec<RuntimeEvent>> {
         let slot = {
-            let guard = self
-                .inner
-                .lock()
-                .map_err(|e| anyhow::anyhow!("{} provider lock poisoned: {e}", self.profile_id))?;
+            let guard = self.inner.lock();
             guard.sessions.get(session_id).cloned().ok_or_else(|| {
                 anyhow::anyhow!("unknown {} session {}", self.profile_id, session_id.0)
             })?
         };
-        let mut session = slot
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{} session lock poisoned: {e}", self.profile_id))?;
+        let mut session = slot.lock();
         let mut out = Vec::new();
         emit_boot_events_if_needed(&mut session, session_id, &mut out);
         session

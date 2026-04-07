@@ -4,7 +4,7 @@ use crate::daemon_client::DaemonClient;
 use crate::remote_terminals::RemoteTerminalSession;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use axis_agent_runtime::adapters::codex::CodexProvider;
 use axis_agent_runtime::adapters::process_only::ProcessOnlyProvider;
@@ -178,16 +178,11 @@ impl AgentRuntimeBridge {
     /// Returns a snapshot of known provider profiles and CLI availability for UI (e.g. picker).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn provider_options(&self) -> Vec<ProviderProfileOption> {
-        self.inner
-            .lock()
-            .map(|g| g.provider_options.clone())
-            .unwrap_or_default()
+        self.inner.lock().provider_options.clone()
     }
 
     pub fn provider_options_for_cwd(&self, cwd: &str) -> Vec<ProviderProfileOption> {
-        let Ok(guard) = self.inner.lock() else {
-            return Vec::new();
-        };
+        let guard = self.inner.lock();
         let selected_cwd = (!cwd.trim().is_empty()).then(|| Path::new(cwd));
         guard
             .provider_options
@@ -227,10 +222,8 @@ impl AgentRuntimeBridge {
     }
 
     pub fn revision(&self) -> u64 {
-        self.inner
-            .lock()
-            .map(|g| g.manager.revision().max(g.daemon_revision))
-            .unwrap_or(0)
+        let g = self.inner.lock();
+        g.manager.revision().max(g.daemon_revision)
     }
 
     fn key(workdesk_runtime_id: u64, surface_id: SurfaceId) -> SurfaceRuntimeKey {
@@ -241,16 +234,11 @@ impl AgentRuntimeBridge {
     }
 
     pub fn set_desk_cwd(&self, workdesk_runtime_id: u64, cwd: String) {
-        if let Ok(mut g) = self.inner.lock() {
-            g.desk_cwd.insert(workdesk_runtime_id, cwd);
-        }
+        self.inner.lock().desk_cwd.insert(workdesk_runtime_id, cwd);
     }
 
     fn resolve_cwd(&self, workdesk_runtime_id: u64, fallback: &str) -> String {
-        let g = match self.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return fallback.to_string(),
-        };
+        let g = self.inner.lock();
         g.desk_cwd
             .get(&workdesk_runtime_id)
             .cloned()
@@ -263,10 +251,10 @@ impl AgentRuntimeBridge {
         workdesk_runtime_id: u64,
         surface_id: SurfaceId,
     ) -> bool {
-        self.inner.lock().ok().is_some_and(|g| {
-            g.surface_to_session
-                .contains_key(&Self::key(workdesk_runtime_id, surface_id))
-        })
+        self.inner
+            .lock()
+            .surface_to_session
+            .contains_key(&Self::key(workdesk_runtime_id, surface_id))
     }
 
     fn start_agent_for_surface_inner(
@@ -284,10 +272,7 @@ impl AgentRuntimeBridge {
         if cwd.is_empty() {
             return Err("agent session requires non-empty cwd".to_string());
         }
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?;
+        let mut guard = self.inner.lock();
         let key = Self::key(workdesk_runtime_id, surface_id);
         if let Ok(record) = guard.daemon.start_agent(
             &WorktreeId::new(cwd.clone()),
@@ -333,12 +318,7 @@ impl AgentRuntimeBridge {
         cwd_fallback: &str,
         terminal: &RemoteTerminalSession,
     ) -> Result<AgentSessionId, String> {
-        let default_profile_id = self
-            .inner
-            .lock()
-            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?
-            .default_profile_id
-            .clone();
+        let default_profile_id = self.inner.lock().default_profile_id.clone();
         self.start_agent_for_surface_inner(
             workdesk_runtime_id,
             workdesk_id,
@@ -376,7 +356,7 @@ impl AgentRuntimeBridge {
         workdesk_runtime_id: u64,
         surface_id: SurfaceId,
     ) -> Option<AgentAttention> {
-        let guard = self.inner.lock().ok()?;
+        let guard = self.inner.lock();
         let sid = guard
             .surface_to_session
             .get(&Self::key(workdesk_runtime_id, surface_id))?;
@@ -417,14 +397,12 @@ impl AgentRuntimeBridge {
         workdesk_runtime_id: u64,
         surface_id: SurfaceId,
     ) -> Option<AgentSessionRecord> {
-        let guard = self.inner.lock().ok()?;
+        let guard = self.inner.lock();
         Self::record_for_key(&guard, Self::key(workdesk_runtime_id, surface_id))
     }
 
     pub(crate) fn sessions_snapshot(&self) -> Vec<AgentSessionRecord> {
-        let Ok(guard) = self.inner.lock() else {
-            return Vec::new();
-        };
+        let guard = self.inner.lock();
         let mut sessions = guard
             .surface_to_session
             .keys()
@@ -441,10 +419,7 @@ impl AgentRuntimeBridge {
     }
 
     pub(crate) fn provider_profile(&self, profile_id: &str) -> Option<ProviderProfileMetadata> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|guard| guard.manager.provider_profile(profile_id))
+        self.inner.lock().manager.provider_profile(profile_id)
     }
 
     pub fn poll_surface(
@@ -452,10 +427,7 @@ impl AgentRuntimeBridge {
         workdesk_runtime_id: u64,
         surface_id: SurfaceId,
     ) -> Result<(), String> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?;
+        let mut guard = self.inner.lock();
         let Some(sid) = guard
             .surface_to_session
             .get(&Self::key(workdesk_runtime_id, surface_id))
@@ -492,10 +464,7 @@ impl AgentRuntimeBridge {
     }
 
     pub(crate) fn stop_session(&self, session_id: &AgentSessionId) -> Result<(), String> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?;
+        let mut guard = self.inner.lock();
         let matching_key = guard
             .surface_to_session
             .iter()
@@ -531,9 +500,7 @@ impl AgentRuntimeBridge {
     }
 
     pub fn stop_surface(&self, workdesk_runtime_id: u64, surface_id: SurfaceId) {
-        let Ok(mut guard) = self.inner.lock() else {
-            return;
-        };
+        let mut guard = self.inner.lock();
         let Some(sid) = guard
             .surface_to_session
             .remove(&Self::key(workdesk_runtime_id, surface_id))
@@ -561,10 +528,7 @@ impl AgentRuntimeBridge {
         agent_session_id: &AgentSessionId,
         after_sequence: Option<u64>,
     ) -> Result<AgentSessionDetail, String> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?;
+        let mut guard = self.inner.lock();
         if let Some(detail) = Self::local_detail_for_session(&guard, agent_session_id) {
             return Ok(filter_detail_after_sequence(detail, after_sequence));
         }
@@ -578,10 +542,7 @@ impl AgentRuntimeBridge {
         agent_session_id: &AgentSessionId,
         text: &str,
     ) -> Result<AgentSessionDetail, String> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?;
+        let mut guard = self.inner.lock();
         if guard.manager.session(agent_session_id).is_some() {
             guard
                 .manager
@@ -602,10 +563,7 @@ impl AgentRuntimeBridge {
         approved: bool,
         note: Option<String>,
     ) -> Result<AgentSessionDetail, String> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?;
+        let mut guard = self.inner.lock();
         if guard.manager.session(agent_session_id).is_some() {
             guard
                 .manager
@@ -628,10 +586,7 @@ impl AgentRuntimeBridge {
         &self,
         agent_session_id: &AgentSessionId,
     ) -> Result<AgentSessionDetail, String> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| format!("agent runtime lock poisoned: {e}"))?;
+        let mut guard = self.inner.lock();
         if guard.manager.session(agent_session_id).is_some() {
             guard
                 .manager
@@ -830,11 +785,10 @@ mod tests {
             timeline: Vec::new(),
             truncated: false,
         };
-        let mut guard = bridge.inner.lock().expect("bridge should lock");
-        guard.surface_to_session.insert(
-            AgentRuntimeBridge::key(runtime_id, surface_id),
-            session_id.clone(),
-        );
+        let mut guard = bridge.inner.lock();
+        guard
+            .surface_to_session
+            .insert(AgentRuntimeBridge::key(runtime_id, surface_id), session_id.clone());
         guard.daemon_records.insert(session_id.clone(), record);
         guard.daemon_details.insert(session_id, detail);
         drop(guard);

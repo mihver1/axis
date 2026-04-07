@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -98,10 +99,7 @@ impl AgentProvider for CodexProvider {
             lifecycle_terminal: false,
         }));
 
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|e| anyhow::anyhow!("codex provider lock poisoned: {e}"))?;
+        let mut g = self.inner.lock();
         let id = AgentSessionId::new(format!("codex-session-{}", g.next_id));
         g.next_id += 1;
         g.sessions.insert(id.clone(), slot);
@@ -110,19 +108,14 @@ impl AgentProvider for CodexProvider {
 
     fn poll_events(&self, session_id: &AgentSessionId) -> anyhow::Result<Vec<RuntimeEvent>> {
         let slot = {
-            let g = self
-                .inner
-                .lock()
-                .map_err(|e| anyhow::anyhow!("codex provider lock poisoned: {e}"))?;
+            let g = self.inner.lock();
             g.sessions
                 .get(session_id)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("unknown codex session {}", session_id.0))?
         };
 
-        let mut state = slot
-            .lock()
-            .map_err(|e| anyhow::anyhow!("codex session lock poisoned: {e}"))?;
+        let mut state = slot.lock();
 
         if state.lifecycle_terminal {
             return Ok(vec![]);
@@ -186,19 +179,14 @@ impl AgentProvider for CodexProvider {
 
     fn stop(&self, session_id: &AgentSessionId) -> anyhow::Result<()> {
         let slot = {
-            let mut g = self
-                .inner
-                .lock()
-                .map_err(|e| anyhow::anyhow!("codex provider lock poisoned: {e}"))?;
+            let mut g = self.inner.lock();
             g.sessions
                 .remove(session_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown codex session {}", session_id.0))?
         };
 
         let process = {
-            let session = slot
-                .lock()
-                .map_err(|e| anyhow::anyhow!("codex session lock poisoned: {e}"))?;
+            let session = slot.lock();
             session.spawned.process.clone()
         };
         process
@@ -215,18 +203,13 @@ impl CodexProvider {
         command: &str,
     ) -> anyhow::Result<Vec<RuntimeEvent>> {
         let slot = {
-            let g = self
-                .inner
-                .lock()
-                .map_err(|e| anyhow::anyhow!("codex provider lock poisoned: {e}"))?;
+            let g = self.inner.lock();
             g.sessions
                 .get(session_id)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("unknown codex session {}", session_id.0))?
         };
-        let mut state = slot
-            .lock()
-            .map_err(|e| anyhow::anyhow!("codex session lock poisoned: {e}"))?;
+        let mut state = slot.lock();
         let mut out = Vec::new();
         emit_boot_events_if_needed(&mut state, session_id, &mut out);
         state

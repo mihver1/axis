@@ -485,6 +485,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axis-core",
+ "parking_lot",
  "process-manager",
  "serde",
  "serde_json",
@@ -500,6 +501,7 @@ dependencies = [
  "axis-editor",
  "axis-terminal",
  "gpui",
+ "parking_lot",
  "serde",
  "serde_json",
 ]
