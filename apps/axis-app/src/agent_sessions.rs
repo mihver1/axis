@@ -525,7 +525,10 @@ impl AgentRuntimeBridge {
             return Ok(());
         };
         if guard.daemon_records.contains_key(&sid) {
-            let sessions = guard.daemon.list_agents(None)?;
+            let sessions = match guard.daemon.list_agents(None) {
+                Ok(s) => s,
+                Err(_) => return Ok(()), // Daemon unavailable, skip gracefully
+            };
             guard.daemon_records = sessions
                 .into_iter()
                 .map(|record| (record.id.clone(), record))
@@ -544,8 +547,16 @@ impl AgentRuntimeBridge {
             });
             guard.daemon_revision = guard.daemon_revision.wrapping_add(1);
             if daemon_ids.contains(&sid) {
-                let detail = guard.daemon.get_agent(&sid, None)?;
-                cache_daemon_detail(&mut guard, detail);
+                match guard.daemon.get_agent(&sid, None) {
+                    Ok(detail) => {
+                        cache_daemon_detail(&mut guard, detail);
+                    }
+                    Err(_) => {
+                        // Session disappeared between list and get — remove from cache
+                        guard.daemon_records.remove(&sid);
+                        guard.daemon_details.remove(&sid);
+                    }
+                }
             }
             return Ok(());
         }
