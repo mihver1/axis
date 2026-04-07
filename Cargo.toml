@@ -9,6 +9,7 @@ members = [
     "crates/axis-terminal",
     "crates/process-manager",
     "crates/ghostty-sys",
+    "crates/axis-lsp",
 ]
 resolver = "2"
 
