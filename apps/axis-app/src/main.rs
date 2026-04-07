@@ -8550,6 +8550,77 @@ impl AxisShell {
                 }),
             ));
 
+        // Tab bar for editor panes with multiple surfaces
+        let has_multiple_editor_surfaces = matches!(active_surface_kind, PaneKind::Editor)
+            && pane.surfaces.len() > 1;
+        let editor_tab_bar = has_multiple_editor_surfaces.then(|| {
+            div()
+                .flex()
+                .items_center()
+                .h(px(28.0))
+                .px(px(4.0))
+                .bg(rgb(0x11171d))
+                .border_b_1()
+                .border_color(rgb(0x22303a))
+                .overflow_x_hidden()
+                .children(
+                    pane.surfaces
+                        .iter()
+                        .map(|surface| {
+                            let surface_id = surface.id;
+                            let active = surface_id == active_surface_id;
+                            let title = surface.title.clone();
+                            let filename = title
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&title)
+                                .to_string();
+                            let dirty = surface.dirty;
+
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .px(px(8.0))
+                                .py(px(4.0))
+                                .cursor_pointer()
+                                .when(active, |d| {
+                                    d.bg(rgb(0x1a2330))
+                                        .border_b_2()
+                                        .border_color(rgb(0x7cc7ff))
+                                })
+                                .when(!active, |d| d.hover(|d| d.bg(rgb(0x161d26))))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if active {
+                                            rgb(0xdce2e8)
+                                        } else {
+                                            rgb(0x7f8a94)
+                                        })
+                                        .child(filename),
+                                )
+                                .when(dirty, |d| {
+                                    d.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0xf0d35f))
+                                            .child("●"),
+                                    )
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.active_workdesk_mut()
+                                        .focus_surface(pane_id, surface_id);
+                                    this.request_persist(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                }))
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into_any_element()
+        });
+
         let body = div()
             .flex()
             .flex_1()
@@ -8581,6 +8652,7 @@ impl AxisShell {
                 }),
             )
             .child(header)
+            .when_some(editor_tab_bar, |s, tab_bar| s.child(tab_bar))
             .child(body);
 
         if frame.allow_layout_drag {
