@@ -67,6 +67,25 @@ just run
 The app will open even if `axisd` is not running, but the full daemon-backed
 automation loop is better with the daemon available.
 
+## Worktree Setup
+
+If you are working in a git worktree (e.g. created by Conductor or `git worktree add`),
+run the setup script first to initialize vendored dependencies:
+
+```bash
+just setup
+```
+
+This initializes the `vendor/ghostty` submodule (using the parent repo as a local
+cache for speed) and fetches Cargo dependencies. The script is idempotent — safe to
+re-run at any time.
+
+For a faster setup that skips `cargo fetch`:
+
+```bash
+just setup --quick
+```
+
 ## Full Local Loop
 
 For the current intended setup, run the daemon and app side by side:
@@ -104,6 +123,7 @@ automation should be expected to go through `axisd`.
 ## Useful Commands
 
 ```bash
+just setup      # initialize worktree (submodules + cargo fetch)
 just doctor     # verify macOS toolchain and Xcode setup
 just check      # cargo check --workspace
 just test       # cargo test -q
