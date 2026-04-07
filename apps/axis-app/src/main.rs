@@ -1,15 +1,16 @@
+use agent_timeline::{
+    build_agent_timeline_view_model, AgentTimelineEntryView, PendingApprovalView,
+};
 use attention::{
     next_attention_pane_target, next_attention_workdesk_target, reduce_pane_attention_state,
     should_notify_attention_transition, summarize_workdesk_attention,
 };
-use agent_timeline::{
-    build_agent_timeline_view_model, AgentTimelineEntryView, PendingApprovalView,
-};
 use axis_agent_runtime::WorktreeService;
 use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionRecord, AgentTransportKind};
 use axis_core::paths::daemon_socket_path;
-use axis_core::workdesk::{WorkdeskId, WorkdeskRecord};
 use axis_core::review::DeskReviewPayload;
+use axis_core::review::ReviewLineKind;
+use axis_core::workdesk::{WorkdeskId, WorkdeskRecord};
 use axis_core::worktree::{WorktreeBinding, WorktreeId};
 use axis_core::{
     automation::{
@@ -19,15 +20,14 @@ use axis_core::{
     PaneId, PaneKind, PaneRecord, Point as WorkdeskPoint, Size as WorkdeskSize, SurfaceId,
     SurfaceKind, SurfaceRecord,
 };
-use axis_core::review::ReviewLineKind;
 use review::{
     build_desk_review_summary_view, build_desk_review_summary_view_from_payload,
     editor_jump_line_for_review_row, merge_review_local_after_fetch,
     refreshed_desk_review_summary_view, resolve_local_desk_review_payload,
-    review_changed_file_preview, review_editor_open_failed_notice,
+    reusable_review_payload_cache, review_changed_file_preview, review_editor_open_failed_notice,
     review_file_hunkless_notice, review_payload_worktree_rebound, review_status_label,
-    review_workspace_setup_notice, reusable_review_payload_cache, DeskReviewSummaryView,
-    ReviewPanelLocalState, ReviewPanelRefreshContext,
+    review_workspace_setup_notice, DeskReviewSummaryView, ReviewPanelLocalState,
+    ReviewPanelRefreshContext,
 };
 
 mod agent_provider_popup;
@@ -1230,9 +1230,8 @@ fn agent_session_inspector_view(
     surface_id: SurfaceId,
 ) -> Option<AgentSessionInspectorView> {
     let record = bridge.session_for_surface(workdesk.runtime_id, surface_id)?;
-    let detail = bridge
-        .session_detail(&record.id, None)
-        .unwrap_or_else(|_| axis_core::agent_history::AgentSessionDetail {
+    let detail = bridge.session_detail(&record.id, None).unwrap_or_else(|_| {
+        axis_core::agent_history::AgentSessionDetail {
             session: record.clone(),
             capabilities: Default::default(),
             started_at_ms: None,
@@ -1243,12 +1242,16 @@ fn agent_session_inspector_view(
             pending_approval_id: None,
             timeline: Vec::new(),
             truncated: false,
-        });
+        }
+    });
     let timeline = build_agent_timeline_view_model(&detail);
     let pane_title = workdesk
         .panes
         .iter()
-        .find_map(|pane| pane.surface(surface_id).map(|surface| surface.title.clone()))
+        .find_map(|pane| {
+            pane.surface(surface_id)
+                .map(|surface| surface.title.clone())
+        })
         .unwrap_or_else(|| "Agent".to_string());
     let capability_note = bridge
         .provider_profile(&record.provider_profile_id)
@@ -1421,9 +1424,11 @@ fn load_workspace_file_candidates_with_rg(root_path: &Path) -> Option<Vec<Worksp
             .lines()
             .filter_map(|line| {
                 let absolute = root.join(line);
-                relative_workspace_path(&root, &absolute).map(|relative_path| WorkspaceFileCandidate {
-                    absolute_path: absolute.display().to_string(),
-                    relative_path,
+                relative_workspace_path(&root, &absolute).map(|relative_path| {
+                    WorkspaceFileCandidate {
+                        absolute_path: absolute.display().to_string(),
+                        relative_path,
+                    }
                 })
             })
             .collect::<Vec<_>>(),
@@ -1437,7 +1442,11 @@ fn load_workspace_file_candidates_fallback(root_path: &Path) -> Vec<WorkspaceFil
     results
 }
 
-fn collect_workspace_files(root_path: &Path, current: &Path, results: &mut Vec<WorkspaceFileCandidate>) {
+fn collect_workspace_files(
+    root_path: &Path,
+    current: &Path,
+    results: &mut Vec<WorkspaceFileCandidate>,
+) {
     let Ok(entries) = fs::read_dir(current) else {
         return;
     };
@@ -1449,10 +1458,7 @@ fn collect_workspace_files(root_path: &Path, current: &Path, results: &mut Vec<W
         if metadata.is_dir() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if matches!(
-                name.as_ref(),
-                ".git" | "target" | ".axis" | "node_modules"
-            ) {
+            if matches!(name.as_ref(), ".git" | "target" | ".axis" | "node_modules") {
                 continue;
             }
             collect_workspace_files(root_path, &path, results);
@@ -4136,8 +4142,9 @@ impl AxisShell {
         };
 
         let worktree_id = WorktreeId::new(binding.root_path.clone());
-        let refreshed_binding = WorktreeService::attach(&binding.root_path, binding.base_branch.clone())
-            .map_err(|error| error.to_string())?;
+        let refreshed_binding =
+            WorktreeService::attach(&binding.root_path, binding.base_branch.clone())
+                .map_err(|error| error.to_string())?;
 
         if let Ok(payload) = DaemonClient::default().desk_review_summary(&worktree_id) {
             if let Some(desk) = self.workdesks.get_mut(desk_index) {
@@ -4159,7 +4166,10 @@ impl AxisShell {
             .workdesks
             .get(desk_index)
             .and_then(|desk| {
-                reusable_review_payload_cache(desk.review_payload_cache.as_ref(), &refreshed_binding)
+                reusable_review_payload_cache(
+                    desk.review_payload_cache.as_ref(),
+                    &refreshed_binding,
+                )
             })
             .cloned();
         let resolved = resolve_local_desk_review_payload(
@@ -4190,7 +4200,8 @@ impl AxisShell {
         stale_rich_payload: bool,
     ) {
         let workdesk_id = WorkdeskId::new(desk.workdesk_id.clone());
-        let rebound = review_payload_worktree_rebound(desk.review_payload_cache.as_ref(), refreshed_binding);
+        let rebound =
+            review_payload_worktree_rebound(desk.review_payload_cache.as_ref(), refreshed_binding);
         let prev_cache = desk.review_payload_cache.as_ref();
         let setup = review_workspace_setup_notice(refreshed_binding);
         let (payload, local) = merge_review_local_after_fetch(
@@ -4515,34 +4526,37 @@ impl AxisShell {
                         .ok()
                         .and_then(|index| self.workdesks.get(index))
                         .and_then(|desk| {
-                            reusable_review_payload_cache(desk.review_payload_cache.as_ref(), &binding)
+                            reusable_review_payload_cache(
+                                desk.review_payload_cache.as_ref(),
+                                &binding,
+                            )
                         })
                         .cloned();
 
-                    let (payload, summary, stale) = match DaemonClient::default()
-                        .desk_review_summary(&worktree_id)
-                    {
-                        Ok(payload) => (
-                            payload.clone(),
-                            build_desk_review_summary_view_from_payload(&binding, &payload),
-                            false,
-                        ),
-                        Err(error)
-                            if !Self::daemon_review_summary_error_allows_fallback(&error) =>
-                        {
-                            return Err(error);
-                        }
-                        Err(_) => {
-                            let resolved = resolve_local_desk_review_payload(
-                                &worktree_id,
-                                &binding,
-                                cached_payload.as_ref(),
-                            )?;
-                            (resolved.payload, resolved.summary, resolved.stale)
-                        }
-                    };
+                    let (payload, summary, stale) =
+                        match DaemonClient::default().desk_review_summary(&worktree_id) {
+                            Ok(payload) => (
+                                payload.clone(),
+                                build_desk_review_summary_view_from_payload(&binding, &payload),
+                                false,
+                            ),
+                            Err(error)
+                                if !Self::daemon_review_summary_error_allows_fallback(&error) =>
+                            {
+                                return Err(error);
+                            }
+                            Err(_) => {
+                                let resolved = resolve_local_desk_review_payload(
+                                    &worktree_id,
+                                    &binding,
+                                    cached_payload.as_ref(),
+                                )?;
+                                (resolved.payload, resolved.summary, resolved.stale)
+                            }
+                        };
 
-                    if let Ok(desk_index) = self.resolve_workdesk_index_by_worktree_id(&worktree_id) {
+                    if let Ok(desk_index) = self.resolve_workdesk_index_by_worktree_id(&worktree_id)
+                    {
                         let binding = self.refresh_worktree_binding_for_desk(desk_index, false)?;
                         if let Some(desk) = self.workdesks.get_mut(desk_index) {
                             let summary =
@@ -4932,12 +4946,10 @@ impl AxisShell {
             cx.notify();
             return;
         };
-        match self.agent_runtime.respond_approval(
-            &record.id,
-            &approval_id,
-            approved,
-            None,
-        ) {
+        match self
+            .agent_runtime
+            .respond_approval(&record.id, &approval_id, approved, None)
+        {
             Ok(_) => {
                 self.sync_agent_runtime_activity(cx);
                 cx.notify();
@@ -5858,9 +5870,7 @@ impl AxisShell {
         let cwd = Self::workdesk_agent_cwd(&self.workdesks[desk_index]);
         let options = self.agent_runtime.provider_options_for_cwd(&cwd);
         self.agent_provider_popup = Some(agent_provider_popup::AgentProviderPopupState::new(
-            desk_index,
-            target,
-            options,
+            desk_index, target, options,
         ));
         cx.notify();
     }
@@ -6040,7 +6050,10 @@ impl AxisShell {
         self.workdesk_editor = None;
         self.session_inspector = None;
         self.review_panel = None;
-        self.workspace_palette = Some(WorkspacePaletteState::new(mode, self.workspace_palette_root()));
+        self.workspace_palette = Some(WorkspacePaletteState::new(
+            mode,
+            self.workspace_palette_root(),
+        ));
         cx.notify();
     }
 
@@ -6146,7 +6159,12 @@ impl AxisShell {
         }
     }
 
-    fn select_review_panel_file(&mut self, desk_index: usize, file_index: usize, cx: &mut Context<Self>) {
+    fn select_review_panel_file(
+        &mut self,
+        desk_index: usize,
+        file_index: usize,
+        cx: &mut Context<Self>,
+    ) {
         let Some(desk) = self.workdesks.get_mut(desk_index) else {
             return;
         };
@@ -6161,17 +6179,16 @@ impl AxisShell {
             .review_payload_cache
             .as_ref()
             .and_then(|p| p.files.get(file_index))
-            .and_then(|file| {
-                if file.hunks.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                }
-            });
+            .and_then(|file| if file.hunks.is_empty() { None } else { Some(0) });
         cx.notify();
     }
 
-    fn select_review_panel_hunk(&mut self, desk_index: usize, hunk_index: usize, cx: &mut Context<Self>) {
+    fn select_review_panel_hunk(
+        &mut self,
+        desk_index: usize,
+        hunk_index: usize,
+        cx: &mut Context<Self>,
+    ) {
         let Some(desk) = self.workdesks.get_mut(desk_index) else {
             return;
         };
@@ -7750,18 +7767,16 @@ impl AxisShell {
                     .session_for_surface(workdesk.runtime_id, active_surface_id)
             })
             .flatten();
-        let agent_provider_badge = active_agent_session
-            .as_ref()
-            .map(|record| {
-                self.agent_runtime
-                    .provider_profile(&record.provider_profile_id)
-                    .and_then(|profile| {
-                        profile
-                            .capability_note
-                            .map(|note| format!("{} · {}", record.provider_profile_id, note))
-                    })
-                    .unwrap_or_else(|| record.provider_profile_id.clone())
-            });
+        let agent_provider_badge = active_agent_session.as_ref().map(|record| {
+            self.agent_runtime
+                .provider_profile(&record.provider_profile_id)
+                .and_then(|profile| {
+                    profile
+                        .capability_note
+                        .map(|note| format!("{} · {}", record.provider_profile_id, note))
+                })
+                .unwrap_or_else(|| record.provider_profile_id.clone())
+        });
         let session_inspector_active = matches!(
             self.session_inspector,
             Some(target)
@@ -8450,6 +8465,8 @@ impl Render for AxisShell {
                 )
             })
             .flatten();
+        let dock_left = sidebar_width + FLOATING_DOCK_MARGIN;
+        let dock_width = (viewport_width - sidebar_width - FLOATING_DOCK_MARGIN * 2.0).max(240.0);
 
         let background_elements = match layout_mode {
             LayoutMode::Free => {
@@ -8843,25 +8860,28 @@ impl Render for AxisShell {
             .collect::<Vec<_>>();
         let notification_overlay = self.notifications_open.then(|| {
             let notification_cards = if notification_entries.is_empty() {
-                vec![
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .p_3()
-                        .bg(rgb(0x10171d))
-                        .border_1()
-                        .border_color(rgb(0x24313b))
-                        .rounded_lg()
-                        .child(div().text_sm().text_color(rgb(0xdce2e8)).child("No attention events yet"))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x8e9ba5))
-                                .child("Agent and terminal attention changes will appear here."),
-                        )
-                        .into_any_element(),
-                ]
+                vec![div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_3()
+                    .bg(shell_panel_bg_raised())
+                    .border_1()
+                    .border_color(shell_border())
+                    .rounded_lg()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(shell_text_primary())
+                            .child("No attention events yet"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(shell_text_secondary())
+                            .child("Agent and terminal attention changes will appear here."),
+                    )
+                    .into_any_element()]
             } else {
                 notification_entries
                     .into_iter()
@@ -8896,11 +8916,10 @@ impl Render for AxisShell {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .bg(rgb(0x0f151b))
+                .bg(shell_panel_bg())
                 .border_1()
-                .border_color(rgb(0x2b3641))
+                .border_color(shell_border())
                 .rounded_xl()
-                .shadow_lg()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
                 })
@@ -8928,15 +8947,12 @@ impl Render for AxisShell {
                                         .child("Attention feed"),
                                 )
                                 .child(div().text_sm().child("Notifications"))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x8e9ba5))
-                                        .child(format!(
-                                            "{} unread attention events across workdesks.",
-                                            unread_notifications
-                                        )),
-                                ),
+                                .child(div().text_xs().text_color(shell_text_secondary()).child(
+                                    format!(
+                                        "{} unread attention events across workdesks.",
+                                        unread_notifications
+                                    ),
+                                )),
                         )
                         .child(control_button(
                             "Close",
@@ -8966,7 +8982,7 @@ impl Render for AxisShell {
                 .top(px(0.0))
                 .w(px(viewport_width))
                 .h(px(viewport_height))
-                .bg(rgba(0x09101660))
+                .bg(shell_scrim_heavy())
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
@@ -8988,10 +9004,9 @@ impl Render for AxisShell {
                         .flex_col()
                         .gap_3()
                         .p_4()
-                        .bg(rgb(0x0f151b))
+                        .bg(shell_panel_bg())
                         .border_l_1()
-                        .border_color(rgb(0x2c3944))
-                        .shadow_lg()
+                        .border_color(shell_border_strong())
                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
                         })
@@ -9016,7 +9031,7 @@ impl Render for AxisShell {
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .text_color(rgb(0x90a0aa))
+                                                .text_color(shell_text_secondary())
                                                 .child(
                                                     "Structured timeline, approvals, and recent terminal replay.",
                                                 ),
@@ -9083,19 +9098,19 @@ impl Render for AxisShell {
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(0x7f8a94))
+                                                    .text_color(shell_text_muted())
                                                     .child("Timeline"),
                                             )
                                             .children(
                                                 if view.timeline_entries.is_empty() {
                                                     vec![div()
                                                         .p_3()
-                                                        .bg(rgb(0x10171d))
+                                                        .bg(shell_panel_bg_raised())
                                                         .border_1()
-                                                        .border_color(rgb(0x24313b))
+                                                        .border_color(shell_border())
                                                         .rounded_lg()
                                                         .text_xs()
-                                                        .text_color(rgb(0x7f8a94))
+                                                        .text_color(shell_text_muted())
                                                         .child("No structured events yet.")
                                                         .into_any_element()]
                                                 } else {
@@ -9116,9 +9131,9 @@ impl Render for AxisShell {
                                             .flex_col()
                                             .gap_2()
                                             .p_3()
-                                            .bg(rgb(0x10171d))
+                                            .bg(shell_panel_bg_raised())
                                             .border_1()
-                                            .border_color(rgb(0x24313b))
+                                            .border_color(shell_border())
                                             .rounded_lg()
                                             .child(inspector_row("Session", view.session_id.clone()))
                                             .child(inspector_row(
@@ -9154,7 +9169,7 @@ impl Render for AxisShell {
                                                 .child(
                                                     div()
                                                         .text_xs()
-                                                        .text_color(rgb(0x7f8a94))
+                                                        .text_color(shell_text_muted())
                                                         .child("Session actions"),
                                                 )
                                                 .when(view.can_send_turn, |section| {
@@ -9218,7 +9233,7 @@ impl Render for AxisShell {
                                                 .child(
                                                     div()
                                                         .text_xs()
-                                                        .text_color(rgb(0x7f8a94))
+                                                        .text_color(shell_text_muted())
                                                         .child("Pending approvals"),
                                                 )
                                                 .children(
@@ -9269,7 +9284,7 @@ impl Render for AxisShell {
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(0x7f8a94))
+                                                    .text_color(shell_text_muted())
                                                     .child("Recent replay"),
                                             )
                                             .child(
@@ -9278,13 +9293,13 @@ impl Render for AxisShell {
                                                     .max_h(px((viewport_height - 460.0).max(140.0)))
                                                     .overflow_hidden()
                                                     .p_3()
-                                                    .bg(rgb(0x10171d))
+                                                    .bg(shell_panel_bg_raised())
                                                     .border_1()
-                                                    .border_color(rgb(0x24313b))
+                                                    .border_color(shell_border())
                                                     .rounded_lg()
                                                     .font_family(".ZedMono")
                                                     .text_xs()
-                                                    .text_color(rgb(0xdce2e8))
+                                                    .text_color(shell_text_primary())
                                                     .child(
                                                         div()
                                                             .flex()
@@ -9293,7 +9308,7 @@ impl Render for AxisShell {
                                                             .children(
                                                                 if view.transcript_preview.is_empty() {
                                                                     vec![div()
-                                                                        .text_color(rgb(0x7f8a94))
+                                                                        .text_color(shell_text_muted())
                                                                         .child("No terminal output yet.")
                                                                         .into_any_element()]
                                                                 } else {
@@ -9316,20 +9331,20 @@ impl Render for AxisShell {
                             panel.child(
                                 div()
                                     .p_3()
-                                    .bg(rgb(0x10171d))
+                                    .bg(shell_panel_bg_raised())
                                     .border_1()
-                                    .border_color(rgb(0x24313b))
+                                    .border_color(shell_border())
                                     .rounded_lg()
                                     .child(
                                         div()
                                             .text_sm()
-                                            .text_color(rgb(0xdce2e8))
+                                            .text_color(shell_text_primary())
                                             .child("Session no longer available."),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(0x8e9ba5))
+                                            .text_color(shell_text_secondary())
                                             .child(
                                                 "The pane or runtime session disappeared before the inspector was rendered.",
                                             ),
@@ -9342,27 +9357,25 @@ impl Render for AxisShell {
             let query = palette.query.clone();
             let root_label = palette.root_path.display().to_string();
             let result_rows = if palette.results.is_empty() {
-                vec![
-                    div()
-                        .p_3()
-                        .bg(rgb(0x10171d))
-                        .border_1()
-                        .border_color(rgb(0x24313b))
-                        .rounded_lg()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(0xdce2e8))
-                                .child(palette.mode.empty_label()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x8e9ba5))
-                                .child(palette.mode.description()),
-                        )
-                        .into_any_element(),
-                ]
+                vec![div()
+                    .p_3()
+                    .bg(shell_panel_bg_raised())
+                    .border_1()
+                    .border_color(shell_border())
+                    .rounded_lg()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(shell_text_primary())
+                            .child(palette.mode.empty_label()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(shell_text_secondary())
+                            .child(palette.mode.description()),
+                    )
+                    .into_any_element()]
             } else {
                 palette
                     .results
@@ -9389,7 +9402,7 @@ impl Render for AxisShell {
                 .top(px(0.0))
                 .w(px(viewport_width))
                 .h(px(viewport_height))
-                .bg(rgba(0x09101680))
+                .bg(shell_scrim_soft())
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
@@ -9402,19 +9415,22 @@ impl Render for AxisShell {
                 .child(
                     div()
                         .absolute()
-                        .left(px(((viewport_width - WORKSPACE_PALETTE_WIDTH).max(32.0) * 0.5).max(16.0)))
+                        .left(px(((viewport_width - WORKSPACE_PALETTE_WIDTH).max(32.0)
+                            * 0.5)
+                            .max(16.0)))
                         .top(px(72.0))
-                        .w(px(WORKSPACE_PALETTE_WIDTH.min((viewport_width - 32.0).max(320.0))))
+                        .w(px(
+                            WORKSPACE_PALETTE_WIDTH.min((viewport_width - 32.0).max(320.0))
+                        ))
                         .max_h(px((viewport_height - 120.0).max(220.0)))
                         .flex()
                         .flex_col()
                         .gap_3()
                         .p_4()
-                        .bg(rgb(0x0f151b))
+                        .bg(shell_panel_bg())
                         .border_1()
-                        .border_color(rgb(0x2c3944))
+                        .border_color(shell_border())
                         .rounded_xl()
-                        .shadow_lg()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
                         })
@@ -9439,7 +9455,7 @@ impl Render for AxisShell {
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .text_color(rgb(0x8e9ba5))
+                                                .text_color(shell_text_secondary())
                                                 .child(root_label),
                                         ),
                                 )
@@ -9458,14 +9474,14 @@ impl Render for AxisShell {
                                 .flex_col()
                                 .gap_1()
                                 .p_3()
-                                .bg(rgb(0x11181e))
+                                .bg(shell_panel_bg_raised())
                                 .border_1()
-                                .border_color(rgb(0x24313b))
+                                .border_color(shell_border())
                                 .rounded_lg()
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(0x7f8a94))
+                                        .text_color(shell_text_muted())
                                         .child("Query"),
                                 )
                                 .child(
@@ -9473,9 +9489,9 @@ impl Render for AxisShell {
                                         .font_family(".ZedMono")
                                         .text_sm()
                                         .text_color(if query.is_empty() {
-                                            rgb(0x6f7d86)
+                                            shell_text_muted()
                                         } else {
-                                            rgb(0xdce2e8)
+                                            shell_text_primary()
                                         })
                                         .child(if query.is_empty() {
                                             palette.mode.prompt().to_string()
@@ -9581,7 +9597,7 @@ impl Render for AxisShell {
                             let row_border: gpui::Hsla = if active {
                                 rgb(0x7cc7ff).into()
                             } else {
-                                rgb(0x24313b).into()
+                                shell_border()
                             };
                             div()
                                 .px_2()
@@ -9589,9 +9605,9 @@ impl Render for AxisShell {
                                 .rounded_md()
                                 .cursor_pointer()
                                 .bg(if active {
-                                    rgb(0x1c2730)
+                                    shell_panel_bg_active()
                                 } else {
-                                    rgb(0x12181e)
+                                    shell_panel_bg_raised()
                                 })
                                 .border_1()
                                 .border_color(row_border)
@@ -9609,9 +9625,9 @@ impl Render for AxisShell {
                                     div()
                                         .text_xs()
                                         .text_color(if active {
-                                            rgb(0xdce2e8)
+                                            shell_text_primary()
                                         } else {
-                                            rgb(0x9aa6af)
+                                            shell_text_secondary()
                                         })
                                         .overflow_hidden()
                                         .whitespace_nowrap()
@@ -9628,7 +9644,7 @@ impl Render for AxisShell {
                         vec![div()
                             .p_3()
                             .text_sm()
-                            .text_color(rgb(0x8e9ba5))
+                            .text_color(shell_text_secondary())
                             .child("No structured review payload is cached for this desk.")
                             .into_any_element()],
                         vec![],
@@ -9637,7 +9653,7 @@ impl Render for AxisShell {
                         vec![div()
                             .p_3()
                             .text_sm()
-                            .text_color(rgb(0x8e9ba5))
+                            .text_color(shell_text_secondary())
                             .child("No files in this review snapshot.")
                             .into_any_element()],
                         vec![],
@@ -9651,14 +9667,14 @@ impl Render for AxisShell {
                                         .flex_col()
                                         .gap_2()
                                         .p_3()
-                                        .bg(rgb(0x10171d))
+                                        .bg(shell_panel_bg_raised())
                                         .border_1()
-                                        .border_color(rgb(0x24313b))
+                                        .border_color(shell_border())
                                         .rounded_lg()
                                         .child(
                                             div()
                                                 .text_sm()
-                                                .text_color(rgb(0xdce2e8))
+                                                .text_color(shell_text_primary())
                                                 .child(review_file_hunkless_notice(file)),
                                         )
                                         .into_any_element()],
@@ -9684,7 +9700,7 @@ impl Render for AxisShell {
                                             let tab_border: gpui::Hsla = if active {
                                                 rgb(0x7cc7ff).into()
                                             } else {
-                                                rgb(0x24313b).into()
+                                                shell_border()
                                             };
                                             div()
                                                 .px_2()
@@ -9692,9 +9708,9 @@ impl Render for AxisShell {
                                                 .rounded_md()
                                                 .cursor_pointer()
                                                 .bg(if active {
-                                                    rgb(0x1c2730)
+                                                    shell_panel_bg_active()
                                                 } else {
-                                                    rgb(0x12181e)
+                                                    shell_panel_bg_raised()
                                                 })
                                                 .border_1()
                                                 .border_color(tab_border)
@@ -9715,9 +9731,9 @@ impl Render for AxisShell {
                                                         .font_family(".ZedMono")
                                                         .text_xs()
                                                         .text_color(if active {
-                                                            rgb(0xdce2e8)
+                                                            shell_text_primary()
                                                         } else {
-                                                            rgb(0x8e9ba5)
+                                                            shell_text_secondary()
                                                         })
                                                         .child(label),
                                                 )
@@ -9730,7 +9746,7 @@ impl Render for AxisShell {
                                         .mb_2()
                                         .font_family(".ZedMono")
                                         .text_xs()
-                                        .text_color(rgb(0x7f8a94))
+                                        .text_color(shell_text_muted())
                                         .child(hunk.header.clone())
                                         .into_any_element(),
                                 ]
@@ -9743,10 +9759,10 @@ impl Render for AxisShell {
                                         ReviewLineKind::Metadata => "@",
                                     };
                                     let text_color = match line.kind {
-                                        ReviewLineKind::Context => rgb(0xc8d1d8),
+                                        ReviewLineKind::Context => shell_text_primary(),
                                         ReviewLineKind::Addition => rgb(0x77d19a),
                                         ReviewLineKind::Removal => rgb(0xff9b88),
-                                        ReviewLineKind::Metadata => rgb(0x7f8a94),
+                                        ReviewLineKind::Metadata => shell_text_muted(),
                                     };
                                     let jumpable = line.jumpable
                                         && editor_jump_line_for_review_row(hunk, line).is_some();
@@ -9789,7 +9805,7 @@ impl Render for AxisShell {
                                 vec![div()
                                     .p_3()
                                     .text_sm()
-                                    .text_color(rgb(0x8e9ba5))
+                                    .text_color(shell_text_secondary())
                                     .child("Selected file is no longer in the payload.")
                                     .into_any_element()],
                                 vec![],
@@ -9803,7 +9819,7 @@ impl Render for AxisShell {
                 .top(px(0.0))
                 .w(px(viewport_width))
                 .h(px(viewport_height))
-                .bg(rgba(0x09101660))
+                .bg(shell_scrim_heavy())
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
@@ -9822,10 +9838,9 @@ impl Render for AxisShell {
                         .flex_col()
                         .gap_3()
                         .p_4()
-                        .bg(rgb(0x0f151b))
+                        .bg(shell_panel_bg())
                         .border_l_1()
-                        .border_color(rgb(0x2c3944))
-                        .shadow_lg()
+                        .border_color(shell_border_strong())
                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
                         })
@@ -9850,7 +9865,7 @@ impl Render for AxisShell {
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .text_color(rgb(0x90a0aa))
+                                                .text_color(shell_text_secondary())
                                                 .child(desk_name),
                                         ),
                                 )
@@ -9883,7 +9898,7 @@ impl Render for AxisShell {
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .text_color(rgb(0x7f8a94))
+                                                .text_color(shell_text_muted())
                                                 .child("Files"),
                                         )
                                         .children(file_rows),
@@ -9909,9 +9924,9 @@ impl Render for AxisShell {
                                                 .flex_1()
                                                 .overflow_hidden()
                                                 .p_2()
-                                                .bg(rgb(0x10171d))
+                                                .bg(shell_panel_bg_raised())
                                                 .border_1()
-                                                .border_color(rgb(0x24313b))
+                                                .border_color(shell_border())
                                                 .rounded_lg()
                                                 .children(diff_rows),
                                         )
@@ -9953,7 +9968,7 @@ impl Render for AxisShell {
                                                     row.child(
                                                         div()
                                                             .text_xs()
-                                                            .text_color(rgb(0x6f7d86))
+                                                            .text_color(shell_text_muted())
                                                             .child(
                                                                 "Hunk actions are unavailable without textual hunks.",
                                                             ),
@@ -10004,9 +10019,9 @@ impl Render for AxisShell {
                 .flex_col()
                 .gap_3()
                 .p_3()
-                .bg(rgb(0x11181e))
+                .bg(shell_panel_bg_raised())
                 .border_1()
-                .border_color(rgb(0x24313b))
+                .border_color(shell_border())
                 .rounded_lg()
                 .child(
                     div()
@@ -10027,7 +10042,7 @@ impl Render for AxisShell {
                     .top(px(0.0))
                     .w(px(viewport_width))
                     .h(px(viewport_height))
-                    .bg(rgba(0x091016d6))
+                    .bg(shell_scrim_soft())
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                         this.close_shortcut_panel(cx);
                         cx.stop_propagation();
@@ -10045,11 +10060,10 @@ impl Render for AxisShell {
                     .flex_col()
                     .gap_3()
                     .p_4()
-                    .bg(rgb(0x0f151b))
+                    .bg(shell_panel_bg())
                     .border_1()
-                    .border_color(rgb(0x27333d))
+                    .border_color(shell_border())
                     .rounded_xl()
-                    .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
@@ -10077,7 +10091,7 @@ impl Render for AxisShell {
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(0x90a0aa))
+                                            .text_color(shell_text_secondary())
                                             .child(
                                                 "Click any binding to record a new chord. Press Delete while recording to clear it, or Escape to cancel.",
                                             ),
@@ -10111,9 +10125,9 @@ impl Render for AxisShell {
                             div()
                                 .px_3()
                                 .py_2()
-                                .bg(rgb(0x182028))
+                                .bg(shell_panel_bg_active())
                                 .border_1()
-                                .border_color(rgb(0x2e4556))
+                                .border_color(shell_border_strong())
                                 .rounded_lg()
                                 .child(
                                     div()
@@ -10125,7 +10139,7 @@ impl Render for AxisShell {
                                     div()
                                         .mt_1()
                                         .text_xs()
-                                        .text_color(rgb(0xb7c1c8))
+                                        .text_color(shell_text_secondary())
                                         .child(
                                             "The next supported chord becomes the new binding immediately.",
                                         ),
@@ -10139,15 +10153,15 @@ impl Render for AxisShell {
                             .justify_between()
                             .px_3()
                             .py_2()
-                            .bg(rgb(0x131a20))
+                            .bg(shell_panel_bg())
                             .border_1()
-                            .border_color(rgb(0x25303a))
+                            .border_color(shell_border())
                             .rounded_lg()
                             .child(status_chip("Open", toggle_shortcut_label.clone()))
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x90a0aa))
+                                    .text_color(shell_text_secondary())
                                     .child(shortcut_path_label.clone()),
                             ),
                     )
@@ -10190,11 +10204,10 @@ impl Render for AxisShell {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .bg(rgb(0x11181e))
+                    .bg(shell_panel_bg())
                     .border_1()
-                    .border_color(rgb(0x2c3944))
+                    .border_color(shell_border())
                     .rounded_lg()
-                    .shadow_lg()
                     .on_any_mouse_down(|_, _, cx| {
                         cx.stop_propagation();
                     })
@@ -10224,7 +10237,7 @@ impl Render for AxisShell {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x90a0aa))
+                                    .text_color(shell_text_secondary())
                                     .child(format!("{} panes", desk.panes.len())),
                             ),
                     )
@@ -10296,11 +10309,10 @@ impl Render for AxisShell {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .bg(rgb(0x11181e))
+                    .bg(shell_panel_bg())
                     .border_1()
-                    .border_color(rgb(0x2c3944))
+                    .border_color(shell_border())
                     .rounded_lg()
-                    .shadow_lg()
                     .on_any_mouse_down(|_, _, cx| {
                         cx.stop_propagation();
                     })
@@ -10329,7 +10341,7 @@ impl Render for AxisShell {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x90a0aa))
+                                    .text_color(shell_text_secondary())
                                     .child(surface_count_label(pane.surfaces.len())),
                             ),
                     )
@@ -10375,9 +10387,8 @@ impl Render for AxisShell {
             )
         });
         let agent_provider_popup_overlay = self.agent_provider_popup.as_ref().map(|popup| {
-            let popup_width = 360.0_f32.min(
-                (viewport_width - sidebar_width - FLOATING_DOCK_MARGIN * 2.0).max(280.0),
-            );
+            let popup_width = 360.0_f32
+                .min((viewport_width - sidebar_width - FLOATING_DOCK_MARGIN * 2.0).max(280.0));
             let left = ((viewport_width - popup_width) * 0.5).max(sidebar_width + 16.0);
             let top = (viewport_height * 0.16).max(44.0);
             let option_rows = popup
@@ -10394,12 +10405,16 @@ impl Render for AxisShell {
                         .gap_1()
                         .px_3()
                         .py_2()
-                        .bg(if available { rgb(0x171f26) } else { rgb(0x13191f) })
+                        .bg(if available {
+                            shell_panel_bg_raised()
+                        } else {
+                            shell_panel_bg()
+                        })
                         .border_1()
                         .border_color(if available {
-                            rgb(0x2b3641)
+                            shell_border_strong()
                         } else {
-                            rgb(0x22303a)
+                            shell_border()
                         })
                         .rounded_md()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -10420,12 +10435,17 @@ impl Render for AxisShell {
                                 .text_color(if available {
                                     rgb(0x7cc7ff)
                                 } else {
-                                    rgb(0x6f7b85)
+                                    shell_text_muted()
                                 })
                                 .child(option.profile_id),
                         )
                         .when_some(option.capability_note, |row, note| {
-                            row.child(div().text_xs().text_color(rgb(0x90a0aa)).child(note))
+                            row.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(shell_text_secondary())
+                                    .child(note),
+                            )
                         })
                         .when_some(option.unavailable_reason, |row, reason| {
                             row.child(div().text_xs().text_color(rgb(0xff9b88)).child(reason))
@@ -10447,13 +10467,16 @@ impl Render for AxisShell {
                         .w(px(viewport_width))
                         .h(px(viewport_height))
                         .debug_selector(|| "agent-provider-popup-backdrop".to_string())
-                        .bg(rgba(0x091016b8))
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                            if this.dismiss_agent_provider_popup() {
-                                cx.notify();
-                            }
-                            cx.stop_propagation();
-                        }))
+                        .bg(shell_scrim_soft())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if this.dismiss_agent_provider_popup() {
+                                    cx.notify();
+                                }
+                                cx.stop_propagation();
+                            }),
+                        )
                         .on_scroll_wheel(|_, _, cx| {
                             cx.stop_propagation();
                         }),
@@ -10469,11 +10492,10 @@ impl Render for AxisShell {
                         .flex_col()
                         .gap_3()
                         .p_4()
-                        .bg(rgb(0x0f151b))
+                        .bg(shell_panel_bg())
                         .border_1()
-                        .border_color(rgb(0x2c3944))
+                        .border_color(shell_border())
                         .rounded_xl()
-                        .shadow_lg()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
                         })
@@ -10491,34 +10513,31 @@ impl Render for AxisShell {
                                 .flex()
                                 .flex_col()
                                 .gap_1()
-                                .child(div().text_xs().text_color(rgb(0x7cc7ff)).child("Start Agent"))
-                                .child(div().text_lg().child("Choose a provider"))
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(0x90a0aa))
-                                        .child("Pick an installed backend before opening a new agent pane."),
-                                ),
+                                        .text_color(rgb(0x7cc7ff))
+                                        .child("Start Agent"),
+                                )
+                                .child(div().text_lg().child("Choose a provider"))
+                                .child(div().text_xs().text_color(shell_text_secondary()).child(
+                                    "Pick an installed backend before opening a new agent pane.",
+                                )),
                         )
                         .child(div().flex().flex_col().gap_2().children(option_rows))
                         .when_some(popup.empty_state_message(), |panel, message| {
                             panel.child(div().text_xs().text_color(rgb(0xff9b88)).child(message))
                         })
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .child(control_button(
-                                    "Cancel",
-                                    rgb(0x7f8a94).into(),
-                                    cx.listener(|this, _, _, cx| {
-                                        if this.dismiss_agent_provider_popup() {
-                                            cx.notify();
-                                        }
-                                        cx.stop_propagation();
-                                    }),
-                                )),
-                        ),
+                        .child(div().flex().justify_end().child(control_button(
+                            "Cancel",
+                            rgb(0x7f8a94).into(),
+                            cx.listener(|this, _, _, cx| {
+                                if this.dismiss_agent_provider_popup() {
+                                    cx.notify();
+                                }
+                                cx.stop_propagation();
+                            }),
+                        ))),
                 )
         });
         let workdesk_editor_overlay = self.workdesk_editor.as_ref().map(|editor| {
@@ -10581,7 +10600,7 @@ impl Render for AxisShell {
                         .top(px(0.0))
                         .w(px(viewport_width))
                         .h(px(viewport_height))
-                        .bg(rgba(0x091016a6))
+                        .bg(shell_scrim())
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                             this.close_workdesk_editor(cx);
                             cx.stop_propagation();
@@ -10605,11 +10624,10 @@ impl Render for AxisShell {
                         .flex_col()
                         .gap_3()
                         .p_4()
-                        .bg(rgb(0x0f151b))
+                        .bg(shell_panel_bg())
                         .border_1()
-                        .border_color(rgb(0x2c3944))
+                        .border_color(shell_border())
                         .rounded_xl()
-                        .shadow_lg()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
                         })
@@ -10634,7 +10652,7 @@ impl Render for AxisShell {
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .text_color(rgb(0x90a0aa))
+                                                .text_color(shell_text_secondary())
                                                 .child(
                                                     "Tab switches fields. Enter saves. Escape cancels.",
                                                 ),
@@ -10658,7 +10676,7 @@ impl Render for AxisShell {
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(0x90a0aa))
+                                            .text_color(shell_text_secondary())
                                             .child("Templates"),
                                     )
                                     .children(template_cards),
@@ -10695,7 +10713,7 @@ impl Render for AxisShell {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(0x7f8a94))
+                                        .text_color(shell_text_muted())
                                         .child(match editor.mode {
                                             WorkdeskEditorMode::Create => {
                                                 "Shortcut quick-create still makes a Shell Desk."
@@ -10739,8 +10757,8 @@ impl Render for AxisShell {
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(0x11161b))
-            .text_color(rgb(0xf7efe5))
+            .bg(shell_window_bg())
+            .text_color(shell_text_primary())
             .track_focus(&self.focus_handle)
             .on_touch(move |event, window, cx| {
                 touch_entity.update(cx, |this, cx| {
@@ -10793,10 +10811,9 @@ impl Render for AxisShell {
                     })
                     .pb_3()
                     .pt(px(14.0 + sidebar_header_inset))
-                    .bg(rgb(0x0d1217))
+                    .bg(shell_sidebar_bg())
                     .border_r_1()
-                    .border_color(rgb(0x22303a))
-                    .shadow_lg()
+                    .border_color(shell_border())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
@@ -10907,18 +10924,19 @@ impl Render for AxisShell {
             .child(
                 div()
                     .absolute()
-                    .left(px(sidebar_width))
-                    .bottom(px(0.0))
-                    .w(px((viewport_width - sidebar_width).max(240.0)))
+                    .left(px(dock_left))
+                    .bottom(px(FLOATING_DOCK_MARGIN))
+                    .w(px(dock_width))
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
                     .px_3()
-                    .py_1()
-                    .bg(rgba(0x0d1217f0))
-                    .border_t_1()
-                    .border_color(rgb(0x25303a))
+                    .py_2()
+                    .bg(rgba(0x0c1014ec))
+                    .border_1()
+                    .border_color(shell_border())
+                    .rounded_xl()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
@@ -10935,9 +10953,9 @@ impl Render for AxisShell {
                                     .max_w(px(260.0))
                                     .text_xs()
                                     .text_color(if stack_controls_enabled {
-                                        rgb(0x97a4ad)
+                                        shell_text_secondary()
                                     } else {
-                                        rgb(0x697680)
+                                        shell_text_muted()
                                     })
                                     .overflow_hidden()
                                     .whitespace_nowrap()
@@ -10949,7 +10967,9 @@ impl Render for AxisShell {
                                     .flex()
                                     .items_center()
                                     .gap_1()
-                                    .child(div().text_xs().text_color(rgb(0x63707a)).child("New"))
+                                    .child(
+                                        div().text_xs().text_color(shell_text_muted()).child("New"),
+                                    )
                                     .child(compact_dock_button(
                                         "+Sh",
                                         rgb(0xe59a49).into(),
@@ -11079,7 +11099,7 @@ impl Render for AxisShell {
                         .top(px(0.0))
                         .w(px(viewport_width))
                         .h(px(viewport_height))
-                        .bg(rgba(0x09101680))
+                        .bg(shell_scrim())
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
@@ -11100,11 +11120,10 @@ impl Render for AxisShell {
                         .flex_col()
                         .gap_3()
                         .p_4()
-                        .bg(rgb(0x0f151b))
+                        .bg(shell_panel_bg())
                         .border_1()
-                        .border_color(rgb(0x2c3944))
+                        .border_color(shell_border())
                         .rounded_xl()
-                        .shadow_lg()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
                         })
@@ -11126,9 +11145,15 @@ impl Render for AxisShell {
                                                 .child("Developer Inspector"),
                                         )
                                         .child(div().text_lg().child("Debug surface"))
-                                        .child(div().text_xs().text_color(rgb(0x90a0aa)).child(
-                                            format!("Toggle with {}", inspector_toggle_label),
-                                        )),
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(shell_text_secondary())
+                                                .child(format!(
+                                                    "Toggle with {}",
+                                                    inspector_toggle_label
+                                                )),
+                                        ),
                                 )
                                 .child(compact_dock_button(
                                     "Close",
@@ -11156,14 +11181,20 @@ impl Render for AxisShell {
                         ),
                 )
             })
-            .when_some(session_inspector_overlay, |root, overlay| root.child(overlay))
-            .when_some(workspace_palette_overlay, |root, overlay| root.child(overlay))
+            .when_some(session_inspector_overlay, |root, overlay| {
+                root.child(overlay)
+            })
+            .when_some(workspace_palette_overlay, |root, overlay| {
+                root.child(overlay)
+            })
             .when_some(review_panel_overlay, |root, overlay| root.child(overlay))
             .children(shortcut_overlay)
             .when_some(workdesk_editor_overlay, |root, overlay| root.child(overlay))
             .when_some(notification_overlay, |root, overlay| root.child(overlay))
             .when_some(stack_surface_context_menu, |root, menu| root.child(menu))
-            .when_some(agent_provider_popup_overlay, |root, overlay| root.child(overlay))
+            .when_some(agent_provider_popup_overlay, |root, overlay| {
+                root.child(overlay)
+            })
             .when_some(workdesk.runtime_notice.clone(), |root, notice| {
                 root.child(
                     div()
@@ -11173,11 +11204,10 @@ impl Render for AxisShell {
                         .max_w(px(420.0))
                         .px_3()
                         .py_3()
-                        .bg(rgb(0x2a1a1a))
+                        .bg(shell_panel_bg())
                         .border_1()
                         .border_color(rgb(0x5b3434))
                         .rounded_lg()
-                        .shadow_lg()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
                         })
@@ -11320,10 +11350,7 @@ fn install_quit_on_last_window_closed(cx: &mut App) {
     install_quit_on_last_window_closed_with(cx, |cx| cx.quit());
 }
 
-fn install_quit_on_last_window_closed_with(
-    cx: &mut App,
-    mut quit: impl FnMut(&mut App) + 'static,
-) {
+fn install_quit_on_last_window_closed_with(cx: &mut App, mut quit: impl FnMut(&mut App) + 'static) {
     cx.on_window_closed(move |cx| {
         if cx.windows().is_empty() {
             quit(cx);
@@ -12124,6 +12151,70 @@ fn shutdown_workdesk_terminals(workdesk: &mut WorkdeskState) {
     workdesk.editor_views.clear();
 }
 
+fn shell_window_bg() -> gpui::Hsla {
+    rgb(0x0f1317).into()
+}
+
+fn shell_sidebar_bg() -> gpui::Hsla {
+    rgb(0x0b1014).into()
+}
+
+fn shell_panel_bg() -> gpui::Hsla {
+    rgb(0x10151a).into()
+}
+
+fn shell_panel_bg_active() -> gpui::Hsla {
+    rgb(0x141a21).into()
+}
+
+fn shell_panel_bg_raised() -> gpui::Hsla {
+    rgb(0x12181e).into()
+}
+
+fn shell_chip_bg() -> gpui::Hsla {
+    rgb(0x0d1217).into()
+}
+
+fn shell_border() -> gpui::Hsla {
+    rgb(0x222d36).into()
+}
+
+fn shell_border_strong() -> gpui::Hsla {
+    rgb(0x2a3640).into()
+}
+
+fn shell_scrim_soft() -> gpui::Hsla {
+    rgba(0x08101572).into()
+}
+
+fn shell_scrim() -> gpui::Hsla {
+    rgba(0x08101596).into()
+}
+
+fn shell_scrim_heavy() -> gpui::Hsla {
+    rgba(0x081015c8).into()
+}
+
+fn shell_text_primary() -> gpui::Hsla {
+    rgb(0xe2e7eb).into()
+}
+
+fn shell_text_secondary() -> gpui::Hsla {
+    rgb(0x97a1a9).into()
+}
+
+fn shell_text_muted() -> gpui::Hsla {
+    rgb(0x707a84).into()
+}
+
+fn shell_button_bg(active: bool) -> gpui::Hsla {
+    if active {
+        shell_panel_bg_active()
+    } else {
+        shell_panel_bg_raised()
+    }
+}
+
 fn workdesk_card(
     index: usize,
     desk: &WorkdeskState,
@@ -12150,12 +12241,12 @@ fn workdesk_card(
     } else if attention_summary.unread_count > 0 {
         attention_tint
     } else {
-        rgb(0x24313b).into()
+        shell_border()
     };
     let background = if is_active || is_menu_open {
-        rgb(0x131b22)
+        shell_panel_bg_active()
     } else {
-        rgb(0x0f151b)
+        shell_panel_bg()
     };
     let focus_label = if desk.active_pane.is_some() {
         desk.active_pane_title()
@@ -12230,12 +12321,12 @@ fn workdesk_card(
     div()
         .flex()
         .flex_col()
-        .gap_1()
-        .p_2()
+        .gap_2()
+        .p_3()
         .bg(background)
         .border_1()
         .border_color(border)
-        .rounded_lg()
+        .rounded_xl()
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
@@ -12271,7 +12362,7 @@ fn workdesk_card(
                                 .px_2()
                                 .py(px(2.0))
                                 .rounded_full()
-                                .bg(rgb(0x0c1116))
+                                .bg(shell_chip_bg())
                                 .text_xs()
                                 .text_color(accent)
                                 .child(deck_label),
@@ -12282,7 +12373,7 @@ fn workdesk_card(
                                     .px_2()
                                     .py(px(2.0))
                                     .rounded_full()
-                                    .bg(rgb(0x0c1116))
+                                    .bg(shell_chip_bg())
                                     .border_1()
                                     .border_color(attention_tint)
                                     .text_xs()
@@ -12295,9 +12386,9 @@ fn workdesk_card(
                                 .px_2()
                                 .py(px(2.0))
                                 .rounded_full()
-                                .bg(rgb(0x0c1116))
+                                .bg(shell_chip_bg())
                                 .text_xs()
-                                .text_color(rgb(0x9da8b1))
+                                .text_color(shell_text_secondary())
                                 .child(live_label),
                         )
                         .child(
@@ -12309,12 +12400,17 @@ fn workdesk_card(
                                 .h(px(22.0))
                                 .px_2()
                                 .cursor_pointer()
-                                .bg(rgb(0x171d24))
+                                .bg(shell_button_bg(false))
                                 .border_1()
-                                .border_color(rgb(0x2b3641))
+                                .border_color(shell_border())
                                 .rounded_md()
                                 .on_mouse_down(MouseButton::Left, edit_listener)
-                                .child(div().text_xs().text_color(rgb(0x9da8b1)).child("Edit")),
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(shell_text_secondary())
+                                        .child("Edit"),
+                                ),
                         )
                         .child(
                             div()
@@ -12324,22 +12420,23 @@ fn workdesk_card(
                                 .w(px(22.0))
                                 .h(px(22.0))
                                 .bg(if is_menu_open {
-                                    rgb(0x1c2730)
+                                    shell_panel_bg_active()
                                 } else {
-                                    rgb(0x0c1116)
+                                    shell_chip_bg()
                                 })
                                 .border_1()
-                                .border_color(if is_menu_open {
-                                    accent
-                                } else {
-                                    rgb(0x24313b).into()
-                                })
+                                .border_color(if is_menu_open { accent } else { shell_border() })
                                 .rounded_md()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })
                                 .on_mouse_up(MouseButton::Left, menu_button_listener)
-                                .child(div().text_xs().text_color(rgb(0x9da8b1)).child("•••")),
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(shell_text_secondary())
+                                        .child("•••"),
+                                ),
                         ),
                 ),
         )
@@ -12347,7 +12444,7 @@ fn workdesk_card(
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x9aa6af))
+                .text_color(shell_text_secondary())
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .child(preview_label),
@@ -12355,7 +12452,7 @@ fn workdesk_card(
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x6f7c86))
+                .text_color(shell_text_muted())
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .child(meta_line),
@@ -12416,7 +12513,7 @@ fn workdesk_card(
                     .children(review_files.into_iter().map(|path| {
                         div()
                             .text_xs()
-                            .text_color(rgb(0x9aa6af))
+                            .text_color(shell_text_secondary())
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .child(path)
@@ -12424,18 +12521,12 @@ fn workdesk_card(
             )
         })
         .when(desk_has_review_entries(desk), |card| {
-                card.child(
-                    div()
-                        .flex()
-                        .justify_end()
-                        .child(control_button(
-                            "Review",
-                            rgb(0x7cc7ff).into(),
-                            review_listener,
-                        )),
-                )
-            },
-        )
+            card.child(div().flex().justify_end().child(control_button(
+                "Review",
+                rgb(0x7cc7ff).into(),
+                review_listener,
+            )))
+        })
         .when_some(navigation_target.clone(), |card, target| {
             card.child(
                 div()
@@ -12466,7 +12557,7 @@ fn workdesk_card(
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(0xd5dde3))
+                                            .text_color(shell_text_primary())
                                             .overflow_hidden()
                                             .whitespace_nowrap()
                                             .child(target.label),
@@ -12475,7 +12566,7 @@ fn workdesk_card(
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x7f8a94))
+                                    .text_color(shell_text_muted())
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .child(target.detail),
@@ -12496,7 +12587,12 @@ fn workdesk_card(
                         .items_center()
                         .gap_2()
                         .child(attention_indicator(focus_attention, false))
-                        .child(div().text_xs().text_color(rgb(0x7f8a94)).child(focus_label)),
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(shell_text_muted())
+                                .child(focus_label),
+                        ),
                 ),
             )
         })
@@ -12518,7 +12614,7 @@ fn workdesk_compact_chip(
     } else if attention_summary.unread_count > 0 {
         attention_summary.highest.tint()
     } else {
-        rgb(0x24313b).into()
+        shell_border()
     };
     let review_button_id = SharedString::from(format!("workdesk-compact-review-{index}"));
     div()
@@ -12531,13 +12627,13 @@ fn workdesk_compact_chip(
         .min_h(px(56.0))
         .p_2()
         .bg(if is_active {
-            rgb(0x141c23)
+            shell_panel_bg_active()
         } else {
-            rgb(0x0f151b)
+            shell_panel_bg()
         })
         .border_1()
         .border_color(border)
-        .rounded_lg()
+        .rounded_xl()
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
@@ -12557,7 +12653,7 @@ fn workdesk_compact_chip(
                 .text_color(if is_active {
                     accent
                 } else {
-                    rgb(0x9da8b1).into()
+                    shell_text_secondary()
                 })
                 .child(format!("{:02}", index + 1)),
         )
@@ -12569,7 +12665,7 @@ fn workdesk_compact_chip(
                     .px_1()
                     .py(px(1.0))
                     .rounded_md()
-                    .bg(rgb(0x171d24))
+                    .bg(shell_chip_bg())
                     .border_1()
                     .border_color(accent)
                     .cursor_pointer()
@@ -12588,15 +12684,11 @@ fn workdesk_template_card(
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let accent = template.accent();
-    let border = if selected {
-        accent
-    } else {
-        rgb(0x293742).into()
-    };
+    let border = if selected { accent } else { shell_border() };
     let background = if selected {
-        rgb(0x17212a)
+        shell_panel_bg_active()
     } else {
-        rgb(0x121920)
+        shell_panel_bg_raised()
     };
 
     div()
@@ -12617,7 +12709,7 @@ fn workdesk_template_card(
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x90a0aa))
+                .text_color(shell_text_secondary())
                 .child(template.summary()),
         )
 }
@@ -12630,12 +12722,16 @@ fn workdesk_editor_field(
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let label = label.to_string();
-    let border = if active { accent } else { rgb(0x293742).into() };
-    let background = if active { rgb(0x16212a) } else { rgb(0x121920) };
-    let text_tint: gpui::Hsla = if value.is_empty() {
-        rgb(0x67737d).into()
+    let border = if active { accent } else { shell_border() };
+    let background = if active {
+        shell_panel_bg_active()
     } else {
-        rgb(0xe4ebf1).into()
+        shell_panel_bg_raised()
+    };
+    let text_tint: gpui::Hsla = if value.is_empty() {
+        shell_text_muted()
+    } else {
+        shell_text_primary()
     };
     let placeholder = format!("{label}...");
 
@@ -12684,16 +12780,21 @@ fn workdesk_menu_item(
         .px_3()
         .py_2()
         .cursor_pointer()
-        .bg(rgb(0x171f26))
+        .bg(shell_panel_bg_raised())
         .border_1()
-        .border_color(rgb(0x293742))
+        .border_color(shell_border())
         .rounded_md()
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
         .on_mouse_up(MouseButton::Left, listener)
         .child(div().text_sm().text_color(accent).child(label))
-        .child(div().text_xs().text_color(rgb(0x90a0aa)).child(detail))
+        .child(
+            div()
+                .text_xs()
+                .text_color(shell_text_secondary())
+                .child(detail),
+        )
 }
 
 fn shortcut_group_accent(group: ShortcutGroup) -> gpui::Hsla {
@@ -12712,8 +12813,12 @@ fn shortcut_binding_button(
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let label = label.to_string();
-    let background = if active { rgb(0x1f2d36) } else { rgb(0x171d24) };
-    let border = if active { accent } else { rgb(0x2b3641).into() };
+    let background = if active {
+        shell_panel_bg_active()
+    } else {
+        shell_button_bg(false)
+    };
+    let border = if active { accent } else { shell_border() };
 
     div()
         .flex()
@@ -12744,15 +12849,11 @@ fn shortcut_row(
 ) -> impl IntoElement {
     let accent = shortcut_group_accent(action.group());
     let background = if is_recording {
-        rgb(0x182028)
+        shell_panel_bg_active()
     } else {
-        rgb(0x121920)
+        shell_panel_bg_raised()
     };
-    let border = if is_recording {
-        accent
-    } else {
-        rgb(0x24313b).into()
-    };
+    let border = if is_recording { accent } else { shell_border() };
 
     div()
         .flex()
@@ -12773,7 +12874,7 @@ fn shortcut_row(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x90a0aa))
+                        .text_color(shell_text_secondary())
                         .child(action.description()),
                 ),
         )
@@ -12818,10 +12919,10 @@ fn control_button(
         .px_3()
         .py_2()
         .cursor_pointer()
-        .bg(rgb(0x171d24))
+        .bg(shell_button_bg(false))
         .border_1()
-        .border_color(rgb(0x2b3641))
-        .rounded_lg()
+        .border_color(shell_border())
+        .rounded_md()
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
@@ -12845,20 +12946,16 @@ fn compact_dock_button_stateful(
 ) -> impl IntoElement {
     let label = label.to_string();
     let background = if enabled {
-        rgb(0x161d24)
+        shell_button_bg(false)
     } else {
-        rgb(0x12181e)
+        shell_panel_bg()
     };
     let border: gpui::Hsla = if enabled {
-        rgb(0x2b3641).into()
+        shell_border()
     } else {
-        rgb(0x22303a).into()
+        shell_border()
     };
-    let text_color = if enabled {
-        accent
-    } else {
-        rgb(0x56626c).into()
-    };
+    let text_color = if enabled { accent } else { shell_text_muted() };
 
     div()
         .flex()
@@ -12891,6 +12988,10 @@ fn brand_icon_badge(compact: bool) -> impl IntoElement {
         .justify_center()
         .w(px(badge_size))
         .h(px(badge_size))
+        .rounded_lg()
+        .bg(shell_chip_bg())
+        .border_1()
+        .border_color(shell_border())
         .child(img(BRAND_ICON_ASSET).size(px(badge_size)))
 }
 
@@ -12902,8 +13003,12 @@ fn chrome_button(
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let label = label.to_string();
-    let background = if active { rgb(0x1b2730) } else { rgb(0x161d24) };
-    let border = if active { accent } else { rgb(0x2b3641).into() };
+    let background = if active {
+        shell_panel_bg_active()
+    } else {
+        shell_button_bg(false)
+    };
+    let border = if active { accent } else { shell_border() };
     let badge_label = badge.and_then(|value| {
         if value == 0 {
             None
@@ -12919,8 +13024,8 @@ fn chrome_button(
         .flex()
         .items_center()
         .justify_center()
-        .min_w(px(28.0))
-        .h(px(24.0))
+        .min_w(px(30.0))
+        .h(px(26.0))
         .px_2()
         .cursor_pointer()
         .bg(background)
@@ -12946,10 +13051,10 @@ fn chrome_button(
                     .items_center()
                     .justify_center()
                     .rounded_full()
-                    .bg(rgb(0x7cc7ff))
+                    .bg(accent)
                     .border_1()
-                    .border_color(rgb(0x0d1217))
-                    .child(div().text_xs().text_color(rgb(0x071015)).child(badge)),
+                    .border_color(shell_window_bg())
+                    .child(div().text_xs().text_color(shell_window_bg()).child(badge)),
             )
         })
 }
@@ -12961,8 +13066,12 @@ fn compact_toggle_button(
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let label = label.to_string();
-    let background = if active { rgb(0x1d2730) } else { rgb(0x161d24) };
-    let border = if active { accent } else { rgb(0x2b3641).into() };
+    let background = if active {
+        shell_panel_bg_active()
+    } else {
+        shell_button_bg(false)
+    };
+    let border = if active { accent } else { shell_border() };
 
     div()
         .flex()
@@ -12980,11 +13089,20 @@ fn compact_toggle_button(
             cx.stop_propagation();
         })
         .on_mouse_up(MouseButton::Left, listener)
-        .child(div().text_xs().text_color(accent).child(label))
+        .child(
+            div()
+                .text_xs()
+                .text_color(if active {
+                    accent
+                } else {
+                    shell_text_secondary()
+                })
+                .child(label),
+        )
 }
 
 fn dock_divider() -> impl IntoElement {
-    div().w(px(1.0)).h(px(24.0)).bg(rgb(0x2b3641))
+    div().w(px(1.0)).h(px(20.0)).bg(shell_border())
 }
 
 fn notification_item(
@@ -13005,10 +13123,14 @@ fn notification_item(
         .flex_col()
         .gap_1()
         .p_3()
-        .bg(if unread { rgb(0x131c25) } else { rgb(0x10171d) })
+        .bg(if unread {
+            shell_panel_bg_active()
+        } else {
+            shell_panel_bg_raised()
+        })
         .border_1()
-        .border_color(if unread { accent } else { rgb(0x24313b).into() })
-        .rounded_lg()
+        .border_color(if unread { accent } else { shell_border() })
+        .rounded_xl()
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
@@ -13024,8 +13146,18 @@ fn notification_item(
                     row.child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(accent))
                 }),
         )
-        .child(div().text_xs().text_color(rgb(0x7f8a94)).child(context))
-        .child(div().text_xs().text_color(rgb(0x95a3ad)).child(detail))
+        .child(
+            div()
+                .text_xs()
+                .text_color(shell_text_muted())
+                .child(context),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(shell_text_secondary())
+                .child(detail),
+        )
 }
 
 fn workspace_palette_result_row(
@@ -13057,14 +13189,18 @@ fn workspace_palette_result_row(
         .flex_col()
         .gap_1()
         .p_3()
-        .bg(if selected { rgb(0x17212a) } else { rgb(0x10171d) })
+        .bg(if selected {
+            shell_panel_bg_active()
+        } else {
+            shell_panel_bg_raised()
+        })
         .border_1()
         .border_color(if selected {
             rgb(0x7cc7ff)
         } else {
-            rgb(0x24313b)
+            shell_border()
         })
-        .rounded_lg()
+        .rounded_xl()
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
@@ -13078,7 +13214,7 @@ fn workspace_palette_result_row(
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(0xdce2e8))
+                        .text_color(shell_text_primary())
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .child(title),
@@ -13088,7 +13224,7 @@ fn workspace_palette_result_row(
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x8e9ba5))
+                .text_color(shell_text_secondary())
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .child(detail),
@@ -13105,9 +13241,14 @@ fn status_chip(label: &str, value: String) -> impl IntoElement {
         .px_2()
         .py_1()
         .rounded_full()
-        .bg(rgb(0x171d24))
-        .child(div().text_xs().text_color(rgb(0x7f8a94)).child(label))
-        .child(div().text_xs().text_color(rgb(0xdce2e8)).child(value))
+        .bg(shell_chip_bg())
+        .child(div().text_xs().text_color(shell_text_muted()).child(label))
+        .child(
+            div()
+                .text_xs()
+                .text_color(shell_text_primary())
+                .child(value),
+        )
 }
 
 fn context_pill(value: impl Into<String>, tint: gpui::Hsla) -> impl IntoElement {
@@ -13120,9 +13261,9 @@ fn context_pill(value: impl Into<String>, tint: gpui::Hsla) -> impl IntoElement 
         .px_2()
         .py_1()
         .rounded_full()
-        .bg(rgb(0x151c23))
+        .bg(shell_chip_bg())
         .border_1()
-        .border_color(rgb(0x2b3641))
+        .border_color(shell_border())
         .child(div().text_xs().text_color(tint).child(value))
 }
 
@@ -13135,11 +13276,11 @@ fn inspector_row(label: &str, value: impl Into<String>) -> impl IntoElement {
         .justify_between()
         .items_start()
         .gap_4()
-        .child(div().text_xs().text_color(rgb(0x7f8a94)).child(label))
+        .child(div().text_xs().text_color(shell_text_muted()).child(label))
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0xdce2e8))
+                .text_color(shell_text_primary())
                 .max_w(px(220.0))
                 .text_right()
                 .child(value),
@@ -13167,13 +13308,17 @@ fn agent_inspector_action_button(
 ) -> impl IntoElement {
     let label = label.to_string();
     let detail = detail.to_string();
-    let background = if enabled { rgb(0x16212a) } else { rgb(0x11181e) };
-    let border = if enabled { accent } else { rgb(0x293742).into() };
-    let label_tint = if enabled { accent } else { rgb(0x67737d).into() };
-    let detail_tint = if enabled {
-        rgb(0xd5dee6)
+    let background = if enabled {
+        shell_panel_bg_active()
     } else {
-        rgb(0x6f7b85)
+        shell_panel_bg_raised()
+    };
+    let border = if enabled { accent } else { shell_border() };
+    let label_tint = if enabled { accent } else { shell_text_muted() };
+    let detail_tint = if enabled {
+        shell_text_primary()
+    } else {
+        shell_text_muted()
     };
 
     div()
@@ -13213,9 +13358,9 @@ fn agent_timeline_entry_card(entry: AgentTimelineEntryView) -> impl IntoElement 
         .flex_col()
         .gap_2()
         .p_3()
-        .bg(rgb(0x10171d))
+        .bg(shell_panel_bg_raised())
         .border_1()
-        .border_color(rgb(0x24313b))
+        .border_color(shell_border())
         .rounded_lg()
         .child(
             div()
@@ -13223,10 +13368,20 @@ fn agent_timeline_entry_card(entry: AgentTimelineEntryView) -> impl IntoElement 
                 .justify_between()
                 .items_center()
                 .gap_3()
-                .child(div().text_sm().text_color(rgb(0xe4ebf1)).child(title))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(shell_text_primary())
+                        .child(title),
+                )
                 .child(context_pill(state_label, tint)),
         )
-        .child(div().text_xs().text_color(rgb(0xc9d3dc)).child(body))
+        .child(
+            div()
+                .text_xs()
+                .text_color(shell_text_secondary())
+                .child(body),
+        )
 }
 
 fn agent_pending_approval_card(
@@ -13244,8 +13399,18 @@ fn agent_pending_approval_card(
         .border_1()
         .border_color(rgb(0x5b4330))
         .rounded_lg()
-        .child(div().text_sm().text_color(rgb(0xf0d35f)).child(approval.title))
-        .child(div().text_xs().text_color(rgb(0xe4d4c5)).child(approval.details))
+        .child(
+            div()
+                .text_sm()
+                .text_color(rgb(0xf0d35f))
+                .child(approval.title),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0xe4d4c5))
+                .child(approval.details),
+        )
         .when(actionable, |card| {
             card.child(
                 div()
@@ -13470,12 +13635,12 @@ fn expose_card(
     let border = if is_active {
         accent
     } else {
-        rgb(0x2b3842).into()
+        shell_border_strong()
     };
     let background = if is_active {
-        rgb(0x182028)
+        shell_panel_bg_active()
     } else {
-        rgb(0x131a20)
+        shell_panel_bg()
     };
     let width = (pane.size.width * layout.scale).max(140.0);
     let height = (pane.size.height * layout.scale).max(92.0);
@@ -13519,7 +13684,7 @@ fn expose_card(
                             .px_2()
                             .py_1()
                             .rounded_full()
-                            .bg(rgb(0x0d1217))
+                            .bg(shell_chip_bg())
                             .text_xs()
                             .text_color(rgb(0xf0d35f))
                             .child("Active"),
@@ -13527,7 +13692,12 @@ fn expose_card(
                 }),
         )
         .child(div().text_sm().child(pane.title.clone()))
-        .child(div().text_xs().text_color(rgb(0x90a0aa)).child(subtitle))
+        .child(
+            div()
+                .text_xs()
+                .text_color(shell_text_secondary())
+                .child(subtitle),
+        )
 }
 
 fn pane_center(pane: &PaneRecord) -> WorkdeskPoint {
@@ -14080,9 +14250,9 @@ fn browser_preview_card(
         .justify_between()
         .gap_4()
         .p_4()
-        .bg(rgb(0x0f151a))
+        .bg(shell_panel_bg())
         .border_1()
-        .border_color(rgb(0x24303a))
+        .border_color(shell_border())
         .rounded_md()
         .child(
             div()
@@ -14094,7 +14264,7 @@ fn browser_preview_card(
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(0xa8b5be))
+                        .text_color(shell_text_secondary())
                         .child(url.to_string()),
                 ),
         )
@@ -14828,10 +14998,10 @@ fn control_input_bytes(key: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axis_core::automation::AutomationResponse;
-    use axis_core::paths::AXIS_SOCKET_PATH_ENV;
     use axis_agent_runtime::adapters::fake::FakeProvider;
     use axis_agent_runtime::ProviderRegistry;
+    use axis_core::automation::AutomationResponse;
+    use axis_core::paths::AXIS_SOCKET_PATH_ENV;
     use gpui::TestAppContext;
     use std::cell::Cell;
     use std::ffi::OsString;
@@ -14915,8 +15085,9 @@ mod tests {
                                 .read_line(&mut line)
                                 .expect("fake daemon should read request");
                         }
-                        let payload = serde_json::to_vec(&AutomationResponse::failure(error.clone()))
-                            .expect("fake daemon response should serialize");
+                        let payload =
+                            serde_json::to_vec(&AutomationResponse::failure(error.clone()))
+                                .expect("fake daemon response should serialize");
                         stream
                             .write_all(&payload)
                             .expect("fake daemon response should write");
@@ -14926,7 +15097,8 @@ mod tests {
                         stream.flush().expect("fake daemon response should flush");
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        if handled > 0 && last_activity.elapsed() > std::time::Duration::from_millis(250)
+                        if handled > 0
+                            && last_activity.elapsed() > std::time::Duration::from_millis(250)
                         {
                             break;
                         }
@@ -15241,7 +15413,7 @@ mod tests {
                 automation::start_automation_server_at(PathBuf::from(format!(
                     "/tmp/axis-app-review-{socket_token}.sock"
                 )))
-                    .expect("automation server should start"),
+                .expect("automation server should start"),
                 view_cx.focus_handle(),
                 SharedString::from(""),
                 SharedString::from(""),
@@ -15270,13 +15442,15 @@ mod tests {
                     "unexpected error: {error}"
                 );
                 assert!(
-                    shell.workdesks
+                    shell
+                        .workdesks
                         .iter()
                         .all(|desk| desk.review_payload_cache.is_none()),
                     "app path should not synthesize a fallback payload on semantic daemon errors"
                 );
                 assert!(
-                    shell.workdesks
+                    shell
+                        .workdesks
                         .iter()
                         .all(|desk| desk.review_summary.is_none()),
                     "app path should not silently project a fallback review summary"
@@ -15481,9 +15655,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn popup_selection_starts_requested_provider_for_stack_target(
-        cx: &mut TestAppContext,
-    ) {
+    async fn popup_selection_starts_requested_provider_for_stack_target(cx: &mut TestAppContext) {
         use std::sync::Arc;
 
         let window = cx.add_empty_window();
@@ -16470,9 +16642,7 @@ mod tests {
     }
 
     fn review_payload_single_text_file(root: &str) -> DeskReviewPayload {
-        use axis_core::review::{
-            ReviewFileChangeKind, ReviewFileDiff, ReviewHunk, ReviewLine,
-        };
+        use axis_core::review::{ReviewFileChangeKind, ReviewFileDiff, ReviewHunk, ReviewLine};
         DeskReviewPayload {
             worktree_id: WorktreeId::new(root.to_string()),
             summary: review_test_summary(),
@@ -16526,9 +16696,7 @@ mod tests {
     }
 
     fn review_payload_removal_anchor(root: &str) -> DeskReviewPayload {
-        use axis_core::review::{
-            ReviewFileChangeKind, ReviewFileDiff, ReviewHunk, ReviewLine,
-        };
+        use axis_core::review::{ReviewFileChangeKind, ReviewFileDiff, ReviewHunk, ReviewLine};
         DeskReviewPayload {
             worktree_id: WorktreeId::new(root.to_string()),
             summary: review_test_summary(),
@@ -16603,9 +16771,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn review_panel_opens_from_reviewable_desk_selects_first_file(
-        cx: &mut TestAppContext,
-    ) {
+    async fn review_panel_opens_from_reviewable_desk_selects_first_file(cx: &mut TestAppContext) {
         let root = std::env::temp_dir().join(format!(
             "axis-review-open-{}-{}",
             std::process::id(),
@@ -16919,8 +17085,7 @@ mod tests {
         ));
         fs::create_dir_all(root.join("src")).expect("fixture directory should exist");
         let file_path = root.join("src/demo.rs");
-        fs::write(&file_path, "one\ntwo\nthree\n")
-            .expect("fixture file should write");
+        fs::write(&file_path, "one\ntwo\nthree\n").expect("fixture file should write");
         let root_string = root.display().to_string();
         let file_path_string = file_path.display().to_string();
         let payload = review_payload_removal_anchor(&root_string);
@@ -16992,8 +17157,10 @@ mod tests {
         let (shell, window) = cx.add_window_view(|_, view_cx| {
             let mut desk = blank_workdesk("Desk", "Summary");
             desk.metadata.cwd = root_string.clone();
-            desk.worktree_binding =
-                Some(worktrees::binding_from_desk_paths(root_string.clone(), "main"));
+            desk.worktree_binding = Some(worktrees::binding_from_desk_paths(
+                root_string.clone(),
+                "main",
+            ));
             AxisShell::new_with_agent_runtime(
                 vec![desk],
                 0,
@@ -17469,6 +17636,9 @@ mod tests {
             window.remove_window();
         });
 
-        assert!(did_quit.get(), "closing the last window should quit the app");
+        assert!(
+            did_quit.get(),
+            "closing the last window should quit the app"
+        );
     }
 }

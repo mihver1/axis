@@ -10,7 +10,7 @@ use axis_core::agent_history::{
     AgentTurnState,
 };
 use axis_core::automation::{
-    AgentGetRequest, AgentResumeRequest, AgentRespondApprovalRequest, AgentSendTurnRequest,
+    AgentGetRequest, AgentRespondApprovalRequest, AgentResumeRequest, AgentSendTurnRequest,
     AutomationRequest,
 };
 use axis_core::SurfaceId;
@@ -149,7 +149,10 @@ fn automation_request_encodes_agent_structured_actions() {
 
     let turn_json = serde_json::to_value(&send_turn).unwrap();
     assert_eq!(turn_json["method"], "agent.send_turn");
-    assert_eq!(turn_json["params"]["text"], "Continue and explain the diff.");
+    assert_eq!(
+        turn_json["params"]["text"],
+        "Continue and explain the diff."
+    );
 
     let approve_json = serde_json::to_value(&approve).unwrap();
     assert_eq!(approve_json["method"], "agent.respond_approval");

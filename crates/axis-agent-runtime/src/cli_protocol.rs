@@ -2,7 +2,9 @@
 
 use anyhow::Context;
 use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionId};
-use axis_core::agent_history::{AgentApprovalRequest, AgentApprovalRequestId, AgentToolCall, AgentTurn};
+use axis_core::agent_history::{
+    AgentApprovalRequest, AgentApprovalRequestId, AgentToolCall, AgentTurn,
+};
 
 use crate::events::RuntimeEvent;
 
@@ -12,7 +14,11 @@ const AXIS_ATTENTION_PREFIX: &str = "AXIS_ATTENTION ";
 const AXIS_STATUS_PREFIX: &str = "AXIS_STATUS ";
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "snake_case")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "snake_case"
+)]
 enum AxisCliEvent {
     Lifecycle { lifecycle: AgentLifecycle },
     Attention { attention: AgentAttention },
@@ -23,9 +29,15 @@ enum AxisCliEvent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "snake_case")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "snake_case"
+)]
 pub enum AxisCliCommand {
-    SendTurn { text: String },
+    SendTurn {
+        text: String,
+    },
     RespondApproval {
         approval_request_id: AgentApprovalRequestId,
         approved: bool,

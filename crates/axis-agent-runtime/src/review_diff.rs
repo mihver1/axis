@@ -7,8 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use axis_core::review::{
-    DeskReviewPayload, ReviewFileChangeKind, ReviewFileDiff, ReviewHunk, ReviewLine,
-    ReviewLineKind,
+    DeskReviewPayload, ReviewFileChangeKind, ReviewFileDiff, ReviewHunk, ReviewLine, ReviewLineKind,
 };
 use axis_core::worktree::{ReviewSummary, WorktreeId};
 
@@ -60,8 +59,7 @@ pub(crate) fn build_desk_review_payload(
     let review_base = resolve_review_base(root, base_branch)?;
     let diff_raw = git_stdout(root, &["diff", "--unified=3", &review_base])?;
     // Lower rename similarity so rename-with-edits still surfaces as `R` in name-status when possible.
-    let name_status_raw =
-        git_stdout(root, &["diff", "--name-status", "-M20", "-z", &review_base])?;
+    let name_status_raw = git_stdout(root, &["diff", "--name-status", "-M20", "-z", &review_base])?;
     let summary_raw = git_stdout(root, &["diff", "--summary", &review_base])?;
 
     let name_status_entries = parse_name_status(&name_status_raw);
@@ -236,7 +234,10 @@ pub(crate) fn parse_porcelain_paths(raw: &str) -> Vec<String> {
 
 fn parse_porcelain(raw: &str) -> Vec<PorcelainEntry> {
     let mut out = Vec::new();
-    let tokens = raw.split('\0').filter(|token| !token.is_empty()).collect::<Vec<_>>();
+    let tokens = raw
+        .split('\0')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
     let mut index = 0;
     while index < tokens.len() {
         let record = tokens[index];
@@ -272,7 +273,10 @@ fn porcelain_unmerged(status: &str) -> bool {
 }
 
 fn porcelain_has_secondary_path(status: &str) -> bool {
-    status.as_bytes().iter().any(|byte| matches!(byte, b'R' | b'C'))
+    status
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'R' | b'C'))
 }
 
 #[derive(Clone)]
@@ -283,7 +287,10 @@ struct NameStatusEntry {
 }
 
 fn parse_name_status(raw: &str) -> Vec<NameStatusEntry> {
-    let tokens = raw.split('\0').filter(|token| !token.is_empty()).collect::<Vec<_>>();
+    let tokens = raw
+        .split('\0')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
     let mut entries = Vec::new();
     let mut index = 0;
 

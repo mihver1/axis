@@ -5,11 +5,11 @@ use axis_core::automation::{
     AutomationRequest, AutomationResponse,
 };
 use axis_core::paths::daemon_socket_path;
+use axis_core::review::DeskReviewPayload;
 use axis_core::terminal::{
     TerminalSessionId, TerminalSessionRecord, TerminalSurfaceKind, TerminalTranscriptChunk,
 };
 use axis_core::workdesk::{WorkdeskId, WorkdeskRecord};
-use axis_core::review::DeskReviewPayload;
 use axis_core::worktree::{WorktreeBinding, WorktreeId};
 use axis_core::SurfaceId;
 use axis_terminal::TerminalGridSize;
@@ -248,18 +248,12 @@ impl DaemonClient {
     }
 
     #[allow(dead_code)]
-    pub fn attention_next(
-        &self,
-        workdesk_id: Option<String>,
-    ) -> Result<serde_json::Value, String> {
+    pub fn attention_next(&self, workdesk_id: Option<String>) -> Result<serde_json::Value, String> {
         self.send_typed_request(AutomationRequest::AttentionNext { workdesk_id })
     }
 
     #[allow(dead_code)]
-    pub fn state_current(
-        &self,
-        workdesk_id: Option<String>,
-    ) -> Result<serde_json::Value, String> {
+    pub fn state_current(&self, workdesk_id: Option<String>) -> Result<serde_json::Value, String> {
         self.send_typed_request(AutomationRequest::StateCurrent { workdesk_id })
     }
 

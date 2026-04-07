@@ -147,9 +147,16 @@ pub struct AgentApprovalRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "snake_case")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "snake_case"
+)]
 pub enum AgentTimelineEntry {
-    Turn { sequence: u64, turn: AgentTurn },
+    Turn {
+        sequence: u64,
+        turn: AgentTurn,
+    },
     ToolCall {
         sequence: u64,
         tool_call: AgentToolCall,

@@ -407,14 +407,19 @@ fn take_string_vec_param(
     }
 }
 
-fn take_optional_u64_param(params: &mut Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
+fn take_optional_u64_param(
+    params: &mut Map<String, Value>,
+    key: &str,
+) -> Result<Option<u64>, String> {
     match params.remove(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(value)) => value
             .as_u64()
             .map(Some)
             .ok_or_else(|| format!("expected `{key}` to be an unsigned integer")),
-        Some(other) => Err(format!("expected `{key}` to be an unsigned integer, got {other}")),
+        Some(other) => Err(format!(
+            "expected `{key}` to be an unsigned integer, got {other}"
+        )),
     }
 }
 

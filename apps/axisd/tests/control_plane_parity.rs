@@ -135,8 +135,14 @@ fn control_plane_parity_state_current_accepts_workdesk_name_selector() {
         },
     )
     .expect("state.current should succeed");
-    assert!(state.ok, "state.current should accept desk names as selectors");
-    assert_eq!(state.result.expect("state payload should exist")["workdesk"]["workdesk_id"], workdesk_id);
+    assert!(
+        state.ok,
+        "state.current should accept desk names as selectors"
+    );
+    assert_eq!(
+        state.result.expect("state payload should exist")["workdesk"]["workdesk_id"],
+        workdesk_id
+    );
 
     drop(server);
 }
@@ -274,7 +280,8 @@ fn control_plane_parity_agent_structured_requests_round_trip_detail_and_actions(
     .expect("agent.get should succeed");
     assert!(initial.ok);
     let initial_detail: AgentSessionDetail =
-        serde_json::from_value(initial.result.expect("detail payload")).expect("detail should decode");
+        serde_json::from_value(initial.result.expect("detail payload"))
+            .expect("detail should decode");
     assert!(initial_detail.timeline.is_empty());
 
     let turn = send_request(
@@ -290,7 +297,10 @@ fn control_plane_parity_agent_structured_requests_round_trip_detail_and_actions(
         serde_json::from_value(turn.result.expect("turn payload")).expect("detail should decode");
     assert_eq!(turn_detail.timeline.len(), 2);
     assert_eq!(
-        turn_detail.pending_approval_id.as_ref().map(|id| id.0.as_str()),
+        turn_detail
+            .pending_approval_id
+            .as_ref()
+            .map(|id| id.0.as_str()),
         Some("approval-1")
     );
 
@@ -340,7 +350,8 @@ fn control_plane_parity_agent_structured_requests_round_trip_detail_and_actions(
     .expect("agent.resume should succeed");
     assert!(resume.ok);
     let resume_detail: AgentSessionDetail =
-        serde_json::from_value(resume.result.expect("resume payload")).expect("detail should decode");
+        serde_json::from_value(resume.result.expect("resume payload"))
+            .expect("detail should decode");
     assert_eq!(resume_detail.session.status_message, "resumed");
 
     drop(server);
@@ -417,7 +428,10 @@ fn control_plane_parity_send_turn_waits_for_delayed_structured_follow_up_events(
         "send_turn should wait until delayed approval_request is included"
     );
     assert_eq!(
-        turn_detail.pending_approval_id.as_ref().map(|id| id.0.as_str()),
+        turn_detail
+            .pending_approval_id
+            .as_ref()
+            .map(|id| id.0.as_str()),
         Some("approval-1")
     );
 
@@ -495,7 +509,10 @@ fn control_plane_parity_send_turn_still_waits_for_quiet_window_after_late_first_
         "send_turn should still honor quiet-window even if first event arrives near timeout"
     );
     assert_eq!(
-        turn_detail.pending_approval_id.as_ref().map(|id| id.0.as_str()),
+        turn_detail
+            .pending_approval_id
+            .as_ref()
+            .map(|id| id.0.as_str()),
         Some("approval-1")
     );
 

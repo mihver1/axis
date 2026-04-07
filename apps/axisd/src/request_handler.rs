@@ -497,13 +497,13 @@ fn handle_request(
             let all_sessions = filtered_agent_sessions(&guard.agent_runtime, None);
             match workdesk_id {
                 Some(selector) => {
-                    let workdesk = resolve_workdesk_selector_from_records(&all_workdesks, &selector)
-                        .ok_or_else(|| anyhow::anyhow!("unknown workdesk `{selector}`"))?;
+                    let workdesk =
+                        resolve_workdesk_selector_from_records(&all_workdesks, &selector)
+                            .ok_or_else(|| anyhow::anyhow!("unknown workdesk `{selector}`"))?;
                     let sessions = all_sessions
                         .into_iter()
                         .filter(|record| {
-                            record.workdesk_id.as_deref()
-                                == Some(workdesk.workdesk_id.0.as_str())
+                            record.workdesk_id.as_deref() == Some(workdesk.workdesk_id.0.as_str())
                         })
                         .collect::<Vec<_>>();
                     let worktree_id = worktree_id_from_record(&workdesk);

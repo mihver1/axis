@@ -60,10 +60,7 @@ pub(crate) fn build_agent_timeline_view_model(
                 state_label: tool_call_state_label(tool_call.state).to_string(),
                 pending: false,
             },
-            AgentTimelineEntry::ApprovalRequest {
-                sequence,
-                approval,
-            } => AgentTimelineEntryView {
+            AgentTimelineEntry::ApprovalRequest { sequence, approval } => AgentTimelineEntryView {
                 sequence: *sequence,
                 title: approval.title.clone(),
                 body: approval_summary_body(approval),
@@ -122,7 +119,11 @@ fn tool_call_state_label(state: axis_core::agent_history::AgentToolCallState) ->
 }
 
 fn approval_summary_body(approval: &AgentApprovalRequest) -> String {
-    match approval.decision.as_ref().and_then(|decision| decision.note.as_deref()) {
+    match approval
+        .decision
+        .as_ref()
+        .and_then(|decision| decision.note.as_deref())
+    {
         Some(note) if !note.trim().is_empty() => format!("{}\n{}", approval.details, note),
         _ => approval.details.clone(),
     }
@@ -215,7 +216,10 @@ mod tests {
         assert_eq!(model.timeline_entries[0].title, "User turn");
         assert_eq!(model.timeline_entries[1].state_label, "pending");
         assert_eq!(model.pending_approvals.len(), 1);
-        assert_eq!(model.pending_approvals[0].id, AgentApprovalRequestId::new("approval-1"));
+        assert_eq!(
+            model.pending_approvals[0].id,
+            AgentApprovalRequestId::new("approval-1")
+        );
     }
 
     #[test]
