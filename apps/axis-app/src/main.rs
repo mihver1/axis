@@ -238,6 +238,13 @@ struct AxisShell {
     persist_generation: u64,
     touchpad_pan_state: Option<TouchpadPanState>,
     last_touchpad_pan_end: Option<Instant>,
+    goto_line_open: bool,
+    goto_line_input: String,
+    file_picker_open: bool,
+    file_picker_query: String,
+    file_picker_files: Vec<String>,
+    file_picker_filtered: Vec<String>,
+    file_picker_selected: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -3076,6 +3083,13 @@ impl AxisShell {
             persist_generation: 0,
             touchpad_pan_state: None,
             last_touchpad_pan_end: None,
+            goto_line_open: false,
+            goto_line_input: String::new(),
+            file_picker_open: false,
+            file_picker_query: String::new(),
+            file_picker_files: Vec::new(),
+            file_picker_filtered: Vec::new(),
+            file_picker_selected: 0,
         };
         shell.assign_workdesk_ids_to_workdesks();
         shell.assign_runtime_ids_to_workdesks();
@@ -6827,6 +6841,51 @@ impl AxisShell {
             return;
         }
 
+        if self.handle_goto_line_key_down(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.handle_file_picker_key_down(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        // Cmd+P: open our inline file picker (intercept before shortcut system's QuickOpen)
+        if event.keystroke.modifiers.platform
+            && event.keystroke.key == "p"
+            && !event.keystroke.modifiers.shift
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.control
+        {
+            self.file_picker_open = true;
+            self.file_picker_query.clear();
+            self.file_picker_selected = 0;
+            if self.file_picker_files.is_empty() {
+                if let Some(root) = self.active_worktree_root_path() {
+                    self.index_worktree_files(&root);
+                }
+            }
+            self.filter_file_picker();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        // Cmd+G (no shift): open go-to-line dialog (intercept before shortcut system)
+        if event.keystroke.modifiers.platform
+            && event.keystroke.key == "g"
+            && !event.keystroke.modifiers.shift
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.control
+        {
+            self.goto_line_open = true;
+            self.goto_line_input.clear();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
         if let Some(action) = self.shortcuts.matching_action(event) {
             if self.execute_shortcut_action(action, window, cx) {
                 cx.stop_propagation();
@@ -7144,6 +7203,165 @@ impl AxisShell {
         false
     }
 
+    fn handle_goto_line_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.goto_line_open {
+            return false;
+        }
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "escape" if !keystroke.modifiers.modified() => {
+                self.goto_line_open = false;
+                cx.notify();
+                return true;
+            }
+            "enter" if !keystroke.modifiers.modified() => {
+                if let Ok(line_num) = self.goto_line_input.parse::<usize>() {
+                    if let Some((pane_id, surface_id)) = self.active_editor_ids() {
+                        self.move_active_editor_to_line(surface_id, line_num);
+                        self.sync_editor_surface_metadata(pane_id, surface_id);
+                        cx.notify();
+                    }
+                }
+                self.goto_line_open = false;
+                cx.notify();
+                return true;
+            }
+            "backspace" | "delete" if !keystroke.modifiers.modified() => {
+                self.goto_line_input.pop();
+                cx.notify();
+                return true;
+            }
+            _ => {}
+        }
+        if let Some(text) = editable_keystroke_text(keystroke) {
+            if text.chars().all(|c| c.is_ascii_digit()) {
+                self.goto_line_input.push_str(&text);
+                cx.notify();
+            }
+            return true;
+        }
+        // Block all other keys while dialog is open
+        true
+    }
+
+    fn handle_file_picker_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.file_picker_open {
+            return false;
+        }
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "escape" if !keystroke.modifiers.modified() => {
+                self.file_picker_open = false;
+                cx.notify();
+                return true;
+            }
+            "enter" if !keystroke.modifiers.modified() => {
+                if let Some(path) = self.file_picker_filtered.get(self.file_picker_selected).cloned() {
+                    let root = self.workspace_palette_root();
+                    let absolute = root.join(&path).display().to_string();
+                    let desk_index = self.active_workdesk;
+                    let _ = self.spawn_surface_on_workdesk(
+                        desk_index,
+                        None,
+                        PaneKind::Editor,
+                        None,
+                        None,
+                        Some(absolute),
+                        true,
+                    );
+                    self.request_persist(cx);
+                }
+                self.file_picker_open = false;
+                cx.notify();
+                return true;
+            }
+            "up" if !keystroke.modifiers.modified() => {
+                self.file_picker_selected = self.file_picker_selected.saturating_sub(1);
+                cx.notify();
+                return true;
+            }
+            "down" if !keystroke.modifiers.modified() => {
+                let max = self.file_picker_filtered.len().saturating_sub(1);
+                self.file_picker_selected = (self.file_picker_selected + 1).min(max);
+                cx.notify();
+                return true;
+            }
+            "backspace" | "delete" if !keystroke.modifiers.modified() => {
+                self.file_picker_query.pop();
+                self.filter_file_picker();
+                cx.notify();
+                return true;
+            }
+            _ => {}
+        }
+        if let Some(text) = editable_keystroke_text(keystroke) {
+            self.file_picker_query.push_str(&text);
+            self.filter_file_picker();
+            cx.notify();
+            return true;
+        }
+        true
+    }
+
+    fn active_worktree_root_path(&self) -> Option<std::path::PathBuf> {
+        let path = self.workspace_palette_root();
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    fn index_worktree_files(&mut self, root: &std::path::Path) {
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, root: &std::path::Path, files: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name.starts_with('.') || name == "node_modules" || name == "target" || name == "vendor" {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(&path, root, files);
+                } else if let Ok(rel) = path.strip_prefix(root) {
+                    files.push(rel.to_string_lossy().to_string());
+                }
+            }
+        }
+        walk(root, root, &mut files);
+        files.sort();
+        self.file_picker_files = files;
+    }
+
+    fn filter_file_picker(&mut self) {
+        let query = self.file_picker_query.to_ascii_lowercase();
+        if query.is_empty() {
+            self.file_picker_filtered = self.file_picker_files.clone();
+        } else {
+            self.file_picker_filtered = self.file_picker_files.iter()
+                .filter(|f| {
+                    let lower = f.to_ascii_lowercase();
+                    let mut chars = query.chars();
+                    let mut current = chars.next();
+                    for c in lower.chars() {
+                        if current == Some(c) { current = chars.next(); }
+                    }
+                    current.is_none()
+                })
+                .cloned().collect();
+        }
+        self.file_picker_selected = 0;
+    }
+
     fn handle_editor_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let Some((pane_id, surface_id)) = self.active_editor_ids() else {
             return false;
@@ -7295,15 +7513,14 @@ impl AxisShell {
                     return true;
                 }
                 "g" => {
-                    if let Some(editor) = self.active_editor_mut() {
-                        if keystroke.modifiers.shift {
+                    if keystroke.modifiers.shift {
+                        if let Some(editor) = self.active_editor_mut() {
                             editor.previous_search_match();
-                        } else {
-                            editor.next_search_match();
                         }
+                        cx.notify();
+                        return true;
                     }
-                    cx.notify();
-                    return true;
+                    // Cmd+G without shift is intercepted at the global level (go-to-line dialog)
                 }
                 "z" => {
                     if let Some(editor) = self.active_editor_mut() {
@@ -9812,6 +10029,139 @@ impl Render for AxisShell {
                         ),
                 )
         });
+        let goto_line_overlay = self.goto_line_open.then(|| {
+            let input_text = if self.goto_line_input.is_empty() {
+                "_".to_string()
+            } else {
+                self.goto_line_input.clone()
+            };
+            div()
+                .absolute()
+                .top(px(40.0))
+                .right(px(20.0))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .bg(rgb(0x1a2330))
+                .border_1()
+                .border_color(rgb(0x3b4d5e))
+                .rounded_md()
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(div().text_xs().text_color(rgb(0xf0d35f)).child("Go to line:"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xdce2e8))
+                        .min_w(px(40.0))
+                        .child(input_text),
+                )
+        });
+        let file_picker_overlay = self.file_picker_open.then(|| {
+            let query = self.file_picker_query.clone();
+            let filtered = self.file_picker_filtered.clone();
+            let selected = self.file_picker_selected;
+            let picker_width = 500.0_f32;
+            let left = ((viewport_width - picker_width) * 0.5).max(16.0);
+            let visible_rows: Vec<_> = filtered
+                .iter()
+                .enumerate()
+                .take(12)
+                .map(|(index, path)| {
+                    let is_selected = index == selected;
+                    div()
+                        .px_3()
+                        .py_1()
+                        .bg(if is_selected { rgb(0x1e3248) } else { rgb(0x1a2330) })
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(".ZedMono")
+                                .text_color(if is_selected {
+                                    rgb(0x7cc7ff)
+                                } else {
+                                    rgb(0xb0bec5)
+                                })
+                                .child(path.clone()),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            let empty_row = if filtered.is_empty() {
+                vec![
+                    div()
+                        .px_3()
+                        .py_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f8a94))
+                                .child("No files found"),
+                        )
+                        .into_any_element(),
+                ]
+            } else {
+                vec![]
+            };
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(60.0))
+                .w(px(picker_width))
+                .flex()
+                .flex_col()
+                .bg(rgb(0x1a2330))
+                .border_1()
+                .border_color(rgb(0x3b4d5e))
+                .rounded_lg()
+                .shadow_lg()
+                .overflow_hidden()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(0x3b4d5e))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7cc7ff))
+                                .child("File:"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .font_family(".ZedMono")
+                                .text_color(if query.is_empty() {
+                                    rgb(0x6f7d86)
+                                } else {
+                                    rgb(0xdce2e8)
+                                })
+                                .child(if query.is_empty() {
+                                    "type to search...".to_string()
+                                } else {
+                                    query
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .children(if visible_rows.is_empty() { empty_row } else { visible_rows }),
+                )
+        });
         let review_panel_overlay = self.review_panel.and_then(|desk_index| {
             self.workdesks.get(desk_index).map(|desk| {
                 let desk_name = desk.name.clone();
@@ -11482,12 +11832,10 @@ impl Render for AxisShell {
                         ),
                 )
             })
-            .when_some(session_inspector_overlay, |root, overlay| {
-                root.child(overlay)
-            })
-            .when_some(workspace_palette_overlay, |root, overlay| {
-                root.child(overlay)
-            })
+            .when_some(session_inspector_overlay, |root, overlay| root.child(overlay))
+            .when_some(workspace_palette_overlay, |root, overlay| root.child(overlay))
+            .when_some(goto_line_overlay, |root, overlay| root.child(overlay))
+            .when_some(file_picker_overlay, |root, overlay| root.child(overlay))
             .when_some(review_panel_overlay, |root, overlay| root.child(overlay))
             .children(shortcut_overlay)
             .when_some(workdesk_editor_overlay, |root, overlay| root.child(overlay))
