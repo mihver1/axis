@@ -3259,15 +3259,6 @@ impl AxisShell {
 
     fn sync_agent_runtime_activity(&mut self, cx: &mut Context<Self>) -> bool {
         self.sync_agent_desk_paths();
-        for desk in &self.workdesks {
-            for pane in &desk.panes {
-                for surface in &pane.surfaces {
-                    if surface.kind == PaneKind::Agent && desk.terminals.contains_key(&surface.id) {
-                        let _ = self.agent_runtime.poll_surface(desk.runtime_id, surface.id);
-                    }
-                }
-            }
-        }
         let rev = self.agent_runtime.revision();
         if rev != self.last_agent_runtime_revision {
             self.last_agent_runtime_revision = rev;
@@ -5554,6 +5545,29 @@ impl AxisShell {
                         || agent_changed
                         || blink_changed
                     {
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Spawn a background task that polls all active agent sessions every 200 ms.
+    /// This keeps provider stdout draining off the UI thread so slow providers
+    /// cannot block frame rendering.
+    fn start_agent_poll_loop(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            Timer::after(Duration::from_millis(200)).await;
+
+            if this
+                .update(cx, |this, cx| {
+                    this.agent_runtime.poll_all_active_sessions();
+                    let agent_changed = this.sync_agent_runtime_activity(cx);
+                    if agent_changed {
                         cx.notify();
                     }
                 })
@@ -11334,6 +11348,7 @@ fn main() {
                     window.focus(&window_focus_handle);
                     shell.update(cx, |this, cx| {
                         this.start_terminal_refresh_loop(cx);
+                        this.start_agent_poll_loop(cx);
                         this.request_persist(cx);
                     });
 

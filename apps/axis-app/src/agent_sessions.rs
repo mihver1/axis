@@ -13,7 +13,7 @@ use axis_agent_runtime::{
     resolve_provider_command_from_env_or_default_for_cwd, ProviderProfileMetadata,
     ProviderRegistry, SessionManager, StartAgentRequest,
 };
-use axis_core::agent::{AgentAttention, AgentSessionId, AgentSessionRecord, AgentTransportKind};
+use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionId, AgentSessionRecord, AgentTransportKind};
 use axis_core::agent_history::{AgentApprovalRequestId, AgentSessionDetail, AgentTimelineEntry};
 use axis_core::workdesk::WorkdeskId;
 use axis_core::worktree::WorktreeId;
@@ -420,6 +420,62 @@ impl AgentRuntimeBridge {
 
     pub(crate) fn provider_profile(&self, profile_id: &str) -> Option<ProviderProfileMetadata> {
         self.inner.lock().manager.provider_profile(profile_id)
+    }
+
+    /// Poll all active local sessions and refresh daemon session state.
+    /// Returns the number of local sessions polled.
+    pub fn poll_all_active_sessions(&self) -> usize {
+        let mut guard = self.inner.lock();
+        let all_session_ids: Vec<AgentSessionId> = guard
+            .surface_to_session
+            .values()
+            .cloned()
+            .collect();
+
+        // Refresh daemon sessions once if any are registered.
+        let has_daemon = all_session_ids
+            .iter()
+            .any(|id| guard.daemon_records.contains_key(id));
+        if has_daemon {
+            if let Ok(sessions) = guard.daemon.list_agents(None) {
+                let daemon_ids: HashSet<AgentSessionId> =
+                    sessions.iter().map(|r| r.id.clone()).collect();
+                guard.daemon_records = sessions
+                    .into_iter()
+                    .map(|record| (record.id.clone(), record))
+                    .collect();
+                guard
+                    .daemon_details
+                    .retain(|session_id, _| daemon_ids.contains(session_id));
+                let local_ids = guard
+                    .manager
+                    .sessions()
+                    .map(|record| record.id.clone())
+                    .collect::<HashSet<_>>();
+                guard.surface_to_session.retain(|_, existing| {
+                    daemon_ids.contains(existing) || local_ids.contains(existing)
+                });
+                guard.daemon_revision = guard.daemon_revision.wrapping_add(1);
+            }
+        }
+
+        let mut polled = 0;
+        for session_id in &all_session_ids {
+            if guard.daemon_records.contains_key(session_id) {
+                continue;
+            }
+            if let Some(session) = guard.manager.session(session_id) {
+                if matches!(
+                    session.lifecycle,
+                    AgentLifecycle::Completed | AgentLifecycle::Failed | AgentLifecycle::Cancelled
+                ) {
+                    continue;
+                }
+            }
+            let _ = guard.manager.poll_provider(session_id);
+            polled += 1;
+        }
+        polled
     }
 
     pub fn poll_surface(
