@@ -117,6 +117,16 @@ impl SessionManager {
     }
 
     pub fn send_turn(&mut self, session_id: &AgentSessionId, text: &str) -> anyhow::Result<()> {
+        let detail = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id.0))?;
+        if !detail.capabilities.turn_input {
+            anyhow::bail!(
+                "provider '{}' does not support turn_input",
+                detail.session.provider_profile_id
+            );
+        }
         let provider = self.provider_for_session(session_id)?;
         let events = provider.send_turn(SendTurnRequest {
             session_id: session_id.clone(),
@@ -132,6 +142,16 @@ impl SessionManager {
         approved: bool,
         note: Option<String>,
     ) -> anyhow::Result<()> {
+        let detail = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id.0))?;
+        if !detail.capabilities.approvals {
+            anyhow::bail!(
+                "provider '{}' does not support approvals",
+                detail.session.provider_profile_id
+            );
+        }
         let provider = self.provider_for_session(session_id)?;
         let events = provider.respond_approval(RespondApprovalRequest {
             session_id: session_id.clone(),
@@ -143,6 +163,16 @@ impl SessionManager {
     }
 
     pub fn resume(&mut self, session_id: &AgentSessionId) -> anyhow::Result<()> {
+        let detail = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id.0))?;
+        if !detail.capabilities.resume {
+            anyhow::bail!(
+                "provider '{}' does not support resume",
+                detail.session.provider_profile_id
+            );
+        }
         let provider = self.provider_for_session(session_id)?;
         let events = provider.resume(ResumeRequest {
             session_id: session_id.clone(),
