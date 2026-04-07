@@ -721,6 +721,8 @@ struct EditorViewState {
     char_width: f32,
     gutter_width: f32,
     viewport_lines: usize,
+    /// When the search/replace bar is open, true = replace field is active, false = find field.
+    replace_field_active: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7160,35 +7162,90 @@ impl AxisShell {
             .active_editor()
             .is_some_and(|editor| editor.search_state().open)
         {
+            let replace_field_active = self
+                .active_workdesk()
+                .editor_views
+                .get(&surface_id)
+                .map(|v| v.replace_field_active)
+                .unwrap_or(false);
+            let replace_open = self
+                .active_editor()
+                .is_some_and(|editor| editor.search_state().replace_open);
+
             if keystroke.key == "escape" && !keystroke.modifiers.modified() {
                 if let Some(editor) = self.active_editor_mut() {
                     editor.close_search();
                 }
-                cx.notify();
-                return true;
-            }
-            if keystroke.key == "enter" && !keystroke.modifiers.modified() {
-                if let Some(editor) = self.active_editor_mut() {
-                    editor.next_search_match();
+                if let Some(view) = self
+                    .active_workdesk_mut()
+                    .editor_views
+                    .get_mut(&surface_id)
+                {
+                    view.replace_field_active = false;
                 }
                 cx.notify();
                 return true;
             }
-            if matches!(keystroke.key.as_str(), "backspace" | "delete")
-                && !keystroke.modifiers.modified()
-            {
-                if let Some(editor) = self.active_editor_mut() {
-                    editor.pop_search_text();
+            // Tab: switch between find and replace fields
+            if keystroke.key == "tab" && !keystroke.modifiers.modified() && replace_open {
+                if let Some(view) = self
+                    .active_workdesk_mut()
+                    .editor_views
+                    .get_mut(&surface_id)
+                {
+                    view.replace_field_active = !view.replace_field_active;
                 }
                 cx.notify();
                 return true;
             }
-            if let Some(text) = editable_keystroke_text(keystroke) {
-                if let Some(editor) = self.active_editor_mut() {
-                    editor.append_search_text(&text);
+            if replace_field_active {
+                if keystroke.key == "enter" && !keystroke.modifiers.modified() {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.replace_current_match();
+                    }
+                    cx.notify();
+                    return true;
                 }
-                cx.notify();
-                return true;
+                if matches!(keystroke.key.as_str(), "backspace" | "delete")
+                    && !keystroke.modifiers.modified()
+                {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.pop_replace_text();
+                    }
+                    cx.notify();
+                    return true;
+                }
+                if let Some(text) = editable_keystroke_text(keystroke) {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.append_replace_text(&text);
+                    }
+                    cx.notify();
+                    return true;
+                }
+            } else {
+                if keystroke.key == "enter" && !keystroke.modifiers.modified() {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.next_search_match();
+                    }
+                    cx.notify();
+                    return true;
+                }
+                if matches!(keystroke.key.as_str(), "backspace" | "delete")
+                    && !keystroke.modifiers.modified()
+                {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.pop_search_text();
+                    }
+                    cx.notify();
+                    return true;
+                }
+                if let Some(text) = editable_keystroke_text(keystroke) {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.append_search_text(&text);
+                    }
+                    cx.notify();
+                    return true;
+                }
             }
         }
 
@@ -7212,6 +7269,27 @@ impl AxisShell {
                 "f" => {
                     if let Some(editor) = self.active_editor_mut() {
                         editor.open_search();
+                    }
+                    if let Some(view) = self
+                        .active_workdesk_mut()
+                        .editor_views
+                        .get_mut(&surface_id)
+                    {
+                        view.replace_field_active = false;
+                    }
+                    cx.notify();
+                    return true;
+                }
+                "h" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.open_replace();
+                    }
+                    if let Some(view) = self
+                        .active_workdesk_mut()
+                        .editor_views
+                        .get_mut(&surface_id)
+                    {
+                        view.replace_field_active = false;
                     }
                     cx.notify();
                     return true;
@@ -8110,6 +8188,14 @@ impl AxisShell {
                     let dirty = editor.dirty();
                     let external_modified = editor.external_modified();
                     let surface_id = active_surface_id;
+                    let search_replace_open = editor.search_state().replace_open;
+                    let search_replace_text = editor.search_state().replace_text.clone();
+                    let search_case_sensitive = editor.search_state().case_sensitive;
+                    let search_replace_field_active = workdesk
+                        .editor_views
+                        .get(&active_surface_id)
+                        .map(|v| v.replace_field_active)
+                        .unwrap_or(false);
 
                     div()
                         .flex()
@@ -8123,8 +8209,77 @@ impl AxisShell {
                                 .flex_col()
                                 .gap_2()
                                 .when(editor.search_state().open, |column| {
-                                    column.child(
-                                        div()
+                                    let find_row = div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_3()
+                                        .px_3()
+                                        .py_2()
+                                        .bg(rgb(0x131a20))
+                                        .border_1()
+                                        .border_color(rgb(0x24303a))
+                                        .rounded_md()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(if !search_replace_field_active {
+                                                    rgb(0xf0d35f)
+                                                } else {
+                                                    rgb(0x7f8a94)
+                                                })
+                                                .child("Find"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_xs()
+                                                .text_color(rgb(0xdce2e8))
+                                                .child(editor.search_state().query.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x7f8a94))
+                                                .child(search_label),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_1()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .bg(if search_case_sensitive {
+                                                    rgb(0x293742)
+                                                } else {
+                                                    rgb(0x1a2530)
+                                                })
+                                                .text_color(if search_case_sensitive {
+                                                    rgb(0xf0d35f)
+                                                } else {
+                                                    rgb(0x7f8a94)
+                                                })
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                })
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        if let Some(editor) =
+                                                            this.active_editor_mut()
+                                                        {
+                                                            editor.toggle_case_sensitivity();
+                                                        }
+                                                        cx.notify();
+                                                        cx.stop_propagation();
+                                                    }),
+                                                )
+                                                .child("Aa"),
+                                        );
+                                    let column = column.child(find_row);
+                                    if search_replace_open {
+                                        let replace_row = div()
                                             .flex()
                                             .items_center()
                                             .justify_between()
@@ -8138,23 +8293,76 @@ impl AxisShell {
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(0xf0d35f))
-                                                    .child("Find"),
+                                                    .text_color(if search_replace_field_active {
+                                                        rgb(0xf0d35f)
+                                                    } else {
+                                                        rgb(0x7f8a94)
+                                                    })
+                                                    .child("Replace"),
                                             )
                                             .child(
                                                 div()
                                                     .flex_1()
                                                     .text_xs()
                                                     .text_color(rgb(0xdce2e8))
-                                                    .child(editor.search_state().query.clone()),
+                                                    .child(search_replace_text),
                                             )
                                             .child(
                                                 div()
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_sm()
                                                     .text_xs()
-                                                    .text_color(rgb(0x7f8a94))
-                                                    .child(search_label),
-                                            ),
-                                    )
+                                                    .cursor_pointer()
+                                                    .bg(rgb(0x1e2d3a))
+                                                    .text_color(rgb(0xaeb8bf))
+                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            if let Some(editor) =
+                                                                this.active_editor_mut()
+                                                            {
+                                                                editor.replace_current_match();
+                                                            }
+                                                            cx.notify();
+                                                            cx.stop_propagation();
+                                                        }),
+                                                    )
+                                                    .child("Replace"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .bg(rgb(0x1e2d3a))
+                                                    .text_color(rgb(0xaeb8bf))
+                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            if let Some(editor) =
+                                                                this.active_editor_mut()
+                                                            {
+                                                                editor.replace_all_matches();
+                                                            }
+                                                            cx.notify();
+                                                            cx.stop_propagation();
+                                                        }),
+                                                    )
+                                                    .child("All"),
+                                            );
+                                        column.child(replace_row)
+                                    } else {
+                                        column
+                                    }
                                 })
                                 .child(
                                     div()

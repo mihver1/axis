@@ -35,6 +35,9 @@ pub struct SearchState {
     pub open: bool,
     pub query: String,
     pub active_match: Option<usize>,
+    pub replace_open: bool,
+    pub replace_text: String,
+    pub case_sensitive: bool,
     matches: Vec<Range<usize>>,
 }
 
@@ -576,9 +579,80 @@ impl EditorBuffer {
 
     pub fn close_search(&mut self) {
         self.search.open = false;
+        self.search.replace_open = false;
         self.search.query.clear();
+        self.search.replace_text.clear();
         self.search.active_match = None;
         self.search.matches.clear();
+    }
+
+    pub fn open_replace(&mut self) {
+        self.search.open = true;
+        self.search.replace_open = true;
+        self.recompute_search_matches(true);
+    }
+
+    pub fn toggle_case_sensitivity(&mut self) {
+        self.search.case_sensitive = !self.search.case_sensitive;
+        self.recompute_search_matches(true);
+    }
+
+    pub fn set_replace_text(&mut self, text: String) {
+        self.search.replace_text = text;
+    }
+
+    pub fn append_replace_text(&mut self, ch: &str) {
+        self.search.replace_text.push_str(ch);
+    }
+
+    pub fn pop_replace_text(&mut self) {
+        self.search.replace_text.pop();
+    }
+
+    pub fn replace_current_match(&mut self) -> bool {
+        let Some(index) = self.search.active_match else {
+            return false;
+        };
+        let Some(range) = self.search.matches.get(index).cloned() else {
+            return false;
+        };
+        let replace_text = self.search.replace_text.clone();
+        let replacement_start = range.start;
+        self.selection.range = range;
+        self.selection.reversed = false;
+        self.replace_selection(&replace_text);
+        self.recompute_search_matches(false);
+        // Snap to next match at or after the replacement point
+        if !self.search.matches.is_empty() {
+            let next_index = self
+                .search
+                .matches
+                .iter()
+                .position(|r| r.start >= replacement_start)
+                .unwrap_or(0);
+            self.activate_search_match(next_index);
+        }
+        true
+    }
+
+    pub fn replace_all_matches(&mut self) -> usize {
+        let mut count = 0usize;
+        loop {
+            let Some(range) = self.search.matches.last().cloned() else {
+                break;
+            };
+            let replace_text = self.search.replace_text.clone();
+            self.selection.range = range;
+            self.selection.reversed = false;
+            self.replace_selection(&replace_text);
+            self.recompute_search_matches(false);
+            count += 1;
+            // Safety: if matches are not decreasing we should stop
+            if self.search.matches.is_empty() {
+                break;
+            }
+        }
+        count
     }
 
     pub fn append_search_text(&mut self, text: &str) {
@@ -729,7 +803,8 @@ impl EditorBuffer {
 
     fn recompute_search_matches(&mut self, snap_to_first: bool) {
         let text = self.rope.to_string();
-        self.search.matches = compute_search_matches(&text, &self.search.query);
+        self.search.matches =
+            compute_search_matches(&text, &self.search.query, self.search.case_sensitive);
         if self.search.matches.is_empty() {
             self.search.active_match = None;
             return;
@@ -860,19 +935,28 @@ fn range_from_utf16_str(text: &str, range: &Range<usize>) -> Range<usize> {
     offset_from_utf16(text, range.start)..offset_from_utf16(text, range.end)
 }
 
-fn compute_search_matches(text: &str, query: &str) -> Vec<Range<usize>> {
+fn compute_search_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<Range<usize>> {
     if query.is_empty() {
         return Vec::new();
     }
-    let query = query.to_ascii_lowercase();
-    let haystack = text.to_ascii_lowercase();
     let mut matches = Vec::new();
     let mut start = 0usize;
-    while let Some(found) = haystack[start..].find(&query) {
-        let begin = start + found;
-        let end = begin + query.len();
-        matches.push(begin..end);
-        start = end.max(begin + 1);
+    if case_sensitive {
+        while let Some(found) = text[start..].find(query) {
+            let begin = start + found;
+            let end = begin + query.len();
+            matches.push(begin..end);
+            start = end.max(begin + 1);
+        }
+    } else {
+        let query_lower = query.to_ascii_lowercase();
+        let haystack = text.to_ascii_lowercase();
+        while let Some(found) = haystack[start..].find(&query_lower) {
+            let begin = start + found;
+            let end = begin + query_lower.len();
+            matches.push(begin..end);
+            start = end.max(begin + 1);
+        }
     }
     matches
 }
