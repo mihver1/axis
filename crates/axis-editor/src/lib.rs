@@ -916,6 +916,225 @@ impl EditorBuffer {
             .scroll_top_line
             .min(self.line_count().saturating_sub(1));
     }
+
+    /// Duplicate the current line, inserting a copy below it, and move the cursor to the new line.
+    pub fn duplicate_line(&mut self) {
+        let cursor = self.cursor_offset();
+        let (line, col) = self.line_col_for_offset(cursor);
+        let line_start = self.rope.line_to_byte(line);
+        // Include the trailing newline in the copy so we insert a full line.
+        let line_end_with_nl = if line + 1 < self.rope.len_lines() {
+            self.rope.line_to_byte(line + 1)
+        } else {
+            self.rope.len_bytes()
+        };
+        let line_text_with_nl = self.get_byte_range_text(line_start..line_end_with_nl);
+        // If the line doesn't already end with a newline we need to add one before the copy.
+        let insertion = if line_text_with_nl.ends_with('\n') {
+            line_text_with_nl.clone()
+        } else {
+            format!("\n{}", line_text_with_nl)
+        };
+        // Insert after end of line (before the newline that's already there, or at EOF).
+        let insert_at = line_end_with_nl;
+        self.selection.range = insert_at..insert_at;
+        self.selection.reversed = false;
+        self.replace_selection(&insertion);
+        // Move cursor to same column on the new line (line + 1).
+        let new_line = line + 1;
+        let new_offset = self.offset_for_line_col(new_line, col);
+        self.selection.range = new_offset..new_offset;
+        self.selection.reversed = false;
+    }
+
+    /// Toggle a line comment based on the buffer language.
+    pub fn toggle_line_comment(&mut self) {
+        let comment_prefix = match self.language {
+            LanguageKind::Rust
+            | LanguageKind::JavaScript
+            | LanguageKind::TypeScript
+            | LanguageKind::Tsx
+            | LanguageKind::Jsx
+            | LanguageKind::Json => "// ",
+            LanguageKind::Toml | LanguageKind::Yaml => "# ",
+            _ => "// ",
+        };
+        let cursor = self.cursor_offset();
+        let (line, col) = self.line_col_for_offset(cursor);
+        let line_range = self.line_range(line);
+        let line_text = self.line_text(line);
+        let leading_spaces = line_text.len() - line_text.trim_start().len();
+        if line_text.trim_start().starts_with(comment_prefix) {
+            // Remove the comment prefix.
+            let remove_at = line_range.start + leading_spaces;
+            self.selection.range = remove_at..remove_at + comment_prefix.len();
+            self.selection.reversed = false;
+            self.replace_selection("");
+            // Adjust cursor: keep it on same line, pull column back by prefix length if past removal point.
+            let new_col = if col >= leading_spaces + comment_prefix.len() {
+                col - comment_prefix.len()
+            } else if col >= leading_spaces {
+                leading_spaces
+            } else {
+                col
+            };
+            let new_offset = self.offset_for_line_col(line, new_col);
+            self.selection.range = new_offset..new_offset;
+            self.selection.reversed = false;
+        } else {
+            // Insert comment prefix after leading whitespace.
+            let insert_at = line_range.start + leading_spaces;
+            self.selection.range = insert_at..insert_at;
+            self.selection.reversed = false;
+            self.replace_selection(comment_prefix);
+            // Adjust cursor: push column forward by prefix length if at or past insertion point.
+            let new_col = if col >= leading_spaces {
+                col + comment_prefix.len()
+            } else {
+                col
+            };
+            let new_offset = self.offset_for_line_col(line, new_col);
+            self.selection.range = new_offset..new_offset;
+            self.selection.reversed = false;
+        }
+    }
+
+    /// Delete the entire current line (including its newline).
+    pub fn delete_line(&mut self) {
+        let cursor = self.cursor_offset();
+        let (line, _) = self.line_col_for_offset(cursor);
+        let line_count = self.line_count();
+        let line_start = self.rope.line_to_byte(line);
+        let line_end_with_nl = if line + 1 < self.rope.len_lines() && line + 1 <= line_count {
+            self.rope.line_to_byte(line + 1)
+        } else {
+            // Last line — also eat the preceding newline to avoid leaving a trailing newline.
+            self.rope.len_bytes()
+        };
+        // If this is the only line, just clear it.
+        let (delete_start, delete_end) = if line == 0 && line_count == 1 {
+            (line_start, line_end_with_nl)
+        } else if line + 1 >= line_count && line > 0 {
+            // Last line: eat the preceding newline too.
+            let prev_line_end = self.rope.line_to_byte(line);
+            (prev_line_end - 1, self.rope.len_bytes())
+        } else {
+            (line_start, line_end_with_nl)
+        };
+        self.selection.range = delete_start..delete_end;
+        self.selection.reversed = false;
+        self.replace_selection("");
+    }
+
+    /// Move the current line up by swapping it with the line above.
+    pub fn move_line_up(&mut self) {
+        let cursor = self.cursor_offset();
+        let (line, col) = self.line_col_for_offset(cursor);
+        if line == 0 {
+            return;
+        }
+        let above = line - 1;
+        let above_start = self.rope.line_to_byte(above);
+        let above_end = self.rope.line_to_byte(line); // includes newline of above line
+        let current_start = above_end;
+        let current_end = if line + 1 < self.rope.len_lines() {
+            self.rope.line_to_byte(line + 1)
+        } else {
+            self.rope.len_bytes()
+        };
+        let above_text = self.get_byte_range_text(above_start..above_end);
+        let current_text = self.get_byte_range_text(current_start..current_end);
+        // Ensure both lines end with a newline for the swap.
+        let above_has_nl = above_text.ends_with('\n');
+        let current_has_nl = current_text.ends_with('\n');
+        let swapped = if current_has_nl {
+            format!("{}{}", current_text, above_text)
+        } else {
+            format!("{}\n{}", current_text, above_text.trim_end_matches('\n'))
+        };
+        // Fixup: if above_has_nl but current did not, the result needs a trailing newline stripped or added.
+        // The simpler approach: replace the whole block (above_start..current_end) with swapped.
+        let _ = above_has_nl; // used above via format logic
+        self.selection.range = above_start..current_end;
+        self.selection.reversed = false;
+        self.replace_selection(&swapped);
+        // Cursor moves to same column on the line above (the moved line is now at `above`).
+        let new_offset = self.offset_for_line_col(above, col);
+        self.selection.range = new_offset..new_offset;
+        self.selection.reversed = false;
+    }
+
+    /// Move the current line down by swapping it with the line below.
+    pub fn move_line_down(&mut self) {
+        let cursor = self.cursor_offset();
+        let (line, col) = self.line_col_for_offset(cursor);
+        let line_count = self.line_count();
+        if line + 1 >= line_count {
+            return;
+        }
+        let below = line + 1;
+        let current_start = self.rope.line_to_byte(line);
+        let current_end = self.rope.line_to_byte(below); // includes newline of current line
+        let below_start = current_end;
+        let below_end = if below + 1 < self.rope.len_lines() {
+            self.rope.line_to_byte(below + 1)
+        } else {
+            self.rope.len_bytes()
+        };
+        let current_text = self.get_byte_range_text(current_start..current_end);
+        let below_text = self.get_byte_range_text(below_start..below_end);
+        let below_has_nl = below_text.ends_with('\n');
+        let swapped = if below_has_nl {
+            format!("{}{}", below_text, current_text)
+        } else {
+            format!("{}\n{}", below_text, current_text.trim_end_matches('\n'))
+        };
+        self.selection.range = current_start..below_end;
+        self.selection.reversed = false;
+        self.replace_selection(&swapped);
+        // Cursor moves to same column on the line below (the moved line is now at `below`).
+        let new_offset = self.offset_for_line_col(below, col);
+        self.selection.range = new_offset..new_offset;
+        self.selection.reversed = false;
+    }
+
+    /// Insert 4 spaces at the start of the current line.
+    pub fn indent(&mut self) {
+        let cursor = self.cursor_offset();
+        let (line, col) = self.line_col_for_offset(cursor);
+        let line_start = self.line_range(line).start;
+        self.selection.range = line_start..line_start;
+        self.selection.reversed = false;
+        self.replace_selection(TAB_TEXT);
+        // Shift cursor right by indent amount.
+        let new_offset = self.offset_for_line_col(line, col + TAB_TEXT.len());
+        self.selection.range = new_offset..new_offset;
+        self.selection.reversed = false;
+    }
+
+    /// Remove up to 4 leading spaces from the current line.
+    pub fn outdent(&mut self) {
+        let cursor = self.cursor_offset();
+        let (line, col) = self.line_col_for_offset(cursor);
+        let line_range = self.line_range(line);
+        let line_text = self.line_text(line);
+        let spaces_to_remove = line_text
+            .chars()
+            .take(TAB_TEXT.len())
+            .take_while(|&c| c == ' ')
+            .count();
+        if spaces_to_remove == 0 {
+            return;
+        }
+        self.selection.range = line_range.start..line_range.start + spaces_to_remove;
+        self.selection.reversed = false;
+        self.replace_selection("");
+        // Shift cursor left by removed amount, but not past the line start.
+        let new_col = col.saturating_sub(spaces_to_remove);
+        let new_offset = self.offset_for_line_col(line, new_col);
+        self.selection.range = new_offset..new_offset;
+        self.selection.reversed = false;
+    }
 }
 
 /// Compute the "logical" line count, collapsing the phantom trailing line

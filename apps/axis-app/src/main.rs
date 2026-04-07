@@ -7565,7 +7565,52 @@ impl AxisShell {
                     cx.notify();
                     return true;
                 }
+                "d" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.duplicate_line();
+                        changed = true;
+                    }
+                }
+                "/" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.toggle_line_comment();
+                        changed = true;
+                    }
+                }
+                "k" if keystroke.modifiers.shift => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.delete_line();
+                        changed = true;
+                    }
+                }
+                "]" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.indent();
+                        changed = true;
+                    }
+                }
+                "[" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.outdent();
+                        changed = true;
+                    }
+                }
                 _ => {}
+            }
+        }
+
+        // Option+Up: move line up
+        if keystroke.key == "up" && keystroke.modifiers.alt && !keystroke.modifiers.platform {
+            if let Some(editor) = self.active_editor_mut() {
+                editor.move_line_up();
+                changed = true;
+            }
+        }
+        // Option+Down: move line down
+        if keystroke.key == "down" && keystroke.modifiers.alt && !keystroke.modifiers.platform {
+            if let Some(editor) = self.active_editor_mut() {
+                editor.move_line_down();
+                changed = true;
             }
         }
 
