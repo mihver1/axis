@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use axis_agent_runtime::adapters::codex::CodexProvider;
+use axis_agent_runtime::adapters::cursor::CursorProvider;
 use axis_agent_runtime::adapters::process_only::ProcessOnlyProvider;
 use axis_agent_runtime::{
     provider_base_argv_from_env_or_default, ProviderProfileMetadata, ProviderRegistry,
@@ -14,9 +15,11 @@ use axis_core::SurfaceId;
 
 const CODEX_PROFILE_ID: &str = "codex";
 const CLAUDE_CODE_PROFILE_ID: &str = "claude-code";
+const CURSOR_PROFILE_ID: &str = "cursor";
 const CLAUDE_CODE_CAPABILITY_NOTE: &str = "basic lifecycle only";
 const CODEX_BIN_ENV: &str = "AXIS_CODEX_BIN";
 const CLAUDE_CODE_BIN_ENV: &str = "AXIS_CLAUDE_CODE_BIN";
+const CURSOR_BIN_ENV: &str = "AXIS_CURSOR_BIN";
 const DETAIL_PROGRESS_POLL_ATTEMPTS: usize = 100;
 const DETAIL_PROGRESS_POLL_SLEEP: Duration = Duration::from_millis(10);
 const DETAIL_PROGRESS_QUIET_WINDOW: Duration = Duration::from_millis(120);
@@ -59,6 +62,13 @@ impl DaemonAgentRuntime {
                 claude_base_argv,
             )),
             Some(CLAUDE_CODE_CAPABILITY_NOTE),
+        );
+        let cursor_base_argv =
+            provider_base_argv_from_env_or_default(CURSOR_BIN_ENV, CURSOR_PROFILE_ID);
+        registry.register_with_metadata(
+            CURSOR_PROFILE_ID,
+            std::sync::Arc::new(CursorProvider::with_base_argv(cursor_base_argv)),
+            None::<String>,
         );
 
         Self {

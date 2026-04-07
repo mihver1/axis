@@ -7,6 +7,7 @@ use std::path::Path;
 use parking_lot::Mutex;
 
 use axis_agent_runtime::adapters::codex::CodexProvider;
+use axis_agent_runtime::adapters::cursor::CursorProvider;
 use axis_agent_runtime::adapters::process_only::ProcessOnlyProvider;
 use axis_agent_runtime::{
     resolve_provider_command_from_env_or_default, resolve_provider_command_from_env_or_default_for_cwd,
@@ -21,9 +22,11 @@ use axis_terminal::TerminalAgentMetadata;
 
 const CODEX_PROFILE_ID: &str = "codex";
 const CLAUDE_CODE_PROFILE_ID: &str = "claude-code";
+const CURSOR_PROFILE_ID: &str = "cursor";
 const CLAUDE_CODE_CAPABILITY_NOTE: &str = "basic lifecycle only";
 const CODEX_BIN_ENV: &str = "AXIS_CODEX_BIN";
 const CLAUDE_CODE_BIN_ENV: &str = "AXIS_CLAUDE_CODE_BIN";
+const CURSOR_BIN_ENV: &str = "AXIS_CURSOR_BIN";
 
 /// Current connectivity status with the axisd daemon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +102,15 @@ impl AgentRuntimeBridge {
             )),
             Some(CLAUDE_CODE_CAPABILITY_NOTE),
         );
+        let cursor_resolution =
+            resolve_provider_command_from_env_or_default(CURSOR_BIN_ENV, CURSOR_PROFILE_ID);
+        registry.register_with_metadata(
+            CURSOR_PROFILE_ID,
+            std::sync::Arc::new(CursorProvider::with_base_argv(
+                cursor_resolution.argv.clone(),
+            )),
+            None::<String>,
+        );
         let provider_options = vec![
             ProviderProfileOption {
                 profile_id: CODEX_PROFILE_ID.to_string(),
@@ -111,6 +123,12 @@ impl AgentRuntimeBridge {
                 capability_note: Some(CLAUDE_CODE_CAPABILITY_NOTE.to_string()),
                 available: claude_resolution.available,
                 unavailable_reason: claude_resolution.unavailable_reason.clone(),
+            },
+            ProviderProfileOption {
+                profile_id: CURSOR_PROFILE_ID.to_string(),
+                capability_note: None,
+                available: cursor_resolution.available,
+                unavailable_reason: cursor_resolution.unavailable_reason.clone(),
             },
         ];
         let provider_option_command_sources = HashMap::from([
@@ -126,6 +144,13 @@ impl AgentRuntimeBridge {
                 ProviderOptionCommandSource {
                     env_name: CLAUDE_CODE_BIN_ENV,
                     default_binary: CLAUDE_CODE_PROFILE_ID,
+                },
+            ),
+            (
+                CURSOR_PROFILE_ID.to_string(),
+                ProviderOptionCommandSource {
+                    env_name: CURSOR_BIN_ENV,
+                    default_binary: CURSOR_PROFILE_ID,
                 },
             ),
         ]);
