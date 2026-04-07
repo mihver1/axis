@@ -5560,20 +5560,27 @@ impl AxisShell {
     /// This keeps provider stdout draining off the UI thread so slow providers
     /// cannot block frame rendering.
     fn start_agent_poll_loop(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
-            Timer::after(Duration::from_millis(200)).await;
+        cx.spawn(async move |this, cx| {
+            let mut tick: u64 = 0;
+            loop {
+                Timer::after(Duration::from_millis(200)).await;
 
-            if this
-                .update(cx, |this, cx| {
-                    this.agent_runtime.poll_all_active_sessions();
-                    let agent_changed = this.sync_agent_runtime_activity(cx);
-                    if agent_changed {
-                        cx.notify();
-                    }
-                })
-                .is_err()
-            {
-                break;
+                tick += 1;
+                if this
+                    .update(cx, |this, cx| {
+                        this.agent_runtime.poll_all_active_sessions();
+                        if tick % 30 == 0 {
+                            this.agent_runtime.prune_expired_sessions(std::time::Duration::from_secs(30));
+                        }
+                        let agent_changed = this.sync_agent_runtime_activity(cx);
+                        if agent_changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();

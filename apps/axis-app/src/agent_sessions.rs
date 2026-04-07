@@ -63,6 +63,8 @@ struct BridgeInner {
     surface_to_session: HashMap<SurfaceRuntimeKey, AgentSessionId>,
     provider_options: Vec<ProviderProfileOption>,
     provider_option_command_sources: HashMap<String, ProviderOptionCommandSource>,
+    /// Tracks when sessions entered terminal state (Completed/Failed/Cancelled)
+    terminal_since: HashMap<AgentSessionId, std::time::Instant>,
 }
 
 impl AgentRuntimeBridge {
@@ -143,6 +145,7 @@ impl AgentRuntimeBridge {
                 surface_to_session: HashMap::new(),
                 provider_options,
                 provider_option_command_sources,
+                terminal_since: HashMap::new(),
             }),
         }
     }
@@ -474,8 +477,38 @@ impl AgentRuntimeBridge {
             }
             let _ = guard.manager.poll_provider(session_id);
             polled += 1;
+
+            // After polling a session, check if it became terminal
+            if let Some(session) = guard.manager.session(session_id) {
+                match session.lifecycle {
+                    AgentLifecycle::Completed | AgentLifecycle::Failed | AgentLifecycle::Cancelled => {
+                        guard.terminal_since
+                            .entry(session_id.clone())
+                            .or_insert_with(std::time::Instant::now);
+                    }
+                    _ => {}
+                }
+            }
         }
         polled
+    }
+
+    /// Remove sessions that have been in terminal state for longer than max_age.
+    pub fn prune_expired_sessions(&self, max_age: std::time::Duration) {
+        let mut guard = self.inner.lock();
+        let now = std::time::Instant::now();
+        let expired: Vec<AgentSessionId> = guard
+            .terminal_since
+            .iter()
+            .filter(|(_, since)| now.duration_since(**since) >= max_age)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for session_id in &expired {
+            guard.terminal_since.remove(session_id);
+            guard.surface_to_session.retain(|_, sid| sid != session_id);
+            let _ = guard.manager.stop_session(session_id);
+        }
     }
 
     pub fn poll_surface(
