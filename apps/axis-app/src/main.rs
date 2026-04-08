@@ -41,7 +41,7 @@ mod remote_terminals;
 mod review;
 mod worktrees;
 use automation::{AutomationEnvelope, AutomationServer};
-use axis_editor::{EditorBuffer, HighlightKind};
+use axis_editor::{DiffAnnotation, DiffLineKind, EditorBuffer, HighlightKind};
 use axis_terminal::{
     ghostty_build_info, TerminalColor, TerminalGridSize, TerminalRow, TerminalRun, TerminalSnapshot,
 };
@@ -6385,9 +6385,10 @@ impl AxisShell {
                 return false;
             };
             let absolute_path = review_file_absolute_path(desk, &file.path);
-            (absolute_path.display().to_string(), line_no)
+            let annotations = build_diff_annotations_for_file(payload, &file.path);
+            (absolute_path.display().to_string(), line_no, annotations)
         };
-        let (absolute_string, line_no) = resolved;
+        let (absolute_string, line_no, annotations) = resolved;
         match self.spawn_surface_on_workdesk(
             review_desk_index,
             None,
@@ -6399,6 +6400,11 @@ impl AxisShell {
         ) {
             Ok((pane_id, surface_id)) => {
                 self.move_active_editor_to_line(surface_id, line_no as usize);
+                if let Some(editor) = self.workdesks.get_mut(review_desk_index)
+                    .and_then(|desk| desk.editors.get_mut(&surface_id))
+                {
+                    editor.set_diff_annotations(annotations);
+                }
                 self.sync_editor_surface_metadata(pane_id, surface_id);
                 self.request_persist(cx);
                 cx.notify();
@@ -7606,6 +7612,28 @@ impl AxisShell {
                         changed = true;
                     }
                 }
+                "]" if keystroke.modifiers.shift => {
+                    // Cmd+Shift+]: jump to next diff hunk
+                    let target_line = self.active_editor().and_then(|e| e.next_diff_hunk());
+                    if let (Some(line_index), Some((_, surface_id))) =
+                        (target_line, self.active_editor_ids())
+                    {
+                        self.move_active_editor_to_line(surface_id, line_index + 1);
+                        cx.notify();
+                    }
+                    return true;
+                }
+                "[" if keystroke.modifiers.shift => {
+                    // Cmd+Shift+[: jump to previous diff hunk
+                    let target_line = self.active_editor().and_then(|e| e.previous_diff_hunk());
+                    if let (Some(line_index), Some((_, surface_id))) =
+                        (target_line, self.active_editor_ids())
+                    {
+                        self.move_active_editor_to_line(surface_id, line_index + 1);
+                        cx.notify();
+                    }
+                    return true;
+                }
                 "]" => {
                     if let Some(editor) = self.active_editor_mut() {
                         editor.indent();
@@ -8441,18 +8469,42 @@ impl AxisShell {
                         .map(|line_index| {
                             let line_label =
                                 format!("{:>width$}", line_index + 1, width = line_number_width);
+                            let diff_bar_color: Option<gpui::Hsla> =
+                                editor.diff_kind_for_line(line_index).map(|kind| match kind {
+                                    DiffLineKind::Addition => rgb(0x4ec990).into(),
+                                    DiffLineKind::Removal => rgb(0xe06c75).into(),
+                                    DiffLineKind::Context => rgba(0x00000000).into(),
+                                });
+                            let gutter_div = div()
+                                .w(px(gutter_width))
+                                .h(px(line_height))
+                                .flex()
+                                .items_stretch()
+                                .flex_row();
+                            let gutter_div = if let Some(color) = diff_bar_color {
+                                gutter_div.child(
+                                    div()
+                                        .w(px(3.0))
+                                        .h_full()
+                                        .flex_shrink_0()
+                                        .bg(color),
+                                )
+                            } else {
+                                gutter_div.child(div().w(px(3.0)).h_full().flex_shrink_0())
+                            };
+                            let gutter_div = gutter_div.child(
+                                div()
+                                    .flex_1()
+                                    .pr_3()
+                                    .text_right()
+                                    .text_color(rgb(0x63717b))
+                                    .child(line_label),
+                            );
                             div()
                                 .h(px(line_height))
                                 .flex()
                                 .items_start()
-                                .child(
-                                    div()
-                                        .w(px(gutter_width))
-                                        .pr_3()
-                                        .text_right()
-                                        .text_color(rgb(0x63717b))
-                                        .child(line_label),
-                                )
+                                .child(gutter_div)
                                 .child(div().flex_1().whitespace_nowrap().child(
                                     editor_line_display(
                                         editor,
@@ -12476,6 +12528,29 @@ fn review_file_absolute_path(desk: &WorkdeskState, relative_path: &str) -> PathB
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(desk.metadata.cwd.trim()));
     root.join(relative_path)
+}
+
+fn build_diff_annotations_for_file(payload: &DeskReviewPayload, file_path: &str) -> Vec<DiffAnnotation> {
+    use axis_core::review::ReviewLineKind as RLK;
+    let mut annotations = Vec::new();
+    if let Some(file_diff) = payload.files.iter().find(|f| f.path == file_path) {
+        for hunk in &file_diff.hunks {
+            for line in &hunk.lines {
+                if let Some(new_line_num) = line.new_line {
+                    let kind = match line.kind {
+                        RLK::Addition => DiffLineKind::Addition,
+                        RLK::Removal => DiffLineKind::Removal,
+                        _ => DiffLineKind::Context,
+                    };
+                    annotations.push(DiffAnnotation {
+                        line: (new_line_num as usize).saturating_sub(1), // 0-indexed
+                        kind,
+                    });
+                }
+            }
+        }
+    }
+    annotations
 }
 
 fn clamp_review_panel_selection(desk: &mut WorkdeskState) {

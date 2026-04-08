@@ -71,6 +71,20 @@ pub enum LanguageKind {
     Markdown,
 }
 
+/// A line-level diff annotation for review integration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffLineKind {
+    Addition,
+    Removal,
+    Context,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiffAnnotation {
+    pub line: usize,
+    pub kind: DiffLineKind,
+}
+
 #[derive(Clone, Debug)]
 pub struct EditorBuffer {
     path: PathBuf,
@@ -91,6 +105,7 @@ pub struct EditorBuffer {
     external_modified: bool,
     document_version: u64,
     pending_deltas: Vec<TextDelta>,
+    diff_annotations: Vec<DiffAnnotation>,
 }
 
 impl EditorBuffer {
@@ -132,6 +147,7 @@ impl EditorBuffer {
             external_modified: false,
             document_version: 0,
             pending_deltas: Vec::new(),
+            diff_annotations: Vec::new(),
         };
         this.selection.range = 0..0;
         this.last_synced_modified_at = file_modified_at(&this.path);
@@ -822,6 +838,68 @@ impl EditorBuffer {
 
     pub fn take_pending_deltas(&mut self) -> Vec<TextDelta> {
         std::mem::take(&mut self.pending_deltas)
+    }
+
+    pub fn set_diff_annotations(&mut self, annotations: Vec<DiffAnnotation>) {
+        self.diff_annotations = annotations;
+    }
+
+    pub fn clear_diff_annotations(&mut self) {
+        self.diff_annotations.clear();
+    }
+
+    pub fn diff_annotations(&self) -> &[DiffAnnotation] {
+        &self.diff_annotations
+    }
+
+    /// Get the diff kind for a specific line, if any.
+    pub fn diff_kind_for_line(&self, line: usize) -> Option<&DiffLineKind> {
+        self.diff_annotations.iter()
+            .find(|a| a.line == line)
+            .map(|a| &a.kind)
+    }
+
+    /// Find the next hunk boundary after the current cursor position.
+    pub fn next_diff_hunk(&self) -> Option<usize> {
+        let (current_line, _) = self.line_col_for_offset(self.cursor_offset());
+        let current_kind = self.diff_kind_for_line(current_line);
+
+        // Find next line where diff kind changes (from current to different, or from none to some)
+        for line in (current_line + 1)..self.line_count() {
+            let kind = self.diff_kind_for_line(line);
+            if kind.is_some() && kind != current_kind {
+                return Some(line);
+            }
+            // Also trigger on transition from annotated back to none then to annotated
+            if current_kind.is_some() && kind.is_none() {
+                // We left the current hunk, now find the next one
+                for next_line in (line + 1)..self.line_count() {
+                    if self.diff_kind_for_line(next_line).is_some() {
+                        return Some(next_line);
+                    }
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Find the previous hunk boundary before the current cursor position.
+    pub fn previous_diff_hunk(&self) -> Option<usize> {
+        let (current_line, _) = self.line_col_for_offset(self.cursor_offset());
+
+        // Go backwards, find a line with a diff annotation that's in a different hunk
+        let mut in_gap = false;
+        for line in (0..current_line).rev() {
+            let kind = self.diff_kind_for_line(line);
+            if kind.is_none() {
+                in_gap = true;
+            } else if in_gap {
+                // Found a line in a previous hunk
+                return Some(line);
+            }
+        }
+        None
     }
 
     fn move_to(&mut self, offset: usize, selecting: bool) {
