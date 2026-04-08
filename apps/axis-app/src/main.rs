@@ -247,6 +247,10 @@ struct AxisShell {
     file_picker_files: Vec<String>,
     file_picker_filtered: Vec<String>,
     file_picker_selected: usize,
+    /// Tracks when each session entered its current attention state (for escalation).
+    attention_since: HashMap<AgentSessionId, (AgentAttention, Instant)>,
+    /// Set of sessions escalated due to prolonged NeedsInput (>2 min).
+    escalated_sessions: HashSet<AgentSessionId>,
 }
 
 #[derive(Clone, Debug)]
@@ -3093,6 +3097,8 @@ impl AxisShell {
             file_picker_files: Vec::new(),
             file_picker_filtered: Vec::new(),
             file_picker_selected: 0,
+            attention_since: HashMap::new(),
+            escalated_sessions: HashSet::new(),
         };
         shell.assign_workdesk_ids_to_workdesks();
         shell.assign_runtime_ids_to_workdesks();
@@ -3355,6 +3361,48 @@ impl AxisShell {
         } else {
             SIDEBAR_WIDTH
         }
+    }
+
+    /// Update escalation state for all active sessions.
+    ///
+    /// For sessions where attention is `NeedsInput` and the timer exceeds 2 minutes,
+    /// the session is added to `escalated_sessions`. When attention changes, the timer
+    /// is reset and escalation is cleared.
+    fn update_attention_escalation(&mut self) {
+        const ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
+
+        let sessions = self.agent_runtime.sessions_snapshot();
+        let now = Instant::now();
+
+        // Track currently active session IDs to prune stale entries later.
+        let mut active_ids: HashSet<AgentSessionId> = HashSet::new();
+
+        for record in &sessions {
+            active_ids.insert(record.id.clone());
+            let current_attention = record.attention;
+
+            // Check if attention changed since we last saw this session.
+            match self.attention_since.get(&record.id) {
+                Some((prev_attention, _since)) if *prev_attention == current_attention => {
+                    // Same attention — check if NeedsInput for long enough to escalate.
+                    if current_attention == AgentAttention::NeedsInput {
+                        let since = self.attention_since[&record.id].1;
+                        if now.duration_since(since) >= ESCALATION_THRESHOLD {
+                            self.escalated_sessions.insert(record.id.clone());
+                        }
+                    }
+                }
+                _ => {
+                    // Attention changed (or new session) — reset timer and clear escalation.
+                    self.attention_since.insert(record.id.clone(), (current_attention, now));
+                    self.escalated_sessions.remove(&record.id);
+                }
+            }
+        }
+
+        // Prune entries for sessions that no longer exist.
+        self.attention_since.retain(|id, _| active_ids.contains(id));
+        self.escalated_sessions.retain(|id| active_ids.contains(id));
     }
 
     fn shortcut_label(&self, action: ShortcutAction) -> String {
@@ -5612,6 +5660,10 @@ impl AxisShell {
                             this.daemon_connected = now_connected;
                         }
                         let agent_changed = this.sync_agent_runtime_activity(cx);
+                        // Update escalation state every 5 ticks (~1 second).
+                        if tick % 5 == 0 {
+                            this.update_attention_escalation();
+                        }
                         if agent_changed {
                             cx.notify();
                         }
@@ -9417,6 +9469,42 @@ impl Render for AxisShell {
                         .join(" · ")
                 };
                 let accent = workdesk_accent(index);
+                // Build per-session rows for agent panes on this desk.
+                let agent_session_rows: Vec<AgentSessionSidebarRow> = desk
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.kind == PaneKind::Agent)
+                    .filter_map(|pane| {
+                        let surface_id = pane.active_surface_id;
+                        let record = self
+                            .agent_runtime
+                            .session_for_surface(desk.runtime_id, surface_id)?;
+                        let attention = record.attention;
+                        let escalated = self.escalated_sessions.contains(&record.id);
+                        let provider_label = record.provider_profile_id.clone();
+                        Some(AgentSessionSidebarRow {
+                            pane_id: pane.id,
+                            pane_title: pane.title.clone(),
+                            provider_label,
+                            attention,
+                            escalated,
+                        })
+                    })
+                    .collect();
+                let session_click_listeners: Vec<Box<dyn Fn(&MouseUpEvent, &mut Window, &mut App)>> =
+                    agent_session_rows
+                        .iter()
+                        .map(|row| {
+                            let pane_id = row.pane_id;
+                            let listener: Box<dyn Fn(&MouseUpEvent, &mut Window, &mut App)> =
+                                cx.listener(move |this, _, _, cx| {
+                                    this.dismiss_workdesk_menu();
+                                    this.navigate_to_workdesk_pane(index, pane_id, cx);
+                                    cx.stop_propagation();
+                                });
+                            listener
+                        })
+                        .collect();
                 if self.sidebar_collapsed {
                     workdesk_compact_chip(
                         index,
@@ -9448,6 +9536,8 @@ impl Render for AxisShell {
                         preview,
                         workdesk_navigation_target(desk),
                         accent,
+                        agent_session_rows,
+                        session_click_listeners,
                         cx.listener(move |this, _, _, cx| {
                             this.dismiss_workdesk_menu();
                             this.select_workdesk(index, cx);
@@ -13053,6 +13143,8 @@ fn workdesk_card(
     preview: String,
     navigation_target: Option<WorkdeskNavigationTarget>,
     accent: gpui::Hsla,
+    agent_session_rows: Vec<AgentSessionSidebarRow>,
+    session_click_listeners: Vec<Box<dyn Fn(&MouseUpEvent, &mut Window, &mut App)>>,
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     context_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     navigation_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
@@ -13424,6 +13516,24 @@ fn workdesk_card(
                                 .child(focus_label),
                         ),
                 ),
+            )
+        })
+        .when(!agent_session_rows.is_empty(), |card| {
+            let rows_with_listeners: Vec<_> = agent_session_rows
+                .into_iter()
+                .zip(session_click_listeners.into_iter())
+                .map(|(row, listener)| agent_session_row(&row, listener))
+                .collect();
+            card.child(
+                div()
+                    .mt(px(2.0))
+                    .pt(px(4.0))
+                    .border_t_1()
+                    .border_color(rgb(0x1e2b34))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .children(rows_with_listeners),
             )
         })
 }
@@ -14331,6 +14441,75 @@ fn attention_indicator(state: AttentionState, unread: bool) -> impl IntoElement 
                     .rounded_full()
                     .border_1()
                     .border_color(tint),
+            )
+        })
+}
+
+/// Map `AgentAttention` to an RGB color, applying escalation logic.
+/// Escalated NeedsInput sessions show red instead of yellow.
+fn attention_color(attention: AgentAttention, escalated: bool) -> gpui::Hsla {
+    match (attention, escalated) {
+        (AgentAttention::Quiet, _) => rgb(0x63717b).into(),
+        (AgentAttention::Working, _) => rgb(0x7cc7ff).into(),
+        (AgentAttention::NeedsInput, true) => rgb(0xe06c75).into(),  // red (escalated)
+        (AgentAttention::NeedsInput, false) => rgb(0xf0d35f).into(), // yellow
+        (AgentAttention::NeedsReview, _) => rgb(0xd19a66).into(),
+        (AgentAttention::Error, _) => rgb(0xe06c75).into(),
+    }
+}
+
+/// A pre-computed row of info for a single agent session shown in the sidebar workdesk card.
+#[derive(Clone, Debug)]
+struct AgentSessionSidebarRow {
+    pane_id: PaneId,
+    pane_title: String,
+    provider_label: String,
+    attention: AgentAttention,
+    escalated: bool,
+}
+
+/// Render a single agent session row within the sidebar workdesk card.
+fn agent_session_row(
+    row: &AgentSessionSidebarRow,
+    on_click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let color = attention_color(row.attention, row.escalated);
+    let provider = row.provider_label.clone();
+    let title = row.pane_title.clone();
+    let escalated = row.escalated;
+
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px(px(4.0))
+        .py(px(2.0))
+        .rounded_md()
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(MouseButton::Left, on_click)
+        .child(
+            div()
+                .w(px(8.0))
+                .h(px(8.0))
+                .rounded_full()
+                .bg(color),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(color)
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(format!("{provider} · {title}")),
+        )
+        .when(escalated, |row| {
+            row.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xe06c75))
+                    .child("!"),
             )
         })
 }
