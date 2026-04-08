@@ -27,6 +27,7 @@ fn start_session(mgr: &mut SessionManager) -> axis_core::agent::AgentSessionId {
         transport: AgentTransportKind::CliWrapped,
         argv_suffix: vec![],
         env: BTreeMap::new(),
+        workdesk_id: None,
     })
     .unwrap()
 }
@@ -186,6 +187,24 @@ fn send_turn_respond_approval_and_resume_apply_provider_events() {
         }
         entry => panic!("expected approval entry, got {entry:?}"),
     }
+
+    // Advance to Waiting so that resume() (Waiting → Running) is a valid transition.
+    mgr.apply_events([
+        RuntimeEvent::Lifecycle {
+            session_id: id.clone(),
+            lifecycle: AgentLifecycle::Starting,
+        },
+        RuntimeEvent::Lifecycle {
+            session_id: id.clone(),
+            lifecycle: AgentLifecycle::Running,
+        },
+        RuntimeEvent::Lifecycle {
+            session_id: id.clone(),
+            lifecycle: AgentLifecycle::Waiting,
+        },
+    ])
+    .unwrap();
+    assert_eq!(mgr.session(&id).unwrap().lifecycle, AgentLifecycle::Waiting);
 
     mgr.resume(&id).unwrap();
     assert_eq!(mgr.session(&id).unwrap().attention, AgentAttention::Working);

@@ -57,6 +57,11 @@ impl DaemonClient {
         Self { socket_path }
     }
 
+    /// Returns true if the daemon socket file exists on disk.
+    pub fn socket_path_exists(&self) -> bool {
+        self.socket_path.exists()
+    }
+
     pub fn ensure_terminal(
         &self,
         workdesk_id: &str,

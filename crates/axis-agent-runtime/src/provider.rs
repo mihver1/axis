@@ -19,6 +19,8 @@ pub struct StartAgentRequest {
     pub argv_suffix: Vec<String>,
     /// Environment entries merged onto the child process environment.
     pub env: BTreeMap<String, String>,
+    /// Optional workdesk binding; stored on the session record at creation time.
+    pub workdesk_id: Option<String>,
 }
 
 /// Handle returned after a provider accepts a start request.

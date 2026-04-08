@@ -341,6 +341,16 @@ pub(crate) fn file_review_aggregate(
     }
 }
 
+/// ARGB hex color for a per-file status dot rendered in the review panel file list.
+pub fn file_status_color(aggregate: FileReviewAggregate) -> u32 {
+    match aggregate {
+        FileReviewAggregate::AllReviewed => 0x4ec990, // green
+        FileReviewAggregate::HasFollowUp => 0xf0d35f, // yellow
+        FileReviewAggregate::InProgress => 0x7f8a94,  // gray
+        FileReviewAggregate::NoHunks => 0x63717b,     // dim gray
+    }
+}
+
 /// Hunk-level actions (mark reviewed / follow-up / clear) are disabled when there are no textual hunks.
 pub(crate) fn review_hunk_actions_disabled(file: &ReviewFileDiff) -> bool {
     file.hunks.is_empty()
@@ -612,9 +622,14 @@ fn valid_hunk_keys(
 
 fn stale_notice_for_refresh(previous: Option<&str>, stale_rich_payload: bool) -> Option<String> {
     if stale_rich_payload {
-        Some(previous.map(String::from).unwrap_or_else(|| {
-            "Diff details may be out of date; file list reflects the latest summary.".to_string()
-        }))
+        Some(
+            previous
+                .map(String::from)
+                .unwrap_or_else(|| {
+                    "Diff details may be out of date — auto-refreshing in background."
+                        .to_string()
+                }),
+        )
     } else {
         None
     }
@@ -632,7 +647,7 @@ pub(crate) fn review_workspace_setup_notice(binding: &WorktreeBinding) -> Option
     if let Some(base) = binding.base_branch.as_deref() {
         if !git_ref_verifies(root, base) {
             return Some(format!(
-                "Base branch '{base}' is not available in this clone; comparing against HEAD instead."
+                "Base branch '{base}' is not available in this clone; comparing against HEAD instead. Run `git fetch origin` or configure base branch."
             ));
         }
     }

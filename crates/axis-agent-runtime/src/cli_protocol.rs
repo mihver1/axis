@@ -12,6 +12,7 @@ const AXIS_EVENT_PREFIX: &str = "AXIS_EVENT ";
 const AXIS_CMD_PREFIX: &str = "AXIS_CMD ";
 const AXIS_ATTENTION_PREFIX: &str = "AXIS_ATTENTION ";
 const AXIS_STATUS_PREFIX: &str = "AXIS_STATUS ";
+pub const AXIS_APPROVAL_REQUEST_PREFIX: &str = "AXIS_APPROVAL_REQUEST ";
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(
@@ -77,6 +78,13 @@ pub fn parse_axis_output_line(
         return Some(vec![RuntimeEvent::Status {
             session_id: session_id.clone(),
             message: rest.trim().to_string(),
+        }]);
+    }
+    if let Some(rest) = trimmed.strip_prefix(AXIS_APPROVAL_REQUEST_PREFIX) {
+        let approval = serde_json::from_str::<AgentApprovalRequest>(rest).ok()?;
+        return Some(vec![RuntimeEvent::ApprovalRequest {
+            session_id: session_id.clone(),
+            approval,
         }]);
     }
     None

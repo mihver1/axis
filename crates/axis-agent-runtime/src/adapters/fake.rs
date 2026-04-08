@@ -1,7 +1,7 @@
 //! Deterministic provider that emits a fixed script without subprocesses.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use axis_core::agent::{AgentAttention, AgentLifecycle, AgentSessionId};
 use axis_core::agent_history::{
@@ -94,10 +94,7 @@ impl AgentProvider for FakeProvider {
     }
 
     fn start(&self, _req: StartAgentRequest) -> anyhow::Result<StartedSession> {
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|e| anyhow::anyhow!("fake provider lock poisoned: {e}"))?;
+        let mut g = self.inner.lock();
         let id = AgentSessionId::new(format!("fake-session-{}", g.next_id));
         g.next_id += 1;
         let script = g.template.clone();
@@ -114,10 +111,7 @@ impl AgentProvider for FakeProvider {
     }
 
     fn poll_events(&self, session_id: &AgentSessionId) -> anyhow::Result<Vec<RuntimeEvent>> {
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|e| anyhow::anyhow!("fake provider lock poisoned: {e}"))?;
+        let mut g = self.inner.lock();
         let state = g
             .sessions
             .get_mut(session_id)
@@ -141,10 +135,7 @@ impl AgentProvider for FakeProvider {
     }
 
     fn send_turn(&self, req: SendTurnRequest) -> anyhow::Result<Vec<RuntimeEvent>> {
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|e| anyhow::anyhow!("fake provider lock poisoned: {e}"))?;
+        let mut g = self.inner.lock();
         let state = g
             .sessions
             .get_mut(&req.session_id)
@@ -173,10 +164,7 @@ impl AgentProvider for FakeProvider {
     }
 
     fn respond_approval(&self, req: RespondApprovalRequest) -> anyhow::Result<Vec<RuntimeEvent>> {
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|e| anyhow::anyhow!("fake provider lock poisoned: {e}"))?;
+        let mut g = self.inner.lock();
         let state = g
             .sessions
             .get_mut(&req.session_id)
@@ -207,10 +195,7 @@ impl AgentProvider for FakeProvider {
     }
 
     fn resume(&self, req: ResumeRequest) -> anyhow::Result<Vec<RuntimeEvent>> {
-        let g = self
-            .inner
-            .lock()
-            .map_err(|e| anyhow::anyhow!("fake provider lock poisoned: {e}"))?;
+        let g = self.inner.lock();
         if !g.sessions.contains_key(&req.session_id) {
             return Err(anyhow::anyhow!("unknown fake session {}", req.session_id.0));
         }
@@ -231,10 +216,7 @@ impl AgentProvider for FakeProvider {
     }
 
     fn stop(&self, session_id: &AgentSessionId) -> anyhow::Result<()> {
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|e| anyhow::anyhow!("fake provider lock poisoned: {e}"))?;
+        let mut g = self.inner.lock();
         g.sessions
             .remove(session_id)
             .ok_or_else(|| anyhow::anyhow!("unknown fake session {}", session_id.0))?;

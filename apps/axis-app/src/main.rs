@@ -22,11 +22,12 @@ use axis_core::{
 };
 use review::{
     build_desk_review_summary_view, build_desk_review_summary_view_from_payload,
-    editor_jump_line_for_review_row, merge_review_local_after_fetch,
-    refreshed_desk_review_summary_view, resolve_local_desk_review_payload,
-    reusable_review_payload_cache, review_changed_file_preview, review_editor_open_failed_notice,
-    review_file_hunkless_notice, review_payload_worktree_rebound, review_status_label,
-    review_workspace_setup_notice, DeskReviewSummaryView, ReviewPanelLocalState,
+    editor_jump_line_for_review_row, file_review_aggregate, file_status_color,
+    merge_review_local_after_fetch, refreshed_desk_review_summary_view,
+    resolve_local_desk_review_payload, review_changed_file_preview,
+    review_editor_open_failed_notice, review_file_hunkless_notice,
+    review_payload_worktree_rebound, review_status_label, review_workspace_setup_notice,
+    reusable_review_payload_cache, DeskReviewSummaryView, ReviewPanelLocalState,
     ReviewPanelRefreshContext,
 };
 
@@ -40,7 +41,7 @@ mod remote_terminals;
 mod review;
 mod worktrees;
 use automation::{AutomationEnvelope, AutomationServer};
-use axis_editor::{EditorBuffer, HighlightKind};
+use axis_editor::{DiffAnnotation, DiffLineKind, EditorBuffer, HighlightKind};
 use axis_terminal::{
     ghostty_build_info, TerminalColor, TerminalGridSize, TerminalRow, TerminalRun, TerminalSnapshot,
 };
@@ -209,6 +210,7 @@ struct AxisShell {
     next_workdesk_runtime_id: u64,
     agent_runtime: agent_sessions::AgentRuntimeBridge,
     last_agent_runtime_revision: u64,
+    daemon_connected: bool,
     workdesk_menu: Option<WorkdeskContextMenu>,
     stack_surface_menu: Option<StackSurfaceMenu>,
     // Popup UI and shortcuts land in follow-up tasks; state is wired here for Task 2.
@@ -238,6 +240,17 @@ struct AxisShell {
     persist_generation: u64,
     touchpad_pan_state: Option<TouchpadPanState>,
     last_touchpad_pan_end: Option<Instant>,
+    goto_line_open: bool,
+    goto_line_input: String,
+    file_picker_open: bool,
+    file_picker_query: String,
+    file_picker_files: Vec<String>,
+    file_picker_filtered: Vec<String>,
+    file_picker_selected: usize,
+    /// Tracks when each session entered its current attention state (for escalation).
+    attention_since: HashMap<AgentSessionId, (AgentAttention, Instant)>,
+    /// Set of sessions escalated due to prolonged NeedsInput (>2 min).
+    escalated_sessions: HashSet<AgentSessionId>,
 }
 
 #[derive(Clone, Debug)]
@@ -721,6 +734,8 @@ struct EditorViewState {
     char_width: f32,
     gutter_width: f32,
     viewport_lines: usize,
+    /// When the search/replace bar is open, true = replace field is active, false = find field.
+    replace_field_active: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3048,6 +3063,7 @@ impl AxisShell {
             next_workdesk_runtime_id: 1,
             agent_runtime,
             last_agent_runtime_revision: 0,
+            daemon_connected: false,
             workdesk_menu: None,
             stack_surface_menu: None,
             agent_provider_popup: None,
@@ -3074,6 +3090,15 @@ impl AxisShell {
             persist_generation: 0,
             touchpad_pan_state: None,
             last_touchpad_pan_end: None,
+            goto_line_open: false,
+            goto_line_input: String::new(),
+            file_picker_open: false,
+            file_picker_query: String::new(),
+            file_picker_files: Vec::new(),
+            file_picker_filtered: Vec::new(),
+            file_picker_selected: 0,
+            attention_since: HashMap::new(),
+            escalated_sessions: HashSet::new(),
         };
         shell.assign_workdesk_ids_to_workdesks();
         shell.assign_runtime_ids_to_workdesks();
@@ -3259,15 +3284,6 @@ impl AxisShell {
 
     fn sync_agent_runtime_activity(&mut self, cx: &mut Context<Self>) -> bool {
         self.sync_agent_desk_paths();
-        for desk in &self.workdesks {
-            for pane in &desk.panes {
-                for surface in &pane.surfaces {
-                    if surface.kind == PaneKind::Agent && desk.terminals.contains_key(&surface.id) {
-                        let _ = self.agent_runtime.poll_surface(desk.runtime_id, surface.id);
-                    }
-                }
-            }
-        }
         let rev = self.agent_runtime.revision();
         if rev != self.last_agent_runtime_revision {
             self.last_agent_runtime_revision = rev;
@@ -3345,6 +3361,48 @@ impl AxisShell {
         } else {
             SIDEBAR_WIDTH
         }
+    }
+
+    /// Update escalation state for all active sessions.
+    ///
+    /// For sessions where attention is `NeedsInput` and the timer exceeds 2 minutes,
+    /// the session is added to `escalated_sessions`. When attention changes, the timer
+    /// is reset and escalation is cleared.
+    fn update_attention_escalation(&mut self) {
+        const ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
+
+        let sessions = self.agent_runtime.sessions_snapshot();
+        let now = Instant::now();
+
+        // Track currently active session IDs to prune stale entries later.
+        let mut active_ids: HashSet<AgentSessionId> = HashSet::new();
+
+        for record in &sessions {
+            active_ids.insert(record.id.clone());
+            let current_attention = record.attention;
+
+            // Check if attention changed since we last saw this session.
+            match self.attention_since.get(&record.id) {
+                Some((prev_attention, _since)) if *prev_attention == current_attention => {
+                    // Same attention — check if NeedsInput for long enough to escalate.
+                    if current_attention == AgentAttention::NeedsInput {
+                        let since = self.attention_since[&record.id].1;
+                        if now.duration_since(since) >= ESCALATION_THRESHOLD {
+                            self.escalated_sessions.insert(record.id.clone());
+                        }
+                    }
+                }
+                _ => {
+                    // Attention changed (or new session) — reset timer and clear escalation.
+                    self.attention_since.insert(record.id.clone(), (current_attention, now));
+                    self.escalated_sessions.remove(&record.id);
+                }
+            }
+        }
+
+        // Prune entries for sessions that no longer exist.
+        self.attention_since.retain(|id, _| active_ids.contains(id));
+        self.escalated_sessions.retain(|id| active_ids.contains(id));
     }
 
     fn shortcut_label(&self, action: ShortcutAction) -> String {
@@ -5565,6 +5623,60 @@ impl AxisShell {
         .detach();
     }
 
+    /// Spawn a background task that polls all active agent sessions every 200 ms.
+    /// This keeps provider stdout draining off the UI thread so slow providers
+    /// cannot block frame rendering.
+    fn start_agent_poll_loop(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut tick: u64 = 0;
+            loop {
+                Timer::after(Duration::from_millis(200)).await;
+
+                tick += 1;
+                if this
+                    .update(cx, |this, cx| {
+                        this.agent_runtime.poll_all_active_sessions();
+                        if tick % 30 == 0 {
+                            this.agent_runtime.prune_expired_sessions(std::time::Duration::from_secs(30));
+                        }
+                        if tick % 25 == 0 {
+                            for desk_index in 0..this.workdesks.len() {
+                                let stale = this
+                                    .workdesks
+                                    .get(desk_index)
+                                    .map(|desk| desk.review_local_state.stale_notice.is_some())
+                                    .unwrap_or(false);
+                                if stale {
+                                    let _ = this.sync_review_summary_for_desk(desk_index);
+                                }
+                            }
+                        }
+                        if tick % 50 == 0 {
+                            let was_connected = this.daemon_connected;
+                            let now_connected = this.agent_runtime.check_daemon_health();
+                            if !was_connected && now_connected {
+                                this.agent_runtime.resync_daemon_sessions();
+                            }
+                            this.daemon_connected = now_connected;
+                        }
+                        let agent_changed = this.sync_agent_runtime_activity(cx);
+                        // Update escalation state every 5 ticks (~1 second).
+                        if tick % 5 == 0 {
+                            this.update_attention_escalation();
+                        }
+                        if agent_changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     fn sync_terminal_revisions(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
 
@@ -6325,9 +6437,10 @@ impl AxisShell {
                 return false;
             };
             let absolute_path = review_file_absolute_path(desk, &file.path);
-            (absolute_path.display().to_string(), line_no)
+            let annotations = build_diff_annotations_for_file(payload, &file.path);
+            (absolute_path.display().to_string(), line_no, annotations)
         };
-        let (absolute_string, line_no) = resolved;
+        let (absolute_string, line_no, annotations) = resolved;
         match self.spawn_surface_on_workdesk(
             review_desk_index,
             None,
@@ -6339,6 +6452,11 @@ impl AxisShell {
         ) {
             Ok((pane_id, surface_id)) => {
                 self.move_active_editor_to_line(surface_id, line_no as usize);
+                if let Some(editor) = self.workdesks.get_mut(review_desk_index)
+                    .and_then(|desk| desk.editors.get_mut(&surface_id))
+                {
+                    editor.set_diff_annotations(annotations);
+                }
                 self.sync_editor_surface_metadata(pane_id, surface_id);
                 self.request_persist(cx);
                 cx.notify();
@@ -6804,6 +6922,51 @@ impl AxisShell {
             return;
         }
 
+        if self.handle_goto_line_key_down(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.handle_file_picker_key_down(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        // Cmd+P: open our inline file picker (intercept before shortcut system's QuickOpen)
+        if event.keystroke.modifiers.platform
+            && event.keystroke.key == "p"
+            && !event.keystroke.modifiers.shift
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.control
+        {
+            self.file_picker_open = true;
+            self.file_picker_query.clear();
+            self.file_picker_selected = 0;
+            if self.file_picker_files.is_empty() {
+                if let Some(root) = self.active_worktree_root_path() {
+                    self.index_worktree_files(&root);
+                }
+            }
+            self.filter_file_picker();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        // Cmd+G (no shift): open go-to-line dialog (intercept before shortcut system)
+        if event.keystroke.modifiers.platform
+            && event.keystroke.key == "g"
+            && !event.keystroke.modifiers.shift
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.control
+        {
+            self.goto_line_open = true;
+            self.goto_line_input.clear();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
         if let Some(action) = self.shortcuts.matching_action(event) {
             if self.execute_shortcut_action(action, window, cx) {
                 cx.stop_propagation();
@@ -7121,6 +7284,165 @@ impl AxisShell {
         false
     }
 
+    fn handle_goto_line_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.goto_line_open {
+            return false;
+        }
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "escape" if !keystroke.modifiers.modified() => {
+                self.goto_line_open = false;
+                cx.notify();
+                return true;
+            }
+            "enter" if !keystroke.modifiers.modified() => {
+                if let Ok(line_num) = self.goto_line_input.parse::<usize>() {
+                    if let Some((pane_id, surface_id)) = self.active_editor_ids() {
+                        self.move_active_editor_to_line(surface_id, line_num);
+                        self.sync_editor_surface_metadata(pane_id, surface_id);
+                        cx.notify();
+                    }
+                }
+                self.goto_line_open = false;
+                cx.notify();
+                return true;
+            }
+            "backspace" | "delete" if !keystroke.modifiers.modified() => {
+                self.goto_line_input.pop();
+                cx.notify();
+                return true;
+            }
+            _ => {}
+        }
+        if let Some(text) = editable_keystroke_text(keystroke) {
+            if text.chars().all(|c| c.is_ascii_digit()) {
+                self.goto_line_input.push_str(&text);
+                cx.notify();
+            }
+            return true;
+        }
+        // Block all other keys while dialog is open
+        true
+    }
+
+    fn handle_file_picker_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.file_picker_open {
+            return false;
+        }
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "escape" if !keystroke.modifiers.modified() => {
+                self.file_picker_open = false;
+                cx.notify();
+                return true;
+            }
+            "enter" if !keystroke.modifiers.modified() => {
+                if let Some(path) = self.file_picker_filtered.get(self.file_picker_selected).cloned() {
+                    let root = self.workspace_palette_root();
+                    let absolute = root.join(&path).display().to_string();
+                    let desk_index = self.active_workdesk;
+                    let _ = self.spawn_surface_on_workdesk(
+                        desk_index,
+                        None,
+                        PaneKind::Editor,
+                        None,
+                        None,
+                        Some(absolute),
+                        true,
+                    );
+                    self.request_persist(cx);
+                }
+                self.file_picker_open = false;
+                cx.notify();
+                return true;
+            }
+            "up" if !keystroke.modifiers.modified() => {
+                self.file_picker_selected = self.file_picker_selected.saturating_sub(1);
+                cx.notify();
+                return true;
+            }
+            "down" if !keystroke.modifiers.modified() => {
+                let max = self.file_picker_filtered.len().saturating_sub(1);
+                self.file_picker_selected = (self.file_picker_selected + 1).min(max);
+                cx.notify();
+                return true;
+            }
+            "backspace" | "delete" if !keystroke.modifiers.modified() => {
+                self.file_picker_query.pop();
+                self.filter_file_picker();
+                cx.notify();
+                return true;
+            }
+            _ => {}
+        }
+        if let Some(text) = editable_keystroke_text(keystroke) {
+            self.file_picker_query.push_str(&text);
+            self.filter_file_picker();
+            cx.notify();
+            return true;
+        }
+        true
+    }
+
+    fn active_worktree_root_path(&self) -> Option<std::path::PathBuf> {
+        let path = self.workspace_palette_root();
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    fn index_worktree_files(&mut self, root: &std::path::Path) {
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, root: &std::path::Path, files: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name.starts_with('.') || name == "node_modules" || name == "target" || name == "vendor" {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(&path, root, files);
+                } else if let Ok(rel) = path.strip_prefix(root) {
+                    files.push(rel.to_string_lossy().to_string());
+                }
+            }
+        }
+        walk(root, root, &mut files);
+        files.sort();
+        self.file_picker_files = files;
+    }
+
+    fn filter_file_picker(&mut self) {
+        let query = self.file_picker_query.to_ascii_lowercase();
+        if query.is_empty() {
+            self.file_picker_filtered = self.file_picker_files.clone();
+        } else {
+            self.file_picker_filtered = self.file_picker_files.iter()
+                .filter(|f| {
+                    let lower = f.to_ascii_lowercase();
+                    let mut chars = query.chars();
+                    let mut current = chars.next();
+                    for c in lower.chars() {
+                        if current == Some(c) { current = chars.next(); }
+                    }
+                    current.is_none()
+                })
+                .cloned().collect();
+        }
+        self.file_picker_selected = 0;
+    }
+
     fn handle_editor_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let Some((pane_id, surface_id)) = self.active_editor_ids() else {
             return false;
@@ -7139,35 +7461,90 @@ impl AxisShell {
             .active_editor()
             .is_some_and(|editor| editor.search_state().open)
         {
+            let replace_field_active = self
+                .active_workdesk()
+                .editor_views
+                .get(&surface_id)
+                .map(|v| v.replace_field_active)
+                .unwrap_or(false);
+            let replace_open = self
+                .active_editor()
+                .is_some_and(|editor| editor.search_state().replace_open);
+
             if keystroke.key == "escape" && !keystroke.modifiers.modified() {
                 if let Some(editor) = self.active_editor_mut() {
                     editor.close_search();
                 }
-                cx.notify();
-                return true;
-            }
-            if keystroke.key == "enter" && !keystroke.modifiers.modified() {
-                if let Some(editor) = self.active_editor_mut() {
-                    editor.next_search_match();
+                if let Some(view) = self
+                    .active_workdesk_mut()
+                    .editor_views
+                    .get_mut(&surface_id)
+                {
+                    view.replace_field_active = false;
                 }
                 cx.notify();
                 return true;
             }
-            if matches!(keystroke.key.as_str(), "backspace" | "delete")
-                && !keystroke.modifiers.modified()
-            {
-                if let Some(editor) = self.active_editor_mut() {
-                    editor.pop_search_text();
+            // Tab: switch between find and replace fields
+            if keystroke.key == "tab" && !keystroke.modifiers.modified() && replace_open {
+                if let Some(view) = self
+                    .active_workdesk_mut()
+                    .editor_views
+                    .get_mut(&surface_id)
+                {
+                    view.replace_field_active = !view.replace_field_active;
                 }
                 cx.notify();
                 return true;
             }
-            if let Some(text) = editable_keystroke_text(keystroke) {
-                if let Some(editor) = self.active_editor_mut() {
-                    editor.append_search_text(&text);
+            if replace_field_active {
+                if keystroke.key == "enter" && !keystroke.modifiers.modified() {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.replace_current_match();
+                    }
+                    cx.notify();
+                    return true;
                 }
-                cx.notify();
-                return true;
+                if matches!(keystroke.key.as_str(), "backspace" | "delete")
+                    && !keystroke.modifiers.modified()
+                {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.pop_replace_text();
+                    }
+                    cx.notify();
+                    return true;
+                }
+                if let Some(text) = editable_keystroke_text(keystroke) {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.append_replace_text(&text);
+                    }
+                    cx.notify();
+                    return true;
+                }
+            } else {
+                if keystroke.key == "enter" && !keystroke.modifiers.modified() {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.next_search_match();
+                    }
+                    cx.notify();
+                    return true;
+                }
+                if matches!(keystroke.key.as_str(), "backspace" | "delete")
+                    && !keystroke.modifiers.modified()
+                {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.pop_search_text();
+                    }
+                    cx.notify();
+                    return true;
+                }
+                if let Some(text) = editable_keystroke_text(keystroke) {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.append_search_text(&text);
+                    }
+                    cx.notify();
+                    return true;
+                }
             }
         }
 
@@ -7192,19 +7569,39 @@ impl AxisShell {
                     if let Some(editor) = self.active_editor_mut() {
                         editor.open_search();
                     }
+                    if let Some(view) = self
+                        .active_workdesk_mut()
+                        .editor_views
+                        .get_mut(&surface_id)
+                    {
+                        view.replace_field_active = false;
+                    }
+                    cx.notify();
+                    return true;
+                }
+                "h" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.open_replace();
+                    }
+                    if let Some(view) = self
+                        .active_workdesk_mut()
+                        .editor_views
+                        .get_mut(&surface_id)
+                    {
+                        view.replace_field_active = false;
+                    }
                     cx.notify();
                     return true;
                 }
                 "g" => {
-                    if let Some(editor) = self.active_editor_mut() {
-                        if keystroke.modifiers.shift {
+                    if keystroke.modifiers.shift {
+                        if let Some(editor) = self.active_editor_mut() {
                             editor.previous_search_match();
-                        } else {
-                            editor.next_search_match();
                         }
+                        cx.notify();
+                        return true;
                     }
-                    cx.notify();
-                    return true;
+                    // Cmd+G without shift is intercepted at the global level (go-to-line dialog)
                 }
                 "z" => {
                     if let Some(editor) = self.active_editor_mut() {
@@ -7249,7 +7646,74 @@ impl AxisShell {
                     cx.notify();
                     return true;
                 }
+                "d" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.duplicate_line();
+                        changed = true;
+                    }
+                }
+                "/" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.toggle_line_comment();
+                        changed = true;
+                    }
+                }
+                "k" if keystroke.modifiers.shift => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.delete_line();
+                        changed = true;
+                    }
+                }
+                "]" if keystroke.modifiers.shift => {
+                    // Cmd+Shift+]: jump to next diff hunk
+                    let target_line = self.active_editor().and_then(|e| e.next_diff_hunk());
+                    if let (Some(line_index), Some((_, surface_id))) =
+                        (target_line, self.active_editor_ids())
+                    {
+                        self.move_active_editor_to_line(surface_id, line_index + 1);
+                        cx.notify();
+                    }
+                    return true;
+                }
+                "[" if keystroke.modifiers.shift => {
+                    // Cmd+Shift+[: jump to previous diff hunk
+                    let target_line = self.active_editor().and_then(|e| e.previous_diff_hunk());
+                    if let (Some(line_index), Some((_, surface_id))) =
+                        (target_line, self.active_editor_ids())
+                    {
+                        self.move_active_editor_to_line(surface_id, line_index + 1);
+                        cx.notify();
+                    }
+                    return true;
+                }
+                "]" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.indent();
+                        changed = true;
+                    }
+                }
+                "[" => {
+                    if let Some(editor) = self.active_editor_mut() {
+                        editor.outdent();
+                        changed = true;
+                    }
+                }
                 _ => {}
+            }
+        }
+
+        // Option+Up: move line up
+        if keystroke.key == "up" && keystroke.modifiers.alt && !keystroke.modifiers.platform {
+            if let Some(editor) = self.active_editor_mut() {
+                editor.move_line_up();
+                changed = true;
+            }
+        }
+        // Option+Down: move line down
+        if keystroke.key == "down" && keystroke.modifiers.alt && !keystroke.modifiers.platform {
+            if let Some(editor) = self.active_editor_mut() {
+                editor.move_line_down();
+                changed = true;
             }
         }
 
@@ -8057,18 +8521,42 @@ impl AxisShell {
                         .map(|line_index| {
                             let line_label =
                                 format!("{:>width$}", line_index + 1, width = line_number_width);
+                            let diff_bar_color: Option<gpui::Hsla> =
+                                editor.diff_kind_for_line(line_index).map(|kind| match kind {
+                                    DiffLineKind::Addition => rgb(0x4ec990).into(),
+                                    DiffLineKind::Removal => rgb(0xe06c75).into(),
+                                    DiffLineKind::Context => rgba(0x00000000).into(),
+                                });
+                            let gutter_div = div()
+                                .w(px(gutter_width))
+                                .h(px(line_height))
+                                .flex()
+                                .items_stretch()
+                                .flex_row();
+                            let gutter_div = if let Some(color) = diff_bar_color {
+                                gutter_div.child(
+                                    div()
+                                        .w(px(3.0))
+                                        .h_full()
+                                        .flex_shrink_0()
+                                        .bg(color),
+                                )
+                            } else {
+                                gutter_div.child(div().w(px(3.0)).h_full().flex_shrink_0())
+                            };
+                            let gutter_div = gutter_div.child(
+                                div()
+                                    .flex_1()
+                                    .pr_3()
+                                    .text_right()
+                                    .text_color(rgb(0x63717b))
+                                    .child(line_label),
+                            );
                             div()
                                 .h(px(line_height))
                                 .flex()
                                 .items_start()
-                                .child(
-                                    div()
-                                        .w(px(gutter_width))
-                                        .pr_3()
-                                        .text_right()
-                                        .text_color(rgb(0x63717b))
-                                        .child(line_label),
-                                )
+                                .child(gutter_div)
                                 .child(div().flex_1().whitespace_nowrap().child(
                                     editor_line_display(
                                         editor,
@@ -8089,6 +8577,14 @@ impl AxisShell {
                     let dirty = editor.dirty();
                     let external_modified = editor.external_modified();
                     let surface_id = active_surface_id;
+                    let search_replace_open = editor.search_state().replace_open;
+                    let search_replace_text = editor.search_state().replace_text.clone();
+                    let search_case_sensitive = editor.search_state().case_sensitive;
+                    let search_replace_field_active = workdesk
+                        .editor_views
+                        .get(&active_surface_id)
+                        .map(|v| v.replace_field_active)
+                        .unwrap_or(false);
 
                     div()
                         .flex()
@@ -8102,8 +8598,77 @@ impl AxisShell {
                                 .flex_col()
                                 .gap_2()
                                 .when(editor.search_state().open, |column| {
-                                    column.child(
-                                        div()
+                                    let find_row = div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_3()
+                                        .px_3()
+                                        .py_2()
+                                        .bg(rgb(0x131a20))
+                                        .border_1()
+                                        .border_color(rgb(0x24303a))
+                                        .rounded_md()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(if !search_replace_field_active {
+                                                    rgb(0xf0d35f)
+                                                } else {
+                                                    rgb(0x7f8a94)
+                                                })
+                                                .child("Find"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_xs()
+                                                .text_color(rgb(0xdce2e8))
+                                                .child(editor.search_state().query.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x7f8a94))
+                                                .child(search_label),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_1()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .bg(if search_case_sensitive {
+                                                    rgb(0x293742)
+                                                } else {
+                                                    rgb(0x1a2530)
+                                                })
+                                                .text_color(if search_case_sensitive {
+                                                    rgb(0xf0d35f)
+                                                } else {
+                                                    rgb(0x7f8a94)
+                                                })
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                })
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        if let Some(editor) =
+                                                            this.active_editor_mut()
+                                                        {
+                                                            editor.toggle_case_sensitivity();
+                                                        }
+                                                        cx.notify();
+                                                        cx.stop_propagation();
+                                                    }),
+                                                )
+                                                .child("Aa"),
+                                        );
+                                    let column = column.child(find_row);
+                                    if search_replace_open {
+                                        let replace_row = div()
                                             .flex()
                                             .items_center()
                                             .justify_between()
@@ -8117,23 +8682,76 @@ impl AxisShell {
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(0xf0d35f))
-                                                    .child("Find"),
+                                                    .text_color(if search_replace_field_active {
+                                                        rgb(0xf0d35f)
+                                                    } else {
+                                                        rgb(0x7f8a94)
+                                                    })
+                                                    .child("Replace"),
                                             )
                                             .child(
                                                 div()
                                                     .flex_1()
                                                     .text_xs()
                                                     .text_color(rgb(0xdce2e8))
-                                                    .child(editor.search_state().query.clone()),
+                                                    .child(search_replace_text),
                                             )
                                             .child(
                                                 div()
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_sm()
                                                     .text_xs()
-                                                    .text_color(rgb(0x7f8a94))
-                                                    .child(search_label),
-                                            ),
-                                    )
+                                                    .cursor_pointer()
+                                                    .bg(rgb(0x1e2d3a))
+                                                    .text_color(rgb(0xaeb8bf))
+                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            if let Some(editor) =
+                                                                this.active_editor_mut()
+                                                            {
+                                                                editor.replace_current_match();
+                                                            }
+                                                            cx.notify();
+                                                            cx.stop_propagation();
+                                                        }),
+                                                    )
+                                                    .child("Replace"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .bg(rgb(0x1e2d3a))
+                                                    .text_color(rgb(0xaeb8bf))
+                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                    })
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            if let Some(editor) =
+                                                                this.active_editor_mut()
+                                                            {
+                                                                editor.replace_all_matches();
+                                                            }
+                                                            cx.notify();
+                                                            cx.stop_propagation();
+                                                        }),
+                                                    )
+                                                    .child("All"),
+                                            );
+                                        column.child(replace_row)
+                                    } else {
+                                        column
+                                    }
                                 })
                                 .child(
                                     div()
@@ -8321,6 +8939,77 @@ impl AxisShell {
                 }),
             ));
 
+        // Tab bar for editor panes with multiple surfaces
+        let has_multiple_editor_surfaces = matches!(active_surface_kind, PaneKind::Editor)
+            && pane.surfaces.len() > 1;
+        let editor_tab_bar = has_multiple_editor_surfaces.then(|| {
+            div()
+                .flex()
+                .items_center()
+                .h(px(28.0))
+                .px(px(4.0))
+                .bg(rgb(0x11171d))
+                .border_b_1()
+                .border_color(rgb(0x22303a))
+                .overflow_x_hidden()
+                .children(
+                    pane.surfaces
+                        .iter()
+                        .map(|surface| {
+                            let surface_id = surface.id;
+                            let active = surface_id == active_surface_id;
+                            let title = surface.title.clone();
+                            let filename = title
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&title)
+                                .to_string();
+                            let dirty = surface.dirty;
+
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .px(px(8.0))
+                                .py(px(4.0))
+                                .cursor_pointer()
+                                .when(active, |d| {
+                                    d.bg(rgb(0x1a2330))
+                                        .border_b_2()
+                                        .border_color(rgb(0x7cc7ff))
+                                })
+                                .when(!active, |d| d.hover(|d| d.bg(rgb(0x161d26))))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if active {
+                                            rgb(0xdce2e8)
+                                        } else {
+                                            rgb(0x7f8a94)
+                                        })
+                                        .child(filename),
+                                )
+                                .when(dirty, |d| {
+                                    d.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0xf0d35f))
+                                            .child("●"),
+                                    )
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.active_workdesk_mut()
+                                        .focus_surface(pane_id, surface_id);
+                                    this.request_persist(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                }))
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into_any_element()
+        });
+
         let body = div()
             .flex()
             .flex_1()
@@ -8352,6 +9041,7 @@ impl AxisShell {
                 }),
             )
             .child(header)
+            .when_some(editor_tab_bar, |s, tab_bar| s.child(tab_bar))
             .child(body);
 
         if frame.allow_layout_drag {
@@ -8755,6 +9445,7 @@ impl Render for AxisShell {
         };
         let show_inspector = cfg!(debug_assertions) && self.inspector_open;
         let inspector_toggle_label = self.shortcut_label(ShortcutAction::ToggleInspector);
+        let daemon_connected = self.daemon_connected;
         let sidebar_header_inset = if cfg!(target_os = "macos") {
             SIDEBAR_WINDOW_CONTROLS_INSET
         } else {
@@ -8778,6 +9469,42 @@ impl Render for AxisShell {
                         .join(" · ")
                 };
                 let accent = workdesk_accent(index);
+                // Build per-session rows for agent panes on this desk.
+                let agent_session_rows: Vec<AgentSessionSidebarRow> = desk
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.kind == PaneKind::Agent)
+                    .filter_map(|pane| {
+                        let surface_id = pane.active_surface_id;
+                        let record = self
+                            .agent_runtime
+                            .session_for_surface(desk.runtime_id, surface_id)?;
+                        let attention = record.attention;
+                        let escalated = self.escalated_sessions.contains(&record.id);
+                        let provider_label = record.provider_profile_id.clone();
+                        Some(AgentSessionSidebarRow {
+                            pane_id: pane.id,
+                            pane_title: pane.title.clone(),
+                            provider_label,
+                            attention,
+                            escalated,
+                        })
+                    })
+                    .collect();
+                let session_click_listeners: Vec<Box<dyn Fn(&MouseUpEvent, &mut Window, &mut App)>> =
+                    agent_session_rows
+                        .iter()
+                        .map(|row| {
+                            let pane_id = row.pane_id;
+                            let listener: Box<dyn Fn(&MouseUpEvent, &mut Window, &mut App)> =
+                                cx.listener(move |this, _, _, cx| {
+                                    this.dismiss_workdesk_menu();
+                                    this.navigate_to_workdesk_pane(index, pane_id, cx);
+                                    cx.stop_propagation();
+                                });
+                            listener
+                        })
+                        .collect();
                 if self.sidebar_collapsed {
                     workdesk_compact_chip(
                         index,
@@ -8809,6 +9536,8 @@ impl Render for AxisShell {
                         preview,
                         workdesk_navigation_target(desk),
                         accent,
+                        agent_session_rows,
+                        session_click_listeners,
                         cx.listener(move |this, _, _, cx| {
                             this.dismiss_workdesk_menu();
                             this.select_workdesk(index, cx);
@@ -9511,14 +10240,148 @@ impl Render for AxisShell {
                         ),
                 )
         });
+        let goto_line_overlay = self.goto_line_open.then(|| {
+            let input_text = if self.goto_line_input.is_empty() {
+                "_".to_string()
+            } else {
+                self.goto_line_input.clone()
+            };
+            div()
+                .absolute()
+                .top(px(40.0))
+                .right(px(20.0))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .bg(rgb(0x1a2330))
+                .border_1()
+                .border_color(rgb(0x3b4d5e))
+                .rounded_md()
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(div().text_xs().text_color(rgb(0xf0d35f)).child("Go to line:"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xdce2e8))
+                        .min_w(px(40.0))
+                        .child(input_text),
+                )
+        });
+        let file_picker_overlay = self.file_picker_open.then(|| {
+            let query = self.file_picker_query.clone();
+            let filtered = self.file_picker_filtered.clone();
+            let selected = self.file_picker_selected;
+            let picker_width = 500.0_f32;
+            let left = ((viewport_width - picker_width) * 0.5).max(16.0);
+            let visible_rows: Vec<_> = filtered
+                .iter()
+                .enumerate()
+                .take(12)
+                .map(|(index, path)| {
+                    let is_selected = index == selected;
+                    div()
+                        .px_3()
+                        .py_1()
+                        .bg(if is_selected { rgb(0x1e3248) } else { rgb(0x1a2330) })
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(".ZedMono")
+                                .text_color(if is_selected {
+                                    rgb(0x7cc7ff)
+                                } else {
+                                    rgb(0xb0bec5)
+                                })
+                                .child(path.clone()),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            let empty_row = if filtered.is_empty() {
+                vec![
+                    div()
+                        .px_3()
+                        .py_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f8a94))
+                                .child("No files found"),
+                        )
+                        .into_any_element(),
+                ]
+            } else {
+                vec![]
+            };
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(60.0))
+                .w(px(picker_width))
+                .flex()
+                .flex_col()
+                .bg(rgb(0x1a2330))
+                .border_1()
+                .border_color(rgb(0x3b4d5e))
+                .rounded_lg()
+                .shadow_lg()
+                .overflow_hidden()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(0x3b4d5e))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7cc7ff))
+                                .child("File:"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .font_family(".ZedMono")
+                                .text_color(if query.is_empty() {
+                                    rgb(0x6f7d86)
+                                } else {
+                                    rgb(0xdce2e8)
+                                })
+                                .child(if query.is_empty() {
+                                    "type to search...".to_string()
+                                } else {
+                                    query
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .children(if visible_rows.is_empty() { empty_row } else { visible_rows }),
+                )
+        });
         let review_panel_overlay = self.review_panel.and_then(|desk_index| {
             self.workdesks.get(desk_index).map(|desk| {
                 let desk_name = desk.name.clone();
+                let workdesk_id = WorkdeskId::new(desk.workdesk_id.clone());
                 let payload = desk.review_payload_cache.clone();
                 let local = desk.review_local_state.clone();
-                (desk_index, desk_name, payload, local)
+                (desk_index, desk_name, workdesk_id, payload, local)
             })
-        }).map(|(desk_index, desk_name, payload, local)| {
+        }).map(|(desk_index, desk_name, workdesk_id, payload, local)| {
             let panel_width = SESSION_INSPECTOR_WIDTH
                 .min((viewport_width - SHORTCUT_PANEL_MARGIN * 2.0).max(320.0));
             let file_list_width = 148.0_f32;
@@ -9599,6 +10462,12 @@ impl Render for AxisShell {
                             } else {
                                 shell_border()
                             };
+                            let aggregate = file_review_aggregate(
+                                &workdesk_id,
+                                file,
+                                &local.hunk_states,
+                            );
+                            let dot_color = rgb(file_status_color(aggregate));
                             div()
                                 .px_2()
                                 .py_1()
@@ -9623,15 +10492,30 @@ impl Render for AxisShell {
                                 )
                                 .child(
                                     div()
-                                        .text_xs()
-                                        .text_color(if active {
-                                            shell_text_primary()
-                                        } else {
-                                            shell_text_secondary()
-                                        })
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .child(path_label),
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .w(px(6.0))
+                                                .h(px(6.0))
+                                                .rounded_full()
+                                                .bg(dot_color)
+                                                .flex_shrink_0(),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(if active {
+                                                    rgb(0xdce2e8)
+                                                } else {
+                                                    rgb(0x9aa6af)
+                                                })
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .child(path_label),
+                                        ),
                                 )
                                 .into_any_element()
                         })
@@ -9692,11 +10576,14 @@ impl Render for AxisShell {
                                         .enumerate()
                                         .map(|(hi, h)| {
                                             let active = hi == hunk_index;
-                                            let label = if h.header.len() > 28 {
+                                            let header_label = if h.header.len() > 28 {
                                                 format!("{}…", &h.header[..28])
                                             } else {
                                                 h.header.clone()
                                             };
+                                            let additions = h.lines.iter().filter(|l| l.kind == ReviewLineKind::Addition).count();
+                                            let removals = h.lines.iter().filter(|l| l.kind == ReviewLineKind::Removal).count();
+                                            let counts_label = format!("+{}/−{}", additions, removals);
                                             let tab_border: gpui::Hsla = if active {
                                                 rgb(0x7cc7ff).into()
                                             } else {
@@ -9728,6 +10615,10 @@ impl Render for AxisShell {
                                                 )
                                                 .child(
                                                     div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap_1()
                                                         .font_family(".ZedMono")
                                                         .text_xs()
                                                         .text_color(if active {
@@ -9735,7 +10626,12 @@ impl Render for AxisShell {
                                                         } else {
                                                             shell_text_secondary()
                                                         })
-                                                        .child(label),
+                                                        .child(header_label)
+                                                        .child(
+                                                            div()
+                                                                .text_color(rgb(0x7f8a94))
+                                                                .child(counts_label),
+                                                        ),
                                                 )
                                                 .into_any_element()
                                         })
@@ -11088,7 +11984,9 @@ impl Render for AxisShell {
                                         cx.stop_propagation();
                                     }),
                                 ))
-                            }),
+                            })
+                            .child(dock_divider())
+                            .child(daemon_status_indicator(daemon_connected)),
                     ),
             )
             .when(show_inspector, |root| {
@@ -11181,12 +12079,10 @@ impl Render for AxisShell {
                         ),
                 )
             })
-            .when_some(session_inspector_overlay, |root, overlay| {
-                root.child(overlay)
-            })
-            .when_some(workspace_palette_overlay, |root, overlay| {
-                root.child(overlay)
-            })
+            .when_some(session_inspector_overlay, |root, overlay| root.child(overlay))
+            .when_some(workspace_palette_overlay, |root, overlay| root.child(overlay))
+            .when_some(goto_line_overlay, |root, overlay| root.child(overlay))
+            .when_some(file_picker_overlay, |root, overlay| root.child(overlay))
             .when_some(review_panel_overlay, |root, overlay| root.child(overlay))
             .children(shortcut_overlay)
             .when_some(workdesk_editor_overlay, |root, overlay| root.child(overlay))
@@ -11334,6 +12230,7 @@ fn main() {
                     window.focus(&window_focus_handle);
                     shell.update(cx, |this, cx| {
                         this.start_terminal_refresh_loop(cx);
+                        this.start_agent_poll_loop(cx);
                         this.request_persist(cx);
                     });
 
@@ -11721,6 +12618,29 @@ fn review_file_absolute_path(desk: &WorkdeskState, relative_path: &str) -> PathB
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(desk.metadata.cwd.trim()));
     root.join(relative_path)
+}
+
+fn build_diff_annotations_for_file(payload: &DeskReviewPayload, file_path: &str) -> Vec<DiffAnnotation> {
+    use axis_core::review::ReviewLineKind as RLK;
+    let mut annotations = Vec::new();
+    if let Some(file_diff) = payload.files.iter().find(|f| f.path == file_path) {
+        for hunk in &file_diff.hunks {
+            for line in &hunk.lines {
+                if let Some(new_line_num) = line.new_line {
+                    let kind = match line.kind {
+                        RLK::Addition => DiffLineKind::Addition,
+                        RLK::Removal => DiffLineKind::Removal,
+                        _ => DiffLineKind::Context,
+                    };
+                    annotations.push(DiffAnnotation {
+                        line: (new_line_num as usize).saturating_sub(1), // 0-indexed
+                        kind,
+                    });
+                }
+            }
+        }
+    }
+    annotations
 }
 
 fn clamp_review_panel_selection(desk: &mut WorkdeskState) {
@@ -12223,6 +13143,8 @@ fn workdesk_card(
     preview: String,
     navigation_target: Option<WorkdeskNavigationTarget>,
     accent: gpui::Hsla,
+    agent_session_rows: Vec<AgentSessionSidebarRow>,
+    session_click_listeners: Vec<Box<dyn Fn(&MouseUpEvent, &mut Window, &mut App)>>,
     listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     context_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     navigation_listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
@@ -12594,6 +13516,24 @@ fn workdesk_card(
                                 .child(focus_label),
                         ),
                 ),
+            )
+        })
+        .when(!agent_session_rows.is_empty(), |card| {
+            let rows_with_listeners: Vec<_> = agent_session_rows
+                .into_iter()
+                .zip(session_click_listeners.into_iter())
+                .map(|(row, listener)| agent_session_row(&row, listener))
+                .collect();
+            card.child(
+                div()
+                    .mt(px(2.0))
+                    .pt(px(4.0))
+                    .border_t_1()
+                    .border_color(rgb(0x1e2b34))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .children(rows_with_listeners),
             )
         })
 }
@@ -13105,6 +14045,31 @@ fn dock_divider() -> impl IntoElement {
     div().w(px(1.0)).h(px(20.0)).bg(shell_border())
 }
 
+fn daemon_status_indicator(daemon_connected: bool) -> impl IntoElement {
+    let (dot_color, label) = if daemon_connected {
+        (rgb(0x77d19a), "daemon")
+    } else {
+        (rgb(0x697680), "local")
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .w(px(6.0))
+                .h(px(6.0))
+                .rounded_full()
+                .bg(dot_color),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x586470))
+                .child(label),
+        )
+}
+
 fn notification_item(
     title: &str,
     detail: &str,
@@ -13476,6 +14441,75 @@ fn attention_indicator(state: AttentionState, unread: bool) -> impl IntoElement 
                     .rounded_full()
                     .border_1()
                     .border_color(tint),
+            )
+        })
+}
+
+/// Map `AgentAttention` to an RGB color, applying escalation logic.
+/// Escalated NeedsInput sessions show red instead of yellow.
+fn attention_color(attention: AgentAttention, escalated: bool) -> gpui::Hsla {
+    match (attention, escalated) {
+        (AgentAttention::Quiet, _) => rgb(0x63717b).into(),
+        (AgentAttention::Working, _) => rgb(0x7cc7ff).into(),
+        (AgentAttention::NeedsInput, true) => rgb(0xe06c75).into(),  // red (escalated)
+        (AgentAttention::NeedsInput, false) => rgb(0xf0d35f).into(), // yellow
+        (AgentAttention::NeedsReview, _) => rgb(0xd19a66).into(),
+        (AgentAttention::Error, _) => rgb(0xe06c75).into(),
+    }
+}
+
+/// A pre-computed row of info for a single agent session shown in the sidebar workdesk card.
+#[derive(Clone, Debug)]
+struct AgentSessionSidebarRow {
+    pane_id: PaneId,
+    pane_title: String,
+    provider_label: String,
+    attention: AgentAttention,
+    escalated: bool,
+}
+
+/// Render a single agent session row within the sidebar workdesk card.
+fn agent_session_row(
+    row: &AgentSessionSidebarRow,
+    on_click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let color = attention_color(row.attention, row.escalated);
+    let provider = row.provider_label.clone();
+    let title = row.pane_title.clone();
+    let escalated = row.escalated;
+
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px(px(4.0))
+        .py(px(2.0))
+        .rounded_md()
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(MouseButton::Left, on_click)
+        .child(
+            div()
+                .w(px(8.0))
+                .h(px(8.0))
+                .rounded_full()
+                .bg(color),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(color)
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(format!("{provider} · {title}")),
+        )
+        .when(escalated, |row| {
+            row.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xe06c75))
+                    .child("!"),
             )
         })
 }

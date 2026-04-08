@@ -21,6 +21,7 @@ fn fake_emits_starting_running_needs_review_completed_sequence() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -67,6 +68,7 @@ fn stop_session_teardown_prevents_further_polls_on_fake() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
 
@@ -84,9 +86,10 @@ fn with_steps_drives_custom_lifecycle_event() {
     let mut reg = ProviderRegistry::new();
     reg.register(
         "fake",
-        Arc::new(FakeProvider::with_steps(vec![FakeScriptStep::Lifecycle(
-            AgentLifecycle::Failed,
-        )])),
+        Arc::new(FakeProvider::with_steps(vec![
+            FakeScriptStep::Lifecycle(AgentLifecycle::Starting),
+            FakeScriptStep::Lifecycle(AgentLifecycle::Failed),
+        ])),
     );
     let mut mgr = SessionManager::new(reg);
     let id = mgr
@@ -96,8 +99,15 @@ fn with_steps_drives_custom_lifecycle_event() {
             transport: AgentTransportKind::CliWrapped,
             argv_suffix: vec![],
             env: BTreeMap::new(),
+            workdesk_id: None,
         })
         .unwrap();
+
+    mgr.poll_provider(&id).unwrap();
+    assert_eq!(
+        mgr.session(&id).unwrap().lifecycle,
+        AgentLifecycle::Starting
+    );
 
     mgr.poll_provider(&id).unwrap();
     assert_eq!(mgr.session(&id).unwrap().lifecycle, AgentLifecycle::Failed);

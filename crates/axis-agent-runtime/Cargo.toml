@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 anyhow = "1"
+parking_lot = { workspace = true }
 axis-core = { path = "../axis-core" }
 process-manager = { path = "../process-manager" }
 serde = { version = "1", features = ["derive"] }

@@ -9,8 +9,13 @@ members = [
     "crates/axis-terminal",
     "crates/process-manager",
     "crates/ghostty-sys",
+    "crates/axis-lsp",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+parking_lot = "0.12"
+ropey = "1"
 
 [workspace.package]
 edition = "2021"

@@ -10,6 +10,7 @@ use axis_core::agent_history::{
     AgentTimelineEntry, AgentToolCall, AgentTurn,
 };
 
+use crate::error::AgentError;
 use crate::events::RuntimeEvent;
 use crate::provider::{
     validate_start_request, ProviderProfileMetadata, ProviderRegistry, RespondApprovalRequest,
@@ -71,7 +72,7 @@ impl SessionManager {
             id: id.clone(),
             provider_profile_id: req.provider_profile_id.clone(),
             transport: req.transport,
-            workdesk_id: None,
+            workdesk_id: req.workdesk_id.clone(),
             surface_id: None,
             cwd: req.cwd,
             lifecycle: AgentLifecycle::Planned,
@@ -117,6 +118,17 @@ impl SessionManager {
     }
 
     pub fn send_turn(&mut self, session_id: &AgentSessionId, text: &str) -> anyhow::Result<()> {
+        let detail = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| AgentError::SessionNotFound(session_id.0.clone()))?;
+        if !detail.capabilities.turn_input {
+            return Err(AgentError::UnsupportedOperation {
+                provider: detail.session.provider_profile_id.clone(),
+                operation: "turn_input".to_string(),
+            }
+            .into());
+        }
         let provider = self.provider_for_session(session_id)?;
         let events = provider.send_turn(SendTurnRequest {
             session_id: session_id.clone(),
@@ -132,6 +144,17 @@ impl SessionManager {
         approved: bool,
         note: Option<String>,
     ) -> anyhow::Result<()> {
+        let detail = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| AgentError::SessionNotFound(session_id.0.clone()))?;
+        if !detail.capabilities.approvals {
+            return Err(AgentError::UnsupportedOperation {
+                provider: detail.session.provider_profile_id.clone(),
+                operation: "approvals".to_string(),
+            }
+            .into());
+        }
         let provider = self.provider_for_session(session_id)?;
         let events = provider.respond_approval(RespondApprovalRequest {
             session_id: session_id.clone(),
@@ -143,6 +166,17 @@ impl SessionManager {
     }
 
     pub fn resume(&mut self, session_id: &AgentSessionId) -> anyhow::Result<()> {
+        let detail = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| AgentError::SessionNotFound(session_id.0.clone()))?;
+        if !detail.capabilities.resume {
+            return Err(AgentError::UnsupportedOperation {
+                provider: detail.session.provider_profile_id.clone(),
+                operation: "resume".to_string(),
+            }
+            .into());
+        }
         let provider = self.provider_for_session(session_id)?;
         let events = provider.resume(ResumeRequest {
             session_id: session_id.clone(),
@@ -162,11 +196,28 @@ impl SessionManager {
     }
 
     /// Local lifecycle transition (e.g. UI or host-driven); bumps revision when the state changes.
+    ///
+    /// Returns `Ok` without bumping the revision if `lifecycle` equals the current state (noop).
+    /// Returns an error if the transition is not valid per the lifecycle state machine.
     pub fn transition_lifecycle(
         &mut self,
         session_id: &AgentSessionId,
         lifecycle: AgentLifecycle,
     ) -> anyhow::Result<()> {
+        let current = self
+            .session(session_id)
+            .with_context(|| format!("unknown session {}", session_id.0))?
+            .lifecycle;
+        if current == lifecycle {
+            return Ok(()); // noop — skip revision bump
+        }
+        if !is_valid_lifecycle_transition(current, lifecycle) {
+            return Err(AgentError::InvalidTransition {
+                from: format!("{current:?}"),
+                to: format!("{lifecycle:?}"),
+            }
+            .into());
+        }
         self.apply_events([RuntimeEvent::Lifecycle {
             session_id: session_id.clone(),
             lifecycle,
@@ -197,6 +248,15 @@ impl SessionManager {
                         .get_mut(&session_id)
                         .with_context(|| format!("unknown session {}", session_id.0))?;
                     if detail.session.lifecycle == lifecycle {
+                        false
+                    } else if !is_valid_lifecycle_transition(detail.session.lifecycle, lifecycle) {
+                        // Provider events may be stale or out-of-order — warn and skip rather
+                        // than hard-erroring so one bad event does not abort the entire poll.
+                        eprintln!(
+                            "[axis-agent-runtime] WARN: skipping invalid lifecycle transition \
+                             {:?} → {:?} for session {}",
+                            detail.session.lifecycle, lifecycle, session_id.0
+                        );
                         false
                     } else {
                         detail.session.lifecycle = lifecycle;
@@ -411,6 +471,29 @@ fn recompute_pending_approval_id(detail: &mut AgentSessionDetail) {
     });
 }
 
+/// Returns true if transitioning from `current` to `next` is valid.
+fn is_valid_lifecycle_transition(current: AgentLifecycle, next: AgentLifecycle) -> bool {
+    if current == next {
+        return true; // noop
+    }
+    use AgentLifecycle::*;
+    matches!(
+        (current, next),
+        (Planned, Starting)
+            | (Starting, Running)
+            | (Starting, Failed)
+            | (Starting, Cancelled)
+            | (Running, Waiting)
+            | (Running, Completed)
+            | (Running, Failed)
+            | (Running, Cancelled)
+            | (Waiting, Running)
+            | (Waiting, Completed)
+            | (Waiting, Failed)
+            | (Waiting, Cancelled)
+    )
+}
+
 fn is_terminal_lifecycle(lifecycle: AgentLifecycle) -> bool {
     matches!(
         lifecycle,
@@ -447,6 +530,7 @@ mod tests {
                 transport: AgentTransportKind::CliWrapped,
                 argv_suffix: vec![],
                 env: BTreeMap::new(),
+                workdesk_id: None,
             })
             .unwrap();
         let after_start = mgr.revision();
